@@ -3,19 +3,232 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>crypto-arb</title>
+    <meta name="color-scheme" content="dark light" />
+    <meta
+      name="description"
+      content="Paper-trading triangular arbitrage scanner. No real orders are placed."
+    />
+    <title>crypto-arb · paper trading</title>
+    <!-- Inline data-URI so the page fetches nothing off-origin and the browser
+         never falls back to a 404 /favicon.ico request. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d11'/%3E%3Cpath d='M16 6 L27 25 L5 25 Z' fill='none' stroke='%2335d07f' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
   </head>
   <body>
-    <main>
-      <h1>crypto-arb</h1>
-      <p>Paper-trading triangular arbitrage scanner.</p>
-      <p class="muted">Dashboard coming soon.</p>
-      <ul class="links">
-        <li><a href="/api/health">/api/health</a></li>
-        <li><a href="/api/version">/api/version</a></li>
-        <li><a href="/api/tickers">/api/tickers</a></li>
-      </ul>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1>
+          crypto-arb<span class="brand-dot" aria-hidden="true">·</span
+          ><span class="brand-sub">paper trading</span>
+        </h1>
+      </div>
+
+      <div class="status" aria-live="polite">
+        <span class="badge" id="source-badge" data-state="idle">no scans yet</span>
+        <span class="status-age" id="scan-age">&mdash;</span>
+      </div>
+
+      <div class="topbar-actions">
+        <button type="button" class="btn btn-primary" id="scan-btn">Scan now</button>
+        <button type="button" class="btn btn-danger" id="reset-btn">Reset</button>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- ── Portfolio ─────────────────────────────────────────────────── -->
+      <section class="panel" aria-labelledby="portfolio-heading">
+        <div class="panel-head">
+          <h2 id="portfolio-heading">Portfolio</h2>
+          <span class="panel-note" id="portfolio-note"></span>
+        </div>
+
+        <div class="stats">
+          <div class="stat">
+            <span class="stat-label">Equity</span>
+            <span class="stat-value num" id="stat-equity">&mdash;</span>
+            <span class="stat-unit">USDT</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">P&amp;L</span>
+            <span class="stat-value num" id="stat-pnl-abs">&mdash;</span>
+            <span class="stat-unit">USDT</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">P&amp;L %</span>
+            <span class="stat-value num" id="stat-pnl-pct">&mdash;</span>
+            <span class="stat-unit">of initial</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Trades</span>
+            <span class="stat-value num" id="stat-trades">&mdash;</span>
+            <span class="stat-unit" id="stat-trades-unit">booked</span>
+          </div>
+        </div>
+
+        <p class="balances">
+          <span class="balances-label">Balances</span>
+          <span class="num" id="balances-line">&mdash;</span>
+        </p>
+      </section>
+
+      <!-- ── Settings ──────────────────────────────────────────────────── -->
+      <details class="panel collapsible" id="settings-panel">
+        <summary>
+          <span class="summary-title">Settings</span>
+          <span class="panel-note" id="settings-summary">&mdash;</span>
+        </summary>
+
+        <div class="panel-body">
+          <div class="settings-grid">
+            <label class="field">
+              <span class="field-label">min_profit_pct</span>
+              <input
+                type="number"
+                step="0.001"
+                class="input num"
+                id="set-min-profit"
+                data-setting="min_profit_pct"
+                autocomplete="off"
+              />
+              <span class="field-hint">Net % a cycle must beat to fill.</span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">trade_size_usdt</span>
+              <input
+                type="number"
+                step="1"
+                min="0"
+                class="input num"
+                id="set-trade-size"
+                data-setting="trade_size_usdt"
+                autocomplete="off"
+              />
+              <span class="field-hint">Notional simulated per cycle.</span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">fee_rate</span>
+              <input
+                type="number"
+                step="0.0001"
+                min="0"
+                max="0.01"
+                class="input num"
+                id="set-fee-rate"
+                data-setting="fee_rate"
+                autocomplete="off"
+              />
+              <span class="field-hint">Taker fee per leg (0.001 = 0.1%).</span>
+            </label>
+          </div>
+
+          <p class="hint">
+            A <strong>negative</strong> <code>min_profit_pct</code> forces demo trades: every
+            scan fills its best cycle even when the edge is negative.
+            <code>initial_usdt</code> is immutable — it is the denominator of every P&amp;L
+            figure.
+          </p>
+          <p class="form-error" id="settings-error" role="alert" hidden></p>
+        </div>
+      </details>
+
+      <!-- ── Opportunities ─────────────────────────────────────────────── -->
+      <section class="panel" aria-labelledby="opps-heading">
+        <div class="panel-head">
+          <h2 id="opps-heading">Opportunities</h2>
+          <span class="panel-note" id="opps-note">newest 30</span>
+        </div>
+        <div class="table-wrap">
+          <table class="grid" id="opps-table">
+            <thead>
+              <tr>
+                <th scope="col" class="col-toggle"><span class="sr-only">Legs</span></th>
+                <th scope="col">Time</th>
+                <th scope="col">Cycle</th>
+                <th scope="col" class="right">Gross %</th>
+                <th scope="col" class="right">Net %</th>
+                <th scope="col">Executed</th>
+              </tr>
+            </thead>
+            <tbody id="opps-body">
+              <tr class="placeholder-row">
+                <td colspan="6">Loading&hellip;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ── Trades ────────────────────────────────────────────────────── -->
+      <section class="panel" aria-labelledby="trades-heading">
+        <div class="panel-head">
+          <h2 id="trades-heading">Trades</h2>
+          <span class="panel-note" id="trades-note">newest 30 · simulated fills</span>
+        </div>
+        <div class="table-wrap">
+          <table class="grid" id="trades-table">
+            <thead>
+              <tr>
+                <th scope="col">Time</th>
+                <th scope="col">Cycle</th>
+                <th scope="col" class="right">Start &rarr; End</th>
+                <th scope="col" class="right">Profit</th>
+                <th scope="col" class="right">Profit %</th>
+              </tr>
+            </thead>
+            <tbody id="trades-body">
+              <tr class="placeholder-row">
+                <td colspan="5">Loading&hellip;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ── Scans ─────────────────────────────────────────────────────── -->
+      <details class="panel collapsible" id="scans-panel">
+        <summary>
+          <span class="summary-title">Scans</span>
+          <span class="panel-note" id="scans-note">newest 15</span>
+        </summary>
+        <div class="panel-body no-pad">
+          <div class="table-wrap">
+            <table class="grid" id="scans-table">
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">Trigger</th>
+                  <th scope="col">Source</th>
+                  <th scope="col" class="right">Pairs</th>
+                  <th scope="col" class="right">Triangles</th>
+                  <th scope="col" class="right">Best net %</th>
+                  <th scope="col" class="right">Duration</th>
+                  <th scope="col">Error</th>
+                </tr>
+              </thead>
+              <tbody id="scans-body">
+                <tr class="placeholder-row">
+                  <td colspan="8">Loading&hellip;</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </details>
     </main>
+
+    <footer class="footer">
+      Paper trading only — no real orders. Data: Binance WS (MEXC fallback).
+    </footer>
+
+    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
   </body>
 </html>
