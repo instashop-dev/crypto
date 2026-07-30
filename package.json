@@ -1,0 +1,23 @@
+{
+  "name": "crypto-arb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "hono": "^4.12.32"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.21",
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^7.0.2",
+    "vitest": "~3.2.7",
+    "wrangler": "^4.115.0"
+  }
+}
