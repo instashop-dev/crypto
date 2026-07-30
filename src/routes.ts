@@ -238,7 +238,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
     return c.json({ ok: sources.some((s) => s.ok), ts: Date.now(), sources });
   });
 
-  app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 4 }));
+  app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 5 }));
 
   /**
    * Dev aid: resolve a snapshot for the given symbols through the real source

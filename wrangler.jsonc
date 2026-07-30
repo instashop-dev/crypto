@@ -17,6 +17,11 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Every minute: the tightest schedule Cron Triggers allow. `runScan` holds a
+  // 45s lock, so a slow tick is skipped rather than lapped by the next one.
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "observability": {
     "enabled": true
   }
