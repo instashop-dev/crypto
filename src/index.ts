@@ -1,141 +1,118 @@
 import { Hono } from "hono";
+import { getSnapshot, getWsCollector, MEXC_BASE, USER_AGENT, type WsCollector } from "./binance";
 import type { Env } from "./types";
 
-/**
- * Binance REST base URLs probed by the health endpoint, in preference order.
- * `data-api.binance.vision` is the public market-data mirror (no auth, no geo
- * restrictions); the other two are the primary global / US clusters.
- */
-export const BINANCE_BASES = [
-  "https://data-api.binance.vision",
-  "https://api.binance.com",
-  "https://api.binance.us",
-] as const;
+const MEXC_PING_PATH = "/api/v3/ping";
+const MEXC_PROBE_TIMEOUT_MS = 8000;
+/** Health probes get a longer WS budget than scans: a cold TLS handshake to
+ *  Binance can eat most of the 4s scan deadline. */
+const WS_PROBE_DEADLINE_MS = 5000;
+const WS_PROBE_SYMBOL = "BTCUSDT";
 
-const PING_PATH = "/api/v3/ping";
-const PROBE_TIMEOUT_MS = 8000;
+/** Default markets for `/api/tickers` — one triangle's worth of legs. */
+const DEFAULT_TICKER_SYMBOLS = ["BTCUSDT", "ETHUSDT", "ETHBTC"];
+/** Guard rail for the debug route so a stray query cannot build a huge stream URL. */
+const MAX_TICKER_SYMBOLS = 100;
 
 export interface HealthSource {
-  base: string;
-  /** HTTP status code, or "timeout" / "error" when the request never completed. */
-  status: number | "timeout" | "error";
+  name: "binance-ws" | "mexc-rest";
   ok: boolean;
   ms: number;
+  /** Symbols the probe actually received (WebSocket source only). */
+  symbols?: string[];
 }
 
 /**
- * Probe a single Binance base URL. Never throws: transport failures are folded
- * into the returned record so one dead endpoint cannot fail the whole report.
+ * Probe the primary source by collecting a one-symbol snapshot. Takes the
+ * collector as a parameter — defaulted at call time from the module seam — so
+ * tests can drive the handler without opening a socket.
  *
- * The API key is only ever sent upstream as a request header. It is never
- * echoed into the response body and never logged.
+ * Never throws: a dead source must not fail the whole report.
  */
-async function probeBase(base: string, apiKey?: string): Promise<HealthSource> {
+export async function probeBinanceWs(
+  env: Env,
+  collect: WsCollector = getWsCollector(),
+): Promise<HealthSource> {
   const started = Date.now();
-  // Workers fetch sends no User-Agent by default; Binance's WAF rejects
-  // UA-less requests with 403, so a UA is required for every upstream call.
-  const headers: Record<string, string> = {
-    "User-Agent": "crypto-arb-paper-trader/1.0",
-    Accept: "application/json",
-  };
-  if (apiKey) headers["X-MBX-APIKEY"] = apiKey;
-
   try {
-    const res = await fetch(`${base}${PING_PATH}`, {
-      method: "GET",
-      headers,
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    const book = await collect([WS_PROBE_SYMBOL], {
+      deadlineMs: WS_PROBE_DEADLINE_MS,
+      env,
     });
     return {
-      base,
-      status: res.status,
-      ok: res.ok,
+      name: "binance-ws",
+      ok: book.has(WS_PROBE_SYMBOL),
       ms: Date.now() - started,
+      symbols: [...book.keys()],
     };
-  } catch (err) {
-    const name = err instanceof Error ? err.name : "";
-    const timedOut = name === "TimeoutError" || name === "AbortError";
-    return {
-      base,
-      status: timedOut ? "timeout" : "error",
-      ok: false,
-      ms: Date.now() - started,
-    };
+  } catch {
+    return { name: "binance-ws", ok: false, ms: Date.now() - started };
+  }
+}
+
+/**
+ * Probe the REST fallback with MEXC's cheap `/ping`. The API key is only ever
+ * sent upstream as a header and is never echoed into the response.
+ */
+export async function probeMexcRest(_env: Env): Promise<HealthSource> {
+  const started = Date.now();
+  try {
+    const res = await fetch(`${MEXC_BASE}${MEXC_PING_PATH}`, {
+      method: "GET",
+      // Workers' fetch sends no User-Agent by default and Binance-family WAFs
+      // answer 403 to UA-less requests, so one is always set.
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+      signal: AbortSignal.timeout(MEXC_PROBE_TIMEOUT_MS),
+    });
+    return { name: "mexc-rest", ok: res.ok, ms: Date.now() - started };
+  } catch {
+    return { name: "mexc-rest", ok: false, ms: Date.now() - started };
   }
 }
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/api/health", async (c) => {
-  const apiKey = c.env?.BINANCE_API_KEY;
-
-  const settled = await Promise.allSettled(
-    BINANCE_BASES.map((base) => probeBase(base, apiKey)),
-  );
-
-  const sources: HealthSource[] = settled.map((result, i) =>
-    result.status === "fulfilled"
-      ? result.value
-      : { base: BINANCE_BASES[i], status: "error", ok: false, ms: 0 },
-  );
-
-  return c.json({ ok: true, ts: Date.now(), sources });
+  const env = c.env;
+  const sources = await Promise.all([probeBinanceWs(env), probeMexcRest(env)]);
+  // `ok` means "market data is obtainable": either source alone is enough.
+  return c.json({ ok: sources.some((s) => s.ok), ts: Date.now(), sources });
 });
 
-app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 1 }));
+app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 2 }));
 
-// Temporary Phase-1 diagnostic: probe an arbitrary base/path with a chosen
-// User-Agent so reachability experiments don't require a redeploy each time.
-// Removed once the source chain is settled.
-app.get("/api/debug-probe", async (c) => {
-  const base = c.req.query("base") ?? "https://data-api.binance.vision";
-  const path = c.req.query("path") ?? PING_PATH;
-  const ua = c.req.query("ua") ?? "crypto-arb-paper-trader/1.0";
-  const started = Date.now();
-  try {
-    const res = await fetch(`${base}${path}`, {
-      headers: { "User-Agent": ua, Accept: "application/json" },
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    const body = (await res.text()).slice(0, 300);
-    return c.json({ base, path, ua, status: res.status, ms: Date.now() - started, body });
-  } catch (err) {
-    return c.json({ base, path, ua, error: String(err), ms: Date.now() - started });
-  }
-});
+/**
+ * Dev aid: resolve a snapshot for the given symbols through the real source
+ * chain and report which source answered.
+ */
+app.get("/api/tickers", async (c) => {
+  const raw = c.req.query("symbols");
+  const requested = raw
+    ? raw
+        .split(",")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean)
+        .slice(0, MAX_TICKER_SYMBOLS)
+    : DEFAULT_TICKER_SYMBOLS;
 
-// Temporary Phase-1 diagnostic: open a WebSocket to Binance's market-data
-// stream host and return the first bookTicker message received. Proves whether
-// WS market data is viable from Workers egress. Removed once settled.
-app.get("/api/debug-ws", async (c) => {
-  const host = c.req.query("host") ?? "data-stream.binance.vision";
-  const stream = c.req.query("stream") ?? "btcusdt@bookTicker";
-  const started = Date.now();
   try {
-    const resp = await fetch(`https://${host}/ws/${stream}`, {
-      headers: { Upgrade: "websocket" },
+    const snapshot = await getSnapshot(requested, c.env);
+    const tickers = [...snapshot.book.values()].map(({ symbol, bid, ask }) => ({
+      symbol,
+      bid,
+      ask,
+    }));
+    return c.json({
+      source: snapshot.source,
+      ts: snapshot.ts,
+      count: tickers.length,
+      tickers,
     });
-    const ws = resp.webSocket;
-    if (!ws) {
-      const body = (await resp.text()).slice(0, 200);
-      return c.json({ host, stream, status: resp.status, ms: Date.now() - started, body });
-    }
-    ws.accept();
-    const first = await new Promise<string>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("ws-timeout")), 8000);
-      ws.addEventListener("message", (ev) => {
-        clearTimeout(t);
-        resolve(String(ev.data).slice(0, 300));
-      });
-      ws.addEventListener("error", () => {
-        clearTimeout(t);
-        reject(new Error("ws-error"));
-      });
-    });
-    ws.close();
-    return c.json({ host, stream, ok: true, ms: Date.now() - started, first });
   } catch (err) {
-    return c.json({ host, stream, error: String(err), ms: Date.now() - started });
+    return c.json(
+      { error: err instanceof Error ? err.message : "snapshot failed" },
+      502,
+    );
   }
 });
 
