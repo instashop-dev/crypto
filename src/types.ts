@@ -1,5 +1,7 @@
 export interface Env {
   ASSETS: Fetcher;
+  /** Paper-trading state: balances, pairs, opportunities, trades, scans, settings. */
+  DB: D1Database;
   BINANCE_API_KEY?: string;
   BINANCE_SECRET_KEY?: string;
 }

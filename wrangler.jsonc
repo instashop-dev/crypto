@@ -9,6 +9,14 @@
     "binding": "ASSETS",
     "run_worker_first": ["/api/*"]
   },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "crypto-arb",
+      "database_id": "a4a8557a-02e9-44d2-953b-fe66f7d86825",
+      "migrations_dir": "migrations"
+    }
+  ],
   "observability": {
     "enabled": true
   }

@@ -58,7 +58,7 @@ describe("GET /api/version", () => {
     const res = await app.request("/api/version", undefined, mockEnv);
 
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ name: "crypto-arb", phase: 2 });
+    await expect(res.json()).resolves.toEqual({ name: "crypto-arb", phase: 4 });
   });
 });
 
