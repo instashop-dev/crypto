@@ -178,7 +178,11 @@ export async function runScan(
     const opportunityIds = await insertOpportunities(db, scanId, top, snapshot.ts);
 
     const best = top[0];
-    if (best && best.netPct >= settings.min_profit_pct) {
+    // A negative threshold means demo mode: fill the best cycle uncondition-
+    // ally, as the dashboard documents — real best nets hover around -0.3%,
+    // so a plain ">= threshold" would make modest negatives (e.g. -0.1) dead.
+    const demoMode = settings.min_profit_pct < 0;
+    if (best && (demoMode || best.netPct >= settings.min_profit_pct)) {
       const balance = await getBalance(db, BASE_ASSET);
       if (balance >= settings.trade_size_usdt) {
         // Re-price against the same snapshot at the real notional; `null` means
