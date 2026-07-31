@@ -1101,12 +1101,46 @@
         : "no board in window",
     );
 
-    const error = data.answers ? data.answers.realizedVsPredictedCarryErrorPct : null;
-    $("report-carry-error").textContent = isNum(error) ? fmtSigned(error, 2) + "%" : "—";
+    // Question (a) is two populations, and the panel shows both. A single
+    // blended figure is what hid the selection: inside a 7-day window nothing
+    // reaches `max_hold`, so every close is an adverse one and a closed-only
+    // mean is negative whatever the book is really doing.
+    const carryAnswer = (data.answers && data.answers.realizedVsPredictedCarry) || {};
+
+    const closedErr = isNum(carryAnswer.closedAvgErrorPct)
+      ? carryAnswer.closedAvgErrorPct
+      : null;
+    $("report-carry-error").textContent =
+      closedErr === null ? "—" : fmtSigned(closedErr, 2) + "%";
     $("report-carry-error").className =
-      "stat-value num " + (isNum(error) ? signClass(error) : "flat");
+      "stat-value num " + (closedErr === null ? "flat" : signClass(closedErr));
+    // The reasons, not just the count: "4 closed" reads as a sample, "4 closed
+    // (3 rate_below_exit, 1 stale_data)" reads as the adverse sample it is.
+    const reasons = carryAnswer.closeReasons || {};
+    const reasonText = Object.keys(reasons)
+      .map(function (key) {
+        return reasons[key] + " " + key;
+      })
+      .join(", ");
     $("report-carry-error-unit").textContent =
-      carry.closedCount > 0 ? carry.closedCount + " closed positions" : "nothing closed yet";
+      carryAnswer.closedCount > 0
+        ? carryAnswer.closedCount + " closed" + (reasonText ? " (" + reasonText + ")" : "")
+        : "nothing closed yet";
+
+    // The other half: the open book marked to date, gross of the exit fees it
+    // has not paid. Labelled as such, because it is not comparable to a
+    // realised figure and must never be read as one.
+    const openMark = isNum(carryAnswer.openAvgAccruedVsPredictedPct)
+      ? carryAnswer.openAvgAccruedVsPredictedPct
+      : null;
+    $("report-carry-open").textContent =
+      openMark === null ? "—" : fmtSigned(openMark, 2) + "%";
+    $("report-carry-open").className =
+      "stat-value num " + (openMark === null ? "flat" : signClass(openMark));
+    $("report-carry-open-unit").textContent =
+      carryAnswer.openCount > 0
+        ? carryAnswer.openCount + " open, gross of exit fees"
+        : "nothing open";
 
     const survival = data.answers ? data.answers.spreadSurvivalRate : null;
     $("report-survival").textContent = isNum(survival)
@@ -1591,13 +1625,36 @@
               " · accrued " +
               fmtSigned(r.carryAccruedUsdt, 4)
             : "";
+        // The basis board polls on its own staggered cadence and fails on its
+        // own, exactly like the funding one — so it gets the same three-way
+        // branch. Silence here used to be indistinguishable from "OKX listed no
+        // dated futures", "not due yet" and "the poll threw".
+        const basis = r.basisError
+          ? " · basis unavailable (" + r.basisError + ")"
+          : r.basisSkipped
+            ? " · basis not due"
+            : " · " +
+              (r.basisCount || 0) +
+              " futures · best basis " +
+              (isNum(r.bestBasisNetAnnualPct) ? fmtPct(r.bestBasisNetAnnualPct, 2) : "n/a");
+        // The persistence pass re-prices the *previous* scan's spreads and is
+        // caught separately from the scan, so a failure here costs the survival
+        // measurement and nothing else. It stays silent when it re-priced
+        // nothing: on the first scan of a deployment there is nothing to check.
+        const persist = r.persistError
+          ? " · persistence failed (" + r.persistError + ")"
+          : r.spreadsRechecked
+            ? " · " + r.spreadsRechecked + " re-priced"
+            : "";
         toast(
           "Scan " +
             (r.source || "unknown") +
             " · " +
             spreads +
+            persist +
             funding +
             carry +
+            basis +
             " · " +
             r.durationMs +
             "ms",
@@ -1655,6 +1712,10 @@
     const btn = $("reset-btn");
     btn.disabled = true;
     try {
+      // `wipeHistory` is sent explicitly because the API defaults it to
+      // **false**: a bodyless reset keeps history, so that a stray curl cannot
+      // destroy a soak. This button is the one caller that really does mean
+      // "wipe it", and it says so rather than relying on a default.
       const r = await getJson("/api/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

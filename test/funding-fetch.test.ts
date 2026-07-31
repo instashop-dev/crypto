@@ -840,6 +840,82 @@ describe("capFundingBoard", () => {
     // The shipped default keeps the bottom of the board, not only the top.
     expect(kept.map((r) => r.quote.symbol).slice(-1)).toEqual(["A39"]);
   });
+
+  it("retains a held contract that has decayed out of both halves of the cap", () => {
+    // The dropout the keep-set exists for. `HELD` sits mid-board — below the
+    // top 2 and above the worst 1 — which is exactly where a carry position's
+    // contract lands as its rate decays. Without the keep-set its rows stop
+    // being written, `getLatestFundingRateFor` freezes, `rate_below_exit` can
+    // never fire, and the position dies of `stale_data` 24h later.
+    const ranked = [
+      row("gate", "AAA", 90),
+      row("gate", "BBB", 80),
+      row("gate", "HELD", 3),
+      row("gate", "WORST", -500),
+    ];
+
+    const without = capFundingBoard(ranked, MAJORS, 2, 1);
+    expect(without.map((r) => r.quote.symbol)).not.toContain("HELD");
+
+    const kept = capFundingBoard(ranked, MAJORS, 2, 1, [
+      { venue: "gate", symbol: "HELD" },
+    ]);
+    // Additive to the budget, and in ranked order — the exemption is a keep,
+    // not a promotion.
+    expect(kept.map((r) => r.quote.symbol)).toEqual(["AAA", "BBB", "HELD", "WORST"]);
+  });
+
+  it("keys the keep-set on the venue as well as the symbol", () => {
+    // A position on Gate's ADA says nothing about KuCoin's, and the same three
+    // letters are routinely two different contracts. Retaining both would be a
+    // silent budget leak on every venue that lists the name.
+    const ranked = [
+      row("gate", "AAA", 90),
+      row("gate", "ADA", 2),
+      row("kucoin", "BBB", 80),
+      row("kucoin", "ADA", 1),
+    ];
+
+    const kept = capFundingBoard(ranked, MAJORS, 1, 0, [
+      { venue: "gate", symbol: "ADA" },
+    ]);
+    expect(kept.map((r) => `${r.quote.venue}:${r.quote.symbol}`)).toEqual([
+      "gate:AAA",
+      "gate:ADA",
+      "kucoin:BBB",
+    ]);
+  });
+
+  it("does not double-count a held contract that is also a major or already kept", () => {
+    const ranked = [
+      row("gate", "AAA", 90),
+      row("gate", "BTC", 4),
+      row("gate", "ZZZ", 1),
+    ];
+
+    const kept = capFundingBoard(ranked, MAJORS, 1, 0, [
+      // Already a major, and already the top row: neither can be kept twice.
+      { venue: "gate", symbol: "BTC" },
+      { venue: "gate", symbol: "AAA" },
+    ]);
+    expect(kept.map((r) => r.quote.symbol)).toEqual(["AAA", "BTC"]);
+  });
+
+  it("case-folds the held symbol, and an empty keep-set changes nothing", () => {
+    const ranked = [row("gate", "AAA", 90), row("gate", "held", 1)];
+
+    expect(
+      capFundingBoard(ranked, MAJORS, 1, 0, [{ venue: "gate", symbol: "HELD" }]).map(
+        (r) => r.quote.symbol,
+      ),
+    ).toEqual(["AAA", "held"]);
+    expect(capFundingBoard(ranked, MAJORS, 1, 0, []).map((r) => r.quote.symbol)).toEqual([
+      "AAA",
+    ]);
+    expect(capFundingBoard(ranked, MAJORS, 1, 0).map((r) => r.quote.symbol)).toEqual([
+      "AAA",
+    ]);
+  });
 });
 
 describe("the module seam", () => {

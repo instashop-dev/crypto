@@ -1177,14 +1177,30 @@ export function createApp(): Hono<{ Bindings: Env }> {
 
   // -- administration -------------------------------------------------------
 
+  /**
+   * Restore the paper balances. **Wiping history is opt-in.**
+   *
+   * `{"wipeHistory": true}` and nothing else clears trades, opportunities,
+   * scans, funding rows, basis rows and the carry book. A bodyless call — a
+   * curl someone pasted, a retried request, a dashboard button that forgot to
+   * send its intent — resets the balances and keeps every recorded row.
+   *
+   * The default used to be the other way round, on the reading that "reset"
+   * unqualified means start over. That is the wrong default for *this*
+   * application: the balances are a paper fiction nothing has moved since Phase
+   * 12, while `funding_positions` and `opportunities` are a multi-day soak that
+   * `GET /api/report` is the only consumer of and that cannot be re-collected
+   * after the fact. Destroying the evidence has to be something the caller
+   * asked for in so many words.
+   */
   app.post("/api/reset", async (c) => {
     try {
       const body = await readJsonBody(c);
       if ("wipeHistory" in body && typeof body.wipeHistory !== "boolean") {
         return c.json({ error: "wipeHistory must be a boolean" }, 400);
       }
-      // Default true: "reset" without qualification means start over.
-      const wipeHistory = body.wipeHistory !== false;
+      // Opt-in, strictly: anything that is not an explicit `true` keeps history.
+      const wipeHistory = body.wipeHistory === true;
 
       await ensureSeeded(c.env.DB);
       await resetAll(c.env.DB, { wipeHistory });

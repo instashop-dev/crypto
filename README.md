@@ -94,12 +94,12 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/funding/positions?limit=50` | The paper carry book: open positions, the newest closed ones, and the realised-vs-predicted summary |
 | `POST /api/funding/positions/:id/close` | Close one position by hand (`close_reason = 'manual'`). 404 unknown, **409** already closed |
 | `GET /api/basis` | Newest OKX dated-futures basis board, best net annual first, with `qualifies` judged against the current `funding_min_annual_pct`. `summary` carries the best contract and the contango/backwardation split |
-| `GET /api/report?days=7` | The 7-day profitability report. `days` is **clamped** to `1..7` (the rate tables' retention) and `meta.requestedDays` says what was asked for |
+| `GET /api/report?days=7` | The 7-day profitability report. `days` is **clamped** to `1..7` (the rate tables' retention); `maxDays` on the response states that ceiling and `meta.requestedDays` says what was asked for |
 | `GET/PUT /api/settings` | See the settings table below |
-| `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
+| `POST /api/reset` | Restore balances. History is **kept** unless you send `{"wipeHistory": true}` — a bodyless reset must not be able to destroy a soak |
 | `GET /api/pairs` | The cached tradable-pair list the scanner prices against |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
-| `GET /api/tickers?symbols=BTCUSDT,...` | Debug passthrough: one raw dual-venue book snapshot (max 100 symbols) |
+| `GET /api/tickers?symbols=BTCUSDT,...` | Debug passthrough: one raw book snapshot resolved through the real source **fallback chain**, with `source` naming the link that answered (max 100 symbols) |
 
 ### Settings
 
@@ -348,9 +348,12 @@ is a **two-disposal** chain (USDT on the buy venue, then the asset on the sell
 venue) against the deleted triangle's three, so ~2% of notional is withheld
 rather than ~3%. Each disposal is valued on the book of the venue where that leg
 would actually execute. On the worked example above, at 100 USDT: base
-`200.7325`, TDS `2.007325`, tax due `0.18953025`, net `0.44223725` — still a ~2%
-drag on a ~0.6% edge, so the conclusion of the India-mode section holds with one
-leg less. That is the other half of why nothing fills.
+`200.71571405` (100 USDT on the buy venue plus `0.00166472` BTC marked at MEXC's
+60500 bid), TDS `2.00715714`, gross profit `0.61499833`, tax due `0.1844995`,
+net `0.43049883` — still a ~2% drag on a ~0.6% edge, so the conclusion of the
+India-mode section holds with one leg less. The figures are the ones
+`test/crossExchange.test.ts` asserts against `spreadTax` itself. That is the
+other half of why nothing fills.
 
 ## Funding-rate carry (cash-and-carry)
 
@@ -432,10 +435,11 @@ structurally cannot be attached to any of them.
    to `BTC`; dated futures, non-USDT margin and perps with an `expireDate` set
    are skipped.
 
-Worst case is 2 + 11 + 1 + 1 = **15 subrequests** for funding and 18 for a whole
-scan, against Cloudflare's free-plan limit of 50. The arithmetic is asserted in
-a comment beside `FUNDING_VENUES` in `src/funding.ts`, which is the only place
-the list is defined.
+Worst case is 2 + 11 + 1 + 1 = **15 subrequests** for funding, plus ≤3 for spot
+(Binance WS, MEXC REST, and one pair discovery on a cold table) and 2 for the
+Phase 17 basis pair, so **20** for a whole scan against Cloudflare's free-plan
+limit of 50. The arithmetic is spelled out in a table beside `FUNDING_VENUES` in
+`src/funding.ts`, which is the only place the list is defined.
 
 > **Reachability is unknown until deploy.** Binance and Bybit REST answer 403
 > from Cloudflare's egress in production and OKX does not; whether Gate and
@@ -467,6 +471,17 @@ a pure "top 25" cap discarded every one of them, so the most extreme figure on
 the board (a live Gate capture had `LA_USDT` at roughly -1548%/yr) was
 systematically the one row that could never be persisted.
 
+**Every contract the carry book is holding is also retained**, whatever it now
+pays and wherever it ranks. Without that exemption the cap silently broke the
+close rules: a tail position is opened *because* it paid, a rate that decays
+falls out of the top 20, and the moment its rows stop being written
+`getLatestFundingRateFor` freezes on the last one. `rate_below_exit` can then
+never fire — the frozen row still clears the exit bar — so the position idles
+for 24 hours and dies of `stale_data` with a fee-only loss, and that loss
+arrives in the acceptance report looking like a prediction error rather than the
+board artefact it is. The exemption costs one insert per poll per open position
+(bounded by `funding_max_positions`) and one D1 read to fetch the keep-set.
+
 **Cadence and retention.** The board is polled at most every 5 minutes, gated on
 the scan's own `funding_last_poll_ts` settings row — funding settles every 8
 hours, so a minutely scan has nothing to learn by asking every minute. The gate
@@ -478,7 +493,9 @@ due again. Only the scan writes the marker, and only after a poll has returned.
 Rows are kept for **7 days**, and
 the prune rides in the last `batch()` of the insert, after every row has landed.
 Inserts are chunked at 50 statements per batch (D1 caps statements per batch, and
-a four-venue board is ~144 rows), so a board is no longer written as one
+a four-venue board is at most 94 rows — `2 × (11 + 25)` from the two full-board
+venues plus 11 each from Bybit and OKX, which are polled per major and have no
+tail to contribute), so a board is no longer written as one
 transaction: a reader polling mid-write can see a *partial* board — never a
 mixture of two polls, since every row of a poll shares one timestamp. A chunk
 that *fails* part-way is worse than that: the chunks already written carry the
@@ -819,7 +836,14 @@ Five sections — `funding`, `carry`, `xchg`, `venueSpreads`, `basis` — plus
 
 ```jsonc
 "answers": {
-  "realizedVsPredictedCarryErrorPct": -13.0,   // (a) mean realised - predicted
+  "realizedVsPredictedCarry": {                // (a) two populations, never one
+    "closedAvgErrorPct": -13.0,                //     mean realised - predicted
+    "closedCount": 2,
+    "closeReasons": { "rate_below_exit": 1, "stale_data": 1 },
+    "openAvgAccruedVsPredictedPct": 1.4,       //     open book, marked to date
+    "openCount": 3,
+    "note": "closed positions are adverse-selected in a window shorter than…"
+  },
   "spreadSurvivalRate": 0.6,                   // (b) fraction still positive later
   "anyStrategyClearedBreakEven": {             // (c) the whole effort's yes/no
     "funding": true, "carry": true, "xchg": false,
@@ -828,11 +852,51 @@ Five sections — `funding`, `carry`, `xchg`, `venueSpreads`, `basis` — plus
 }
 ```
 
+**(a) is two populations because a single number would be biased, and biased in
+a knowable direction.** `funding_hold_days` is 30; this endpoint serves at most
+7 days. So `max_hold` — the ending a position that *worked* reaches — cannot
+fire inside any window you can ask for, and everything that closes inside the
+window closed early for an adverse reason: the rate fell through
+`funding_exit_annual_pct`, or the board stopped quoting it. The healthy
+positions are all still open and contribute nothing. A closed-only mean is
+therefore negative *by construction* — it would indict the entry model even on a
+book where every position was paying exactly what it promised.
+
+So the closed mean is reported with its **count and its close reasons** (the
+absence of `max_hold` is visible, not inferred), and beside it the open book is
+marked to date: accrued-so-far, annualised over the hold-so-far, **with no fees
+charged**, because the round trip is paid on exit and these have not exited.
+That mark is gross where the prediction is net, so it reads slightly optimistic
+— the opposite bias, which is exactly why both are shown and neither is blended
+into the other. When a soak eventually runs past 30 days, `max_hold` closes
+appear in `closeReasons` and the closed mean becomes unbiased on its own; the
+shape of the answer does not change, only what is in it.
+
+Two supporting fields exist for the same reason. `carry.closeReasons[]` carries
+`avgAccrualCount` beside `avgSpannedSettlements` — settlements actually booked
+against settlement periods the hold spanned — so a position that booked 2 of 9
+reads as a coverage hole rather than a bad carry. And `carry.openMarks[]` lists
+the per-position marks (capped at 50; the average above is over the whole book
+regardless).
+
 **Break-even here is a net figure above zero**, not `funding_min_annual_pct` —
 in all five sections, with no exception. The fee drag has already been
 subtracted from every one of those percentages, so zero *is* the arithmetic; the
 thresholds are display preferences, and each section reports its `qualifying*`
 count separately for whoever wants that question instead.
+
+**`venueSpreads` and the dashboard's cross-venue table are different
+populations, and both are right.** This section is bounded to the 11 verified
+majors; `GET /api/funding`'s `spreads` is the whole board, every symbol quoted
+by two or more venues, tail included, with a `verifiedPair: false` badge on the
+rows where three shared letters may well be two unrelated projects. An
+*aggregate* cannot carry that badge — one unverified pair with a 900%/yr
+"differential" would set `maxGrossAnnualPct` for the week — so the report takes
+the narrow population. The visible consequence is that
+`answers.anyStrategyClearedBreakEven.venueSpreads` can read `false` while the
+dashboard shows a large spread. The response says so itself:
+`venueSpreads.symbols` lists what was covered and `venueSpreads.note` states the
+difference in one sentence.
 
 `xchg` is the section where this is easiest to get wrong, so it states both
 explicitly: `survivalRate` is the fraction of measured spreads with

@@ -133,10 +133,15 @@ Cheap columns on `opportunities` (`skew_ms`, `persist_net_pct`, `persist_checked
 - Timestamp the WS window end and the MEXC REST completion in `src/binance.ts`'s dual snapshot; persist the skew per spread row.
 - Each scan, re-price the *previous* scan's top spreads against the fresh dual snapshot and record the surviving net — zero extra subrequests.
 - Decision rule: if the surviving-net distribution never clears 0.2002%, the dashboard marks the strategy display-only and no further effort goes to it.
+  > **As shipped the bar is "surviving net > 0", not 0.2002%.** `persist_net_pct` is `evaluateSpread` re-run on a later book and has *already* paid both legs' taker fees, so holding it against a **gross** two-leg break-even charges the same round trip twice and would condemn spreads that in fact broke even. The gross figure (`(1/(1 − fee)² − 1) × 100` = 0.2003004% at the shipped 0.1%; the 0.2002% here came from a differently-derived expression) survives only in `meta.settings.xchgBreakEvenPct`, as the fee basis, judged against nothing. See README, "The 7-day profitability report".
 
 ### R7 — 7-day profitability report
 
 `GET /api/report?days=7` (7-day funding retention already supports it): per strategy — realized vs predicted carry error (R2), spread survival stats (R6), triangular best-net distribution (documents the −0.3% floor). One dashboard card. This is the acceptance test for everything above.
+
+> **As shipped there is no triangular section.** The strategy was deleted in Phase 12 along with every paper-fill path — its gross edge was zero, so there is no distribution left to document and a section reporting one would be reporting on rows nothing writes. The shipped report has five sections: `funding`, `carry`, `xchg`, `venueSpreads`, `basis`. Historical triangular rows in `opportunities` are still served by `GET /api/opportunities?strategy=triangular`; the report simply does not aggregate them.
+>
+> **And (a) is answered as two labelled populations, not one number.** `funding_hold_days` (30) exceeds the longest window this endpoint serves (7), so `max_hold` cannot fire inside it and a closed-only mean is adverse-selected by construction. `answers.realizedVsPredictedCarry` carries the closed mean, its count, its close reasons, and the open book marked to date beside them.
 
 ---
 
@@ -157,7 +162,7 @@ Phase 8's finding stands and shapes everything above: with every leg a VDA dispo
 After implementing R1–R3 + R6–R7 and a 3–7 day soak, `GET /api/report` must be able to answer:
 
 1. **Realized vs predicted carry error** — including the widened universe's fat-tail rates (does a 200%-annualized print on a small cap survive even 3 days?).
-2. **Spread survival rate** — what fraction of cross-exchange spreads outlive the ~4s skew and clear 0.2002%?
+2. **Spread survival rate** — what fraction of cross-exchange spreads outlive the ~4s skew and stay **above zero** once the round trip is paid? (Asked here as "clear 0.2002%"; the shipped bar is a positive `persist_net_pct`, which is the same question net of fees rather than gross — see the note under R6.)
 3. **Did any strategy clear its break-even over the window?** — the whole effort's yes/no.
 
 If (3) is "no" across a few weeks of soak, that is itself the answer: the honest conclusion would be that this venue/fee/latency envelope offers carry-grade returns only, and the dashboard should say so.

@@ -512,11 +512,35 @@ export async function pollFundingRates(
     settings.perp_fee_rate,
     settings.funding_hold_days,
   );
+  // Every contract the carry book is holding is retained through the cap,
+  // whatever it now pays. Without this a tail position's rows stop being
+  // written the moment its rate decays out of the top 20,
+  // `getLatestFundingRateFor` freezes on the last row written,
+  // `rate_below_exit` can never fire against a stale row that still clears the
+  // bar, and the position instead idles for 24 hours and dies of `stale_data`
+  // with a fee-only loss — a board artefact that arrives in the acceptance
+  // report dressed as a prediction error. One extra read per poll, bounded by
+  // `funding_max_positions`.
+  //
+  // **Best-effort, and deliberately so.** The carry layer is downstream of the
+  // board in every other respect — it runs after the rows are committed, in a
+  // `catch` of its own, so that a carry failure costs positions and never
+  // costs the series. Letting this read throw would invert that: an unreadable
+  // `funding_positions` would take the whole board down with it. A failure
+  // here costs the retention exemption for one poll, which the 24-hour
+  // staleness window absorbs.
+  let held: FundingPosition[] = [];
+  try {
+    held = await listOpenFundingPositions(db);
+  } catch (err) {
+    console.warn(`funding board keep-set unavailable: ${errorMessage(err)}`);
+  }
   const kept = capFundingBoard(
     ranked,
     assets,
     FUNDING_BOARD_TOP_N,
     FUNDING_BOARD_BOTTOM_N,
+    held,
   );
 
   const rows: FundingRateInput[] = kept.map((r) => ({

@@ -16,6 +16,7 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ASSET_UNIVERSE, BASE_ASSET, perpAssets, STRATEGY_CROSS_EXCHANGE } from "../src/config";
 import {
+  accrueFundingPosition,
   closeFundingPosition,
   ensureSeeded,
   insertBasisRates,
@@ -31,9 +32,11 @@ import {
 import { feeDragAnnualPct, rankVenueSpreads, venueSpreadDragAnnualPct } from "../src/engine";
 import {
   buildReport,
+  CARRY_ANSWER_NOTE,
   parseReportDays,
   REPORT_MAX_DAYS,
   twoLegBreakEvenPct,
+  VENUE_SPREAD_POPULATION_NOTE,
   xchgVerdict,
   type Report,
 } from "../src/report";
@@ -221,7 +224,18 @@ describe("buildReport - an empty database", () => {
     expect(r.basis.polls).toBe(0);
     expect(r.basis.maxBestNetAnnualPct).toBeNull();
 
-    expect(r.answers.realizedVsPredictedCarryErrorPct).toBeNull();
+    // (a) is a structure even when nothing has happened: an empty book has an
+    // empty *population*, and both halves of it say so separately.
+    expect(r.answers.realizedVsPredictedCarry).toEqual({
+      closedAvgErrorPct: null,
+      closedCount: 0,
+      closeReasons: {},
+      openAvgAccruedVsPredictedPct: null,
+      openCount: 0,
+      note: CARRY_ANSWER_NOTE,
+    });
+    expect(r.carry.openMarks).toEqual([]);
+    expect(r.carry.closeReasons).toEqual([]);
     expect(r.answers.spreadSurvivalRate).toBeNull();
     expect(r.answers.anyStrategyClearedBreakEven).toEqual({
       funding: false,
@@ -349,13 +363,21 @@ describe("buildReport - the carry section", () => {
     symbol: string;
     entryTs: number;
     predicted: number;
-    close?: { ts: number; realizedPnl: number; realizedAnnual: number };
+    notional?: number;
+    /** Funding booked so far, and over how many settlements. */
+    accrued?: { usdt: number; count: number };
+    close?: {
+      ts: number;
+      realizedPnl: number;
+      realizedAnnual: number;
+      reason?: string;
+    };
   }): Promise<number> {
     const id = await insertFundingPosition(env.DB, null, {
       venue: "okx",
       symbol: opts.symbol,
       instrument: `${opts.symbol}-USDT-SWAP`,
-      notionalUsdt: 1000,
+      notionalUsdt: opts.notional ?? 1000,
       entryTs: opts.entryTs,
       entryRate: 0.0001,
       entryAnnualizedPct: opts.predicted + 3.65,
@@ -364,10 +386,19 @@ describe("buildReport - the carry section", () => {
       perpFeeRate: 0.0005,
       predictedNetAnnualPct: opts.predicted,
     });
+    if (opts.accrued) {
+      await accrueFundingPosition(
+        env.DB,
+        id,
+        opts.accrued.usdt,
+        opts.accrued.count,
+        opts.entryTs,
+      );
+    }
     if (opts.close) {
       await closeFundingPosition(env.DB, id, {
         closeTs: opts.close.ts,
-        closeReason: "max_hold",
+        closeReason: opts.close.reason ?? "max_hold",
         realizedPnlUsdt: opts.close.realizedPnl,
         realizedAnnualPct: opts.close.realizedAnnual,
       });
@@ -404,7 +435,9 @@ describe("buildReport - the carry section", () => {
     expect(r.carry.best!.symbol).toBe("SOL");
     expect(r.carry.worst!.symbol).toBe("XRP");
 
-    expect(r.answers.realizedVsPredictedCarryErrorPct).toBeCloseTo(-13, 6);
+    expect(r.answers.realizedVsPredictedCarry.closedAvgErrorPct).toBeCloseTo(-13, 6);
+    expect(r.answers.realizedVsPredictedCarry.closedCount).toBe(2);
+    expect(r.answers.realizedVsPredictedCarry.openCount).toBe(2);
     // Realised P&L over the window is positive, so carry cleared its costs.
     expect(r.answers.anyStrategyClearedBreakEven.carry).toBe(true);
   });
@@ -427,6 +460,141 @@ describe("buildReport - the carry section", () => {
     expect(r.carry.openCount).toBe(1);
     expect(r.carry.avgPredictionErrorPct).toBeNull();
     expect(r.answers.anyStrategyClearedBreakEven.carry).toBe(false);
+  });
+
+  it("marks the open book to date, fee-free, beside the closed mean", async () => {
+    // The bias this structure exists for, in one fixture. Two positions closed
+    // inside the window — and inside a 7-day window nothing can reach
+    // `max_hold` (the planned hold is 30 days), so both closed for adverse
+    // reasons. Two more are open and doing fine. A single blended scalar would
+    // have reported only the first pair.
+    await seedPosition({
+      symbol: "SOL",
+      entryTs: NOW - 6 * DAY_MS,
+      predicted: 12,
+      close: {
+        ts: NOW - 3 * DAY_MS,
+        realizedPnl: -2,
+        realizedAnnual: -8,
+        reason: "rate_below_exit",
+      },
+    });
+    await seedPosition({
+      symbol: "XRP",
+      entryTs: NOW - 6 * DAY_MS,
+      predicted: 20,
+      close: {
+        ts: NOW - 2 * DAY_MS,
+        realizedPnl: -3,
+        realizedAnnual: -12,
+        reason: "stale_data",
+      },
+    });
+    // 2 USDT on 1000 over 2 days: (2/1000) x (365/2) x 100 = 36.5%/yr gross.
+    await seedPosition({
+      symbol: "BTC",
+      entryTs: NOW - 2 * DAY_MS,
+      predicted: 10,
+      accrued: { usdt: 2, count: 6 },
+    });
+    // 0.5 USDT on 1000 over 1 day: (0.5/1000) x 365 x 100 = 18.25%/yr gross.
+    await seedPosition({
+      symbol: "ETH",
+      entryTs: NOW - DAY_MS,
+      predicted: 8,
+      accrued: { usdt: 0.5, count: 3 },
+    });
+
+    const r = await report();
+    const a = r.answers.realizedVsPredictedCarry;
+
+    // The closed half: adverse by construction, and the reasons prove it —
+    // there is no `max_hold` in here and there cannot be.
+    expect(a.closedCount).toBe(2);
+    expect(a.closedAvgErrorPct).toBeCloseTo(((-8 - 12) + (-12 - 20)) / 2, 6);
+    expect(a.closeReasons).toEqual({ rate_below_exit: 1, stale_data: 1 });
+    expect(a.closeReasons.max_hold).toBeUndefined();
+
+    // The open half: gross accrual annualised over the hold so far. **No fee is
+    // charged** — the round trip is paid on exit and neither has exited — so
+    // amortising one here would invent a cost over a moving denominator.
+    expect(a.openCount).toBe(2);
+    expect(a.openAvgAccruedVsPredictedPct).toBeCloseTo(
+      ((36.5 - 10) + (18.25 - 8)) / 2,
+      6,
+    );
+    // ...and it is emphatically not the fee-charged figure a closed position
+    // would report: 1000 USDT costs 3 USDT of round trip, which over two days
+    // would be a −54.75%/yr drag all by itself.
+    expect(a.openAvgAccruedVsPredictedPct).toBeGreaterThan(0);
+    expect(a.note).toBe(CARRY_ANSWER_NOTE);
+
+    const btc = r.carry.openMarks.find((m) => m.symbol === "BTC")!;
+    expect(btc.holdDays).toBeCloseTo(2, 6);
+    expect(btc.accruedFundingUsdt).toBe(2);
+    expect(btc.accrualCount).toBe(6);
+    expect(btc.accruedAnnualPct).toBeCloseTo(36.5, 6);
+    expect(btc.predictedNetAnnualPct).toBe(10);
+    expect(btc.accruedVsPredictedPct).toBeCloseTo(26.5, 6);
+    expect(r.carry.openMarks).toHaveLength(2);
+
+    // The accrual coverage that says whether the closed figures were even
+    // measurable: booked settlements against the settlements the hold spanned.
+    // Three days at the 8-hour cadence spans 9; a close that booked none of
+    // them is a hole in the data, not a carry that paid nothing.
+    const below = r.carry.closeReasons.find((c) => c.reason === "rate_below_exit")!;
+    expect(below.count).toBe(1);
+    expect(below.avgErrorPct).toBeCloseTo(-20, 6);
+    expect(below.avgAccrualCount).toBe(0);
+    expect(below.avgSpannedSettlements).toBeCloseTo(9, 6);
+  });
+
+  it("does not blend the two halves into one number", async () => {
+    // An open book that is doing well and a single adverse close. The closed
+    // mean must stay negative and the open mark positive; a scalar that
+    // averaged them would report a number no position ever experienced.
+    await seedPosition({
+      symbol: "SOL",
+      entryTs: NOW - 5 * DAY_MS,
+      predicted: 30,
+      close: {
+        ts: NOW - 4 * DAY_MS,
+        realizedPnl: -3,
+        realizedAnnual: -100,
+        reason: "stale_data",
+      },
+    });
+    await seedPosition({
+      symbol: "BTC",
+      entryTs: NOW - 4 * DAY_MS,
+      predicted: 10,
+      // 4 USDT on 1000 over 4 days: (4/1000) x (365/4) x 100 = 36.5%/yr.
+      accrued: { usdt: 4, count: 12 },
+    });
+
+    const a = (await report()).answers.realizedVsPredictedCarry;
+    expect(a.closedAvgErrorPct).toBeCloseTo(-130, 6);
+    expect(a.openAvgAccruedVsPredictedPct).toBeCloseTo(26.5, 6);
+    expect(a.closedCount).toBe(1);
+    expect(a.openCount).toBe(1);
+  });
+
+  it("marks a position entered at the report's own clock as null, not infinity", async () => {
+    // A zero-length hold has no annualised return: the divisor is zero and any
+    // finite answer would be an artefact of the division.
+    await seedPosition({
+      symbol: "BTC",
+      entryTs: NOW,
+      predicted: 10,
+      accrued: { usdt: 1, count: 1 },
+    });
+
+    const r = await report();
+    expect(r.carry.openMarks[0].accruedAnnualPct).toBeNull();
+    expect(r.carry.openMarks[0].accruedVsPredictedPct).toBeNull();
+    expect(r.answers.realizedVsPredictedCarry.openAvgAccruedVsPredictedPct).toBeNull();
+    // The position is still on the book — "unmeasurable" is not "absent".
+    expect(r.answers.realizedVsPredictedCarry.openCount).toBe(1);
   });
 });
 
@@ -677,6 +845,15 @@ describe("buildReport - the cross-venue spread section", () => {
     const r = await report();
     expect(r.venueSpreads.polls).toBe(0);
     expect(r.venueSpreads.maxGrossAnnualPct).toBeNull();
+
+    // ...and the response says so itself, because `GET /api/funding`'s
+    // `spreads` *does* show that 899-point differential. A reader looking at a
+    // big number on the dashboard and `venueSpreads: false` here has to be able
+    // to tell the two populations apart without reading the source.
+    expect(r.venueSpreads.symbols).toEqual(ASSETS);
+    expect(r.venueSpreads.note).toBe(VENUE_SPREAD_POPULATION_NOTE);
+    expect(r.venueSpreads.note).toMatch(/verified majors/);
+    expect(r.answers.anyStrategyClearedBreakEven.venueSpreads).toBe(false);
   });
 });
 

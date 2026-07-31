@@ -387,8 +387,27 @@ describe("POST /api/reset", () => {
     await seedHistory(2_000, 5);
   });
 
-  it("wipes history by default", async () => {
+  it("keeps history by default — a bodyless reset cannot destroy a soak", async () => {
+    // The default is **opt-in**, and deliberately so. The balances are a paper
+    // fiction nothing has moved since Phase 12; `opportunities` and
+    // `funding_positions` are a multi-day soak that `GET /api/report` is the
+    // only consumer of and that cannot be re-collected after the fact. A curl
+    // someone pasted without a body must not be able to delete it.
     const res = await send("/api/reset", "POST");
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as PortfolioBody & { wipeHistory: boolean };
+    expect(body.wipeHistory).toBe(false);
+    expect(body.equityUsdt).toBe(DEFAULTS.initial_usdt);
+
+    const trades = (await (await get("/api/trades")).json()) as { count: number };
+    expect(trades.count).toBe(1);
+    const scans = (await (await get("/api/scans")).json()) as { count: number };
+    expect(scans.count).toBe(1);
+  });
+
+  it("wipes history only on an explicit true", async () => {
+    const res = await send("/api/reset", "POST", { wipeHistory: true });
     expect(res.status).toBe(200);
 
     const body = (await res.json()) as PortfolioBody & { wipeHistory: boolean };
@@ -423,7 +442,7 @@ describe("POST /api/reset", () => {
 
   it("keeps tuned settings across a reset", async () => {
     await send("/api/settings", "PUT", { xchg_min_profit_pct: -0.5 });
-    await send("/api/reset", "POST");
+    await send("/api/reset", "POST", { wipeHistory: true });
 
     const settings = (await (await get("/api/settings")).json()) as {
       xchg_min_profit_pct: number;
@@ -670,7 +689,10 @@ describe("GET /api/portfolio - tax block", () => {
     await seedTrade(7_100, GROSS_PROFIT, { tax: TAXED });
     expect((await portfolio()).tax.tdsWithheldUsdt).toBeGreaterThan(0);
 
-    const res = await send("/api/reset", "POST");
+    // The tax block is derived from `trades`, so zeroing it needs the wipe —
+    // which is opt-in. A bodyless reset restores the balance and keeps the
+    // trade, and its tax totals with it.
+    const res = await send("/api/reset", "POST", { wipeHistory: true });
     const body = (await res.json()) as PortfolioBody;
 
     expect(body.tax.trades).toBe(0);
@@ -1791,7 +1813,11 @@ describe("POST /api/reset - funding rows", () => {
     await send("/api/reset", "POST", { wipeHistory: false });
     expect((await funding()).count).toBe(11);
 
+    // ...and a bodyless reset keeps it too: the wipe is opt-in.
     await send("/api/reset", "POST");
+    expect((await funding()).count).toBe(11);
+
+    await send("/api/reset", "POST", { wipeHistory: true });
     const wiped = await funding();
     expect(wiped.count).toBe(0);
     expect(wiped.ts).toBeNull();

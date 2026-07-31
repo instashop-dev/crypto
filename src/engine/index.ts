@@ -48,7 +48,6 @@ export {
   MS_PER_DAY,
   realizedFigures,
   settlementBoundaries,
-  settlementsCrossed,
   shouldClose,
   type CarryCloseInput,
   type CarryCloseReason,

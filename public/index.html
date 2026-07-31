@@ -687,16 +687,25 @@
           </div>
         </div>
 
-        <p class="subhead">The two measured error terms</p>
+        <p class="subhead">The measured error terms</p>
         <div class="stats">
           <div class="stat">
             <span
               class="stat-label"
-              title="Mean of realised annual % minus the net annual % predicted at entry, over the positions closed in the window. Negative means entry over-promised."
-              >Carry prediction error</span
+              title="Mean of realised annual % minus the net annual % predicted at entry, over the positions CLOSED in the window. Adverse-selected: a 7-day window is shorter than the 30-day planned hold, so max_hold cannot fire and only rate_below_exit and stale_data closes appear here. Read it beside the reasons underneath."
+              >Carry error (closed)</span
             >
             <span class="stat-value num" id="report-carry-error">&mdash;</span>
             <span class="stat-unit" id="report-carry-error-unit">%/yr, closed</span>
+          </div>
+          <div class="stat">
+            <span
+              class="stat-label"
+              title="Mean of accrued-so-far annualised over the hold-so-far, minus the net annual % predicted at entry, over the OPEN book. No fees are charged: the round trip is paid on exit and these positions have not exited, so this reads slightly optimistic — the opposite bias to the closed figure beside it."
+              >Carry mark (open)</span
+            >
+            <span class="stat-value num" id="report-carry-open">&mdash;</span>
+            <span class="stat-unit" id="report-carry-open-unit">%/yr, open</span>
           </div>
           <div class="stat">
             <span

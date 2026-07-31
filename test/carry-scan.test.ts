@@ -34,6 +34,7 @@ import {
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { app } from "../src/index";
+import { buildReport } from "../src/report";
 import { runScan } from "../src/scan";
 import type { BookTickerEntry, Env, FundingVenue } from "../src/types";
 import { fundingQuote, snapshotOf } from "./funding-stub";
@@ -706,6 +707,163 @@ describe("runScan - carry degradation isolation", () => {
     expect(result.carryError).toBeUndefined();
     expect(result.positionsOpened).toBe(0);
     await expect(positions()).resolves.toHaveLength(0);
+  });
+});
+
+/**
+ * The full carry lifecycle on a **capped Gate board**, which is the shape the
+ * production scanner actually persists and the one the rest of this file's
+ * Bybit fixtures cannot produce: Bybit is polled per major and has no tail, so
+ * nothing on its board can ever be capped away.
+ *
+ * The bug this pins: a position is opened on a tail contract *because* it paid,
+ * the rate decays, the contract falls out of the 20-top/5-bottom cap, and its
+ * rows stop being written. `getLatestFundingRateFor` then freezes on the last
+ * row persisted — one that still clears the exit bar — so `rate_below_exit` can
+ * never fire, the position idles for 24 hours and dies of `stale_data` with a
+ * fee-only loss. That loss lands in `GET /api/report` looking like a prediction
+ * error, which is the acceptance measurement, so a board artefact was arriving
+ * dressed as a finding about the strategy.
+ */
+describe("runScan - a held tail contract decaying out of the capped board", () => {
+  /** Gate's 30 non-major contracts; `TAIL00` is the one a position is opened on. */
+  const TAILS = Array.from({ length: 30 }, (_, i) => `TAIL${String(i).padStart(2, "0")}`);
+
+  /** The majors, priced under the 5% opening bar so nothing opens on them. */
+  const MAJOR_RATE = 0.00005; // 5.475%/yr gross, 1.825% net — below the bar.
+
+  /**
+   * Phase 1: `TAIL00` is the best-paying contract on the board, so it is inside
+   * the top 20 and a position opens on it.
+   */
+  function phaseOne(): Array<[FundingVenue, string, number]> {
+    return [
+      ...ASSETS.map((s) => ["gate", s, MAJOR_RATE] as [FundingVenue, string, number]),
+      ["gate", "TAIL00", 0.0002],
+      ...TAILS.slice(1).map(
+        (s, i) => ["gate", s, 0.00015 - i * 0.000001] as [FundingVenue, string, number],
+      ),
+    ];
+  }
+
+  /**
+   * Phase 2: `TAIL00` has collapsed to 0.1095%/yr gross (−3.54% net, below the
+   * zero exit bar) and now ranks **25th** of Gate's 30 non-majors — outside the
+   * best 20 and outside the worst 5, which are held by the five negative
+   * contracts below it. Exactly the dead zone the cap discards.
+   */
+  function phaseTwo(): Array<[FundingVenue, string, number]> {
+    return [
+      ...ASSETS.map((s) => ["gate", s, MAJOR_RATE] as [FundingVenue, string, number]),
+      // Ranks 1-20.
+      ...TAILS.slice(1, 21).map(
+        (s, i) => ["gate", s, 0.00015 - i * 0.000001] as [FundingVenue, string, number],
+      ),
+      // Ranks 21-24: the rows that prove the dead zone is real, because they
+      // are dropped and `TAIL00` — identically placed — is not.
+      ...TAILS.slice(21, 25).map(
+        (s, i) => ["gate", s, 0.0001 - i * 0.000001] as [FundingVenue, string, number],
+      ),
+      // Rank 25: the held contract, decayed.
+      ["gate", "TAIL00", 0.000001],
+      // Ranks 26-30: the deepest negatives, which own the bottom-5 budget.
+      ...TAILS.slice(25).map(
+        (s, i) => ["gate", s, -0.0001 - i * 0.00001] as [FundingVenue, string, number],
+      ),
+    ];
+  }
+
+  /** The `(venue, symbol)` pairs persisted at the newest board timestamp. */
+  async function latestBoard(): Promise<string[]> {
+    const { results } = await env.DB.prepare(
+      "SELECT venue, symbol FROM funding_rates" +
+        " WHERE ts = (SELECT MAX(ts) FROM funding_rates)",
+    ).all<{ venue: string; symbol: string }>();
+    return (results ?? []).map((r) => `${r.venue}:${r.symbol}`);
+  }
+
+  beforeEach(async () => {
+    // One slot, so the position under test is the only one on the book.
+    await updateSettings(env.DB, { funding_max_positions: 1 });
+  });
+
+  it("keeps writing its rows, so rate_below_exit fires instead of stale_data", async () => {
+    const first = await runScan(env, "manual", deps(boardOf(phaseOne())));
+    expect(first.positionsOpened).toBe(1);
+
+    const [held] = await openPositions();
+    expect(held.venue).toBe("gate");
+    expect(held.symbol).toBe("TAIL00");
+    expect(held.entryTs).toBe(T0);
+
+    // The cap is doing its job at this point: 11 majors + 25 of the 30 tails.
+    expect(await latestBoard()).toHaveLength(ASSETS.length + 25);
+
+    // One settlement later, on a board where the contract has decayed into the
+    // dead zone between the two halves of the cap.
+    clock = T0 + PERIOD_MS;
+    const second = await runScan(env, "manual", deps(boardOf(phaseTwo())));
+
+    const board = await latestBoard();
+    // The dead zone is real: its four neighbours were all dropped...
+    for (const dropped of ["TAIL21", "TAIL22", "TAIL23", "TAIL24"]) {
+      expect(board, dropped).not.toContain(`gate:${dropped}`);
+    }
+    // ...and the held contract, which ranks below every one of them, was kept
+    // anyway. That is the keep-set, and nothing else could have kept it.
+    expect(board).toContain("gate:TAIL00");
+    // Additive to the budget, not carved out of it: 25 tail rows plus the one
+    // retained contract, plus the majors.
+    expect(board).toHaveLength(ASSETS.length + 26);
+
+    // ...so the position is closed by the *rate*, on the pass that saw it fall,
+    // rather than idling for 24 hours and dying of a data outage that never
+    // happened.
+    expect(second.positionsClosed).toBe(1);
+    const [closed] = (await positions()).filter((p) => p.status === "closed");
+    expect(closed.symbol).toBe("TAIL00");
+    expect(closed.closeReason).toBe("rate_below_exit");
+    expect(closed.closeTs).toBe(clock);
+    // One settlement was booked before it closed: accrue-then-close, so the
+    // exit does not forfeit the funding the position actually saw. It is
+    // priced at the row in force *at the boundary* — this poll's decayed one,
+    // which lands on the boundary exactly — not at the entry rate.
+    expect(closed.accrualCount).toBe(1);
+    expect(closed.accruedFundingUsdt).toBeCloseTo(0.000001 * NOTIONAL, 8);
+    expect(closed.realizedPnlUsdt).toBeCloseTo(0.000001 * NOTIONAL - ROUND_TRIP_FEE, 6);
+    // Which is the finding, stated plainly: the fee-only loss is *real* here,
+    // and it is attributed to a rate that collapsed rather than to a board that
+    // stopped reporting. Under the old cap this same position would still be
+    // open, accruing nothing, 23 hours from a `stale_data` close.
+    expect(closed.realizedPnlUsdt).toBeLessThan(0);
+  });
+
+  it("reports the close under its own reason, not blended into the mean", async () => {
+    await runScan(env, "manual", deps(boardOf(phaseOne())));
+    clock = T0 + PERIOD_MS;
+    await runScan(env, "manual", deps(boardOf(phaseTwo())));
+
+    // `buildReport` rather than the route, because the route reads the wall
+    // clock and this suite's clock is an epoch-aligned fiction.
+    const body = await buildReport(env.DB, { requested: 7, days: 7 }, clock);
+
+    // The acceptance answer names the population it is made of. A `max_hold`
+    // close cannot appear inside a 7-day window against a 30-day planned hold,
+    // and the absence is visible here rather than something a reader has to
+    // know to look for.
+    expect(body.answers.realizedVsPredictedCarry.closedCount).toBe(1);
+    expect(body.answers.realizedVsPredictedCarry.closeReasons).toEqual({
+      rate_below_exit: 1,
+    });
+
+    // And the accrual coverage behind it: one settlement spanned, one booked.
+    // A close that had booked none of them would be a hole in the data rather
+    // than a carry that paid nothing.
+    const [reason] = body.carry.closeReasons;
+    expect(reason.reason).toBe("rate_below_exit");
+    expect(reason.count).toBe(1);
+    expect(reason.avgAccrualCount).toBe(1);
+    expect(reason.avgSpannedSettlements).toBe(1);
   });
 });
 
