@@ -2,7 +2,8 @@
 
 A fully serverless scanner that measures two things every minute and writes down
 what it saw: **cross-exchange spot spreads** (the same market on Binance and
-MEXC) and **perpetual funding rates** (Bybit / OKX). **Nothing is traded, and
+MEXC) and **perpetual funding rates** (Bybit, OKX, Gate and KuCoin, all four
+polled on every board). **Nothing is traded, and
 nothing is simulated as traded** — no orders, and since Phase 12 no paper fills
 either.
 
@@ -32,11 +33,12 @@ POST /api/scan ──────────►    │
         [cross-exch]  price every X/USDT market on BOTH books, both ways →
                       keep the better → rank → persist the top 10
                               │
-              api.bybit.com / www.okx.com  ◄── perp funding rates, polled at
-                              │                most every 5 min (gated)
-        [funding]     annualise the next funding rate of all 11 perps, net of
-                      4 legs of fees over the assumed holding period →
-                      persist the whole board
+      bybit · okx · gate · kucoin (all four)  ◄── perp funding rates, polled at
+                              │                   most every 5 min (gated),
+                              │                   concurrent + allSettled
+        [funding]     annualise the next funding rate of every quoted perp, net
+                      of 4 legs of fees over the assumed holding period → rank →
+                      persist the majors + each venue's best 25
                               │
                               ▼
         D1 (SQLite): pairs · scans · opportunities · funding_rates · settings
@@ -71,9 +73,9 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/opportunities?limit=50` | Ranked spreads per scan, with per-leg detail and a `qualifies` flag judged against the current `xchg_min_profit_pct`. `&strategy=cross_exchange\|triangular` filters (the latter reads history only); an unknown value is a 400 |
 | `GET /api/trades?limit=50` | **Historical.** Fills booked before Phase 12. Same `&strategy=` filter |
 | `GET /api/scans?limit=20` | Scan log (trigger, source, duration, errors, spread counts) |
-| `GET /api/funding` | Newest funding board, best net carry first, with `qualifies` judged against the current threshold |
-| `GET /api/funding/history?symbol=BTC&limit=100` | One symbol's rate series, newest first (limit clamped to 500) |
-| `POST /api/funding/refresh` | Poll the perp venues now, bypassing the 5-minute gate. 502 if both venues fail |
+| `GET /api/funding` | Newest funding board across every venue, best net carry first, with `qualifies` judged against the current threshold. `venues` reports each venue's share; `venue` names the source of the top row |
+| `GET /api/funding/history?symbol=BTC&limit=100` | One symbol's rate series, newest first (limit clamped to 500). `&venue=gate` narrows it to one venue — a symbol now has a row per venue per poll; an unknown venue is a 400 |
+| `POST /api/funding/refresh` | Poll every perp venue now, bypassing the 5-minute gate. 200 with `venueErrors` when some venues fail; 502 only when they all do |
 | `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
@@ -308,28 +310,74 @@ The split is a **re-pricing, not a migration.** Rows already on disk keep the
 poll time — so a board recorded before Phase 13 reads ~1.22%/yr lower at a
 30-day hold than the same board would today.
 
-**Venue chain**, both unauthenticated and both reached with a User-Agent and
-nothing else — the header builder in `src/funding.ts` takes no `Env`, so a
-Binance credential structurally cannot be attached to either:
+**Every venue, every board** (Phase 14). There is no primary/fallback chain any
+more: all four are polled concurrently under `Promise.allSettled` and each one's
+failure costs exactly its own rows. A chain answers "which venue do we trust
+most", which is the wrong question once the venues quote *different universes* —
+and two venues disagreeing about BTC's funding is a measurement, not a conflict.
+All four are unauthenticated and reached with a User-Agent and nothing else; the
+header builder in `src/funding.ts` takes no `Env`, so a Binance credential
+structurally cannot be attached to any of them.
 
 1. **Bybit v5** `/v5/market/tickers?category=linear` — the whole linear board in
-   one request. It does not carry the settlement interval, so
-   `/v5/market/instruments-info` supplies that separately and is cached for 24h
-   in a `settings` row (same escape hatch as the scan lock). A missing cadence
-   falls back to 8 hours and the row is tagged `interval_source = 'assumed'`,
-   because the annualised figure scales *linearly* with it.
+   one request, reduced to the 11 majors. It does not carry the settlement
+   interval, so `/v5/market/instruments-info` supplies that separately and is
+   cached for 24h in a `settings` row (same escape hatch as the scan lock). A
+   missing cadence falls back to 8 hours and the row is tagged
+   `interval_source = 'assumed'`, because the annualised figure scales
+   *linearly* with it.
 2. **OKX v5** `/api/v5/public/funding-rate?instId=…` — one request per
-   instrument (11), under `Promise.allSettled`. The cadence is derived from
-   `nextFundingTime − fundingTime`, so the fallback is not a second-class
-   source. Used when Bybit fails or covers under 60% of the universe; if both
-   fail the error names both, exactly as the spot chain's does.
+   instrument, so it stays capped at the 11 majors: pointing it at a full board
+   would cost ~600 subrequests by itself. The cadence is derived from
+   `nextFundingTime − fundingTime`, so it is not a second-class source.
+3. **Gate v4** `/api/v4/futures/usdt/contracts` — one request, ~850 USDT-margined
+   perps with `funding_rate` and `funding_interval` (seconds) included.
+   Delisting, halted, pre-market and non-crypto contracts (Gate lists tokenised
+   equities, indices, forex and metals on the same board) are skipped: a carry
+   needs a spot leg.
+4. **KuCoin futures** `/api/v1/contracts/active` — one request, ~660 perps with
+   `fundingFeeRate` and `fundingRateGranularity` (milliseconds). `XBT` normalises
+   to `BTC`; dated futures, non-USDT margin and perps with an `expireDate` set
+   are skipped.
+
+Worst case is 2 + 11 + 1 + 1 = **15 subrequests** for funding and 18 for a whole
+scan, against Cloudflare's free-plan limit of 50. The arithmetic is asserted in
+a comment beside `FUNDING_VENUES` in `src/funding.ts`, which is the only place
+the list is defined.
+
+> **Reachability is unknown until deploy.** Binance and Bybit REST answer 403
+> from Cloudflare's egress in production and OKX does not; whether Gate and
+> KuCoin are reachable is an open question until phase 18 deploys and looks.
+> That is precisely why they are two more `allSettled` branches and not links in
+> a chain: a blocked venue costs its own rows, a string in
+> `ScanResult.fundingVenueErrors`, and nothing else. A poll fails only when *no*
+> venue produced a single quote.
+
+**Kraken futures is deliberately not here.** Its perps fund continuously and
+accrue per hour against a different reference, so normalising it into the
+per-settlement `rate` this schema stores would produce a number that looks
+comparable to the other four and is not. Modelling it wrong is worse than
+omitting it; adding it means modelling its semantics, not adding a URL. Future
+work.
+
+**Universe and cap.** Each full-board venue persists the 11 majors
+unconditionally — they are the continuous series `/api/funding/history` serves,
+and dropping BTC the day its funding went flat would put a hole in exactly the
+chart someone reads to see funding go flat — plus its own best
+`FUNDING_BOARD_TOP_N = 25` remaining contracts by net annual carry. The cap is
+per venue, not global, so one hot venue cannot crowd every other one off the
+board and quietly end the cross-venue comparison.
 
 **Cadence and retention.** The board is polled at most every 5 minutes, gated on
 `MAX(ts)` in `funding_rates` — funding settles every 8 hours, so a minutely scan
-has nothing to learn by asking every minute. Rows are kept for **7 days** and
-pruned inside the same `batch()` that writes the new board, so the prune can
-never run without its insert. `POST /api/funding/refresh` bypasses the gate and
-writes rows with `scan_id = NULL`.
+has nothing to learn by asking every minute. Rows are kept for **7 days**, and
+the prune rides in the last `batch()` of the insert, after every row has landed.
+Inserts are chunked at 50 statements per batch (D1 caps statements per batch, and
+a four-venue board is ~144 rows), so a board is no longer written as one
+transaction: a reader polling mid-write can see a *partial* board — never a
+mixture of two polls, since every row of a poll shares one timestamp.
+`POST /api/funding/refresh` bypasses the gate and writes rows with
+`scan_id = NULL`.
 
 **No positions are opened**, on purpose. A carry is held for days, and the
 paper-execution model this repo used to have was atomic — a round trip opened

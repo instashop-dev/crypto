@@ -162,6 +162,24 @@ export const STRATEGIES: readonly Strategy[] = [
 export const FUNDING_POLL_INTERVAL_MS = 300_000;
 
 /**
+ * How many *non-major* contracts each venue contributes to a persisted board.
+ *
+ * Gate and KuCoin quote 850+ and 660+ USDT perps respectively, and the whole
+ * point of Phase 14 is that the fat tail of funding lives out there — but
+ * persisting every contract of every venue on every 5-minute poll would write
+ * ~1.5M rows a week for a table nothing reads past its first page. So each
+ * venue keeps the {@link ASSET_UNIVERSE} majors unconditionally (they are the
+ * continuous series the history charts are built on, and dropping one the day
+ * its funding goes flat would put a hole in it) plus its own best 25 by net
+ * annual carry.
+ *
+ * 25 is a display budget, not a market judgement: the dashboard shows one board
+ * and nobody scrolls past the top few dozen rows. Raising it costs rows
+ * linearly and nothing else.
+ */
+export const FUNDING_BOARD_TOP_N = 25;
+
+/**
  * How long a cached funding-interval map is trusted, in milliseconds.
  *
  * A contract's settlement cadence changes on the order of never; when a venue

@@ -358,6 +358,9 @@
           <code>perp_fee_rate</code>, spread over <code>funding_hold_days</code>. The
           annualised figure assumes the <em>next</em> published rate repeats all year,
           which it will not; basis, margin and liquidation are not modelled.
+          Every venue is polled on every board, so one symbol can appear more than
+          once and the two full-board venues each contribute the 11 majors plus
+          their own best 25 contracts.
         </p>
       </section>
 
@@ -429,7 +432,8 @@
 
     <footer class="footer">
       Observation only — nothing is traded or simulated. Data: Binance WS + MEXC REST
-      (spot, cross-exchange spreads) · Bybit v5 + OKX v5 (perpetual funding rates).
+      (spot, cross-exchange spreads) · Bybit v5, OKX v5, Gate v4 and KuCoin futures
+      (perpetual funding rates, every venue polled every board).
     </footer>
 
     <div class="toasts" id="toasts" role="status" aria-live="polite"></div>

@@ -27,6 +27,7 @@ import {
   updateSettings,
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
+import { serveFlatBoard } from "./funding-stub";
 import { runScan } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
@@ -45,25 +46,7 @@ beforeAll(() => {
  * reach for the network. Nothing in this file asserts on funding — the stub
  * exists so that the assertions below stay about orchestration.
  */
-const serveFundingBoard: FundingFetcher = async (assets) => ({
-  venue: "bybit",
-  ts: Date.now(),
-  quotes: new Map(
-    assets.map((symbol) => [
-      symbol,
-      {
-        venue: "bybit" as const,
-        symbol,
-        instrument: `${symbol}USDT`,
-        rate: 0.0001,
-        intervalMinutes: 480,
-        intervalSource: "api" as const,
-        nextFundingTs: null,
-        markPrice: null,
-      },
-    ]),
-  ),
-});
+const serveFundingBoard: FundingFetcher = serveFlatBoard();
 
 afterEach(() => {
   setWsCollector(null);

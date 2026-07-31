@@ -25,6 +25,7 @@ import {
   replacePairs,
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
+import { fundingQuote, snapshotOf } from "./funding-stub";
 import { app } from "../src/index";
 import type { BookTickerEntry, Env } from "../src/types";
 
@@ -51,25 +52,17 @@ const PERP_ASSETS = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
  * Rates descend with the asset's position in the universe, giving the ranking
  * an unambiguous winner (BTC) without any test having to name a number twice.
  */
-const serveFundingBoard: FundingFetcher = async (assets) => ({
-  venue: "bybit",
-  ts: Date.now(),
-  quotes: new Map(
-    assets.map((symbol, i) => [
-      symbol,
-      {
-        venue: "bybit" as const,
-        symbol,
-        instrument: `${symbol}USDT`,
+const serveFundingBoard: FundingFetcher = async (assets) =>
+  snapshotOf(
+    assets.map((symbol, i) =>
+      fundingQuote(symbol, {
         rate: 0.0002 - i * 0.00002,
-        intervalMinutes: 480,
-        intervalSource: "api" as const,
         nextFundingTs: Date.now() + 3_600_000,
         markPrice: 100 + i,
-      },
-    ]),
-  ),
-});
+      }),
+    ),
+    Date.now(),
+  );
 
 const PAIRS = [
   { symbol: "BTCUSDT", base: "BTC", quote: "USDT" },
@@ -1094,6 +1087,7 @@ interface FundingBody {
   ageMs: number | null;
   stale: boolean;
   venue: string | null;
+  venues: Array<{ venue: string; count: number }>;
   count: number;
   minAnnualPct: number;
   holdDays: number;
@@ -1104,9 +1098,9 @@ interface FundingBody {
 }
 
 /** One synthetic funding row at a controlled timestamp. */
-function fundingRow(symbol: string, netAnnualPct: number) {
+function fundingRow(symbol: string, netAnnualPct: number, venue = "bybit") {
   return {
-    venue: "bybit",
+    venue,
     symbol,
     instrument: `${symbol}USDT`,
     rate: 0.0001,
@@ -1143,6 +1137,7 @@ describe("GET /api/funding", () => {
     expect(body.count).toBe(0);
     expect(body.rates).toEqual([]);
     expect(body.venue).toBeNull();
+    expect(body.venues).toEqual([]);
     expect(body.stale).toBe(false);
     // The settings echo is present either way, so the panel can render its
     // header before any row exists.
@@ -1220,6 +1215,39 @@ describe("GET /api/funding", () => {
     expect(stale.count).toBe(1);
   });
 
+  it("ranks a multi-venue board by net carry, whichever venue quoted it", async () => {
+    const ts = Date.now();
+    await insertFundingRates(
+      env.DB,
+      null,
+      [
+        fundingRow("BTC", 4, "bybit"),
+        fundingRow("BTC", 19, "gate"),
+        fundingRow("PEPE", 31, "kucoin"),
+        fundingRow("ETH", 12, "okx"),
+      ],
+      ts,
+    );
+
+    const body = await funding();
+    expect(body.count).toBe(4);
+    expect(body.rates.map((r) => `${r.venue}:${r.symbol}`)).toEqual([
+      "kucoin:PEPE",
+      "gate:BTC",
+      "okx:ETH",
+      "bybit:BTC",
+    ]);
+    // The single `venue` still names the source of the headline row, and
+    // `venues` is the honest full answer beside it.
+    expect(body.venue).toBe("kucoin");
+    expect(body.venues).toEqual([
+      { venue: "kucoin", count: 1 },
+      { venue: "gate", count: 1 },
+      { venue: "okx", count: 1 },
+      { venue: "bybit", count: 1 },
+    ]);
+  });
+
   it("reads exactly one poll, never a mixture of two", async () => {
     const older = Date.now() - 600_000;
     await insertFundingRates(
@@ -1288,6 +1316,45 @@ describe("GET /api/funding/history", () => {
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toEqual({ error: "symbol is required" });
   });
+
+  it("narrows one symbol's series to a single venue", async () => {
+    // Four venues quoting BTC means four rows per timestamp; a chart drawn from
+    // the mixture would zig-zag between venues rather than show either series.
+    await insertFundingRates(env.DB, null, [fundingRow("BTC", 30, "gate")], 6_003);
+    await insertFundingRates(env.DB, null, [fundingRow("BTC", 31, "gate")], 6_004);
+
+    const all = (await (await get("/api/funding/history?symbol=BTC")).json()) as {
+      venue: string | null;
+      count: number;
+    };
+    expect(all.count).toBe(5);
+    expect(all.venue).toBeNull();
+
+    const gate = (await (
+      await get("/api/funding/history?symbol=BTC&venue=gate")
+    ).json()) as { venue: string; count: number; rates: FundingRateBody[] };
+    expect(gate.venue).toBe("gate");
+    expect(gate.count).toBe(2);
+    expect(gate.rates.every((r) => r.venue === "gate")).toBe(true);
+    expect(gate.rates.map((r) => r.ts)).toEqual([6_004, 6_003]);
+
+    // The filter is applied in SQL, so a narrowed request still returns `limit`
+    // rows of the venue asked for rather than however many survive a slice.
+    const one = (await (
+      await get("/api/funding/history?symbol=BTC&venue=GATE&limit=1")
+    ).json()) as { count: number; rates: FundingRateBody[] };
+    expect(one.count).toBe(1);
+    expect(one.rates[0].ts).toBe(6_004);
+  });
+
+  it("rejects an unknown venue rather than silently ignoring the filter", async () => {
+    // A silently-ignored filter looks exactly like a venue that never quotes.
+    const res = await get("/api/funding/history?symbol=BTC&venue=binance");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("unknown venue: binance");
+    expect(body.error).toContain("kucoin");
+  });
 });
 
 describe("POST /api/funding/refresh", () => {
@@ -1295,9 +1362,17 @@ describe("POST /api/funding/refresh", () => {
     const res = await send("/api/funding/refresh", "POST");
     expect(res.status).toBe(200);
 
-    const body = (await res.json()) as { count: number; venue: string; ts: number };
+    const body = (await res.json()) as {
+      count: number;
+      venue: string;
+      venues: string[];
+      venueErrors: string[];
+      ts: number;
+    };
     expect(body.count).toBe(11);
     expect(body.venue).toBe("bybit");
+    expect(body.venues).toEqual(["bybit"]);
+    expect(body.venueErrors).toEqual([]);
     expect(typeof body.ts).toBe("number");
 
     const { results } = await env.DB.prepare(
@@ -1397,6 +1472,8 @@ describe("POST /api/scan - funding block", () => {
     const body = (await (await send("/api/scan", "POST")).json()) as {
       error?: string;
       fundingVenue: string | null;
+      fundingVenues: string[];
+      fundingVenueErrors?: string[];
       fundingCount: number;
       bestFundingNetAnnualPct: number | null;
       fundingError?: string;
@@ -1405,10 +1482,42 @@ describe("POST /api/scan - funding block", () => {
 
     expect(body.error).toBeUndefined();
     expect(body.fundingVenue).toBe("bybit");
+    expect(body.fundingVenues).toEqual(["bybit"]);
+    expect(body.fundingVenueErrors).toBeUndefined();
     expect(body.fundingCount).toBe(11);
     expect(body.bestFundingNetAnnualPct).toBeCloseTo(18.25, 6);
     expect(body.fundingError).toBeUndefined();
     expect(body.fundingSkipped).toBeUndefined();
+  });
+
+  it("reports a half-dead venue list without failing anything", async () => {
+    serveBook();
+    setFundingFetcher(async (assets) => ({
+      ...snapshotOf(
+        assets.map((symbol) => fundingQuote(symbol, { venue: "gate" })),
+        Date.now(),
+      ),
+      venues: [
+        { venue: "bybit", count: 0, error: "HTTP 403" },
+        { venue: "gate", count: assets.length, error: null },
+      ],
+    }));
+
+    const body = (await (await send("/api/scan", "POST")).json()) as {
+      error?: string;
+      fundingVenue: string | null;
+      fundingVenues: string[];
+      fundingVenueErrors?: string[];
+      fundingError?: string;
+    };
+
+    // One venue blocked from Cloudflare's egress is the *expected* production
+    // state, not a failure: the board that landed is still a board.
+    expect(body.fundingVenue).toBe("gate");
+    expect(body.fundingVenues).toEqual(["gate"]);
+    expect(body.fundingVenueErrors).toEqual(["bybit: HTTP 403"]);
+    expect(body.fundingError).toBeUndefined();
+    expect(body.error).toBeUndefined();
   });
 
   it("reports the funding half as skipped on an immediate second scan", async () => {

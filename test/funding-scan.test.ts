@@ -13,9 +13,15 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { setRestFetcher, setWsCollector } from "../src/binance";
-import { ASSET_UNIVERSE, BASE_ASSET, perpAssets } from "../src/config";
+import {
+  ASSET_UNIVERSE,
+  BASE_ASSET,
+  FUNDING_BOARD_TOP_N,
+  perpAssets,
+} from "../src/config";
 import {
   ensureSeeded,
+  FUNDING_INSERT_CHUNK,
   FUNDING_INTERVALS_KEY,
   getFundingIntervals,
   getRawSetting,
@@ -30,8 +36,9 @@ import {
 } from "../src/db";
 import { setFundingFetcher } from "../src/funding";
 import { runScan } from "../src/scan";
-import type { BookTickerEntry } from "../src/types";
-import type { FundingFetcher, FundingQuote } from "../src/funding";
+import type { BookTickerEntry, FundingVenue } from "../src/types";
+import type { FundingFetcher, VenueOutcome } from "../src/funding";
+import { fundingQuote, snapshotOf } from "./funding-stub";
 
 const ASSETS = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -101,30 +108,21 @@ afterEach(() => {
 
 /** A full Bybit-shaped board at the current clock, one quote per asset. */
 function board(intervals: Record<string, number> = {}): FundingFetcher {
-  return async (assets) => ({
-    venue: "bybit",
-    ts: clock,
-    quotes: new Map<string, FundingQuote>(
+  return async (assets) =>
+    snapshotOf(
       assets.map((symbol, i) => {
-        const instrument = `${symbol}USDT`;
-        const known = intervals[instrument];
-        return [
-          symbol,
-          {
-            venue: "bybit",
-            symbol,
-            instrument,
-            // Descending, so ranking has an unambiguous winner: BTC first.
-            rate: 0.0002 - i * 0.00001,
-            intervalMinutes: known ?? 480,
-            intervalSource: known ? "api" : "assumed",
-            nextFundingTs: clock + 3_600_000,
-            markPrice: 100 + i,
-          },
-        ];
+        const known = intervals[`${symbol}USDT`];
+        return fundingQuote(symbol, {
+          // Descending, so ranking has an unambiguous winner: BTC first.
+          rate: 0.0002 - i * 0.00001,
+          intervalMinutes: known ?? 480,
+          intervalSource: known ? "api" : "assumed",
+          nextFundingTs: clock + 3_600_000,
+          markPrice: 100 + i,
+        });
       }),
-    ),
-  });
+      clock,
+    );
 }
 
 /** A funding fetcher whose interval handling mirrors the real parser's. */
@@ -139,6 +137,46 @@ async function fundingRows(): Promise<
     "SELECT scan_id, ts, symbol, interval_source FROM funding_rates ORDER BY id ASC",
   ).all<{ scan_id: number | null; ts: number; symbol: string; interval_source: string }>();
   return results ?? [];
+}
+
+/** Every persisted row's venue and symbol, best net carry first. */
+async function persistedBoard(): Promise<Array<{ venue: string; symbol: string }>> {
+  const { results } = await env.DB.prepare(
+    "SELECT venue, symbol FROM funding_rates WHERE ts = (SELECT MAX(ts) FROM funding_rates)" +
+      " ORDER BY net_annual_pct DESC, symbol ASC",
+  ).all<{ venue: string; symbol: string }>();
+  return results ?? [];
+}
+
+/**
+ * A board assembled by hand from `(venue, symbol, rate)` triples, with the
+ * venue outcomes derived from it — the same invariant the real snapshot has.
+ */
+function boardOf(
+  quotes: Array<[FundingVenue, string, number]>,
+  failures: VenueOutcome[] = [],
+): FundingFetcher {
+  return async () => {
+    const snapshot = snapshotOf(
+      quotes.map(([venue, symbol, rate]) =>
+        fundingQuote(symbol, { venue, rate, instrument: `${symbol}-${venue}` }),
+      ),
+      clock,
+    );
+    return { ...snapshot, venues: [...snapshot.venues, ...failures] };
+  };
+}
+
+/** `count` tail contracts on `venue`, descending in rate from `top`. */
+function tail(
+  venue: FundingVenue,
+  count: number,
+  top: number,
+): Array<[FundingVenue, string, number]> {
+  return Array.from(
+    { length: count },
+    (_, i) => [venue, `TAIL${venue.toUpperCase()}${i}`, top - i * 1e-7] as const,
+  ).map(([v, s, r]) => [v, s, r] as [FundingVenue, string, number]);
 }
 
 describe("runScan - funding poll", () => {
@@ -566,5 +604,169 @@ describe("resetAll - funding rows", () => {
       ts: clock,
       intervals: { BTCUSDT: 480 },
     });
+  });
+});
+
+describe("runScan - a multi-venue board", () => {
+  it("persists every venue's rows and reports which of them served", async () => {
+    const result = await runScan(env, "manual", {
+      now,
+      fetchFunding: boardOf([
+        ["bybit", "BTC", 0.0001],
+        ["okx", "BTC", 0.00012],
+        ["gate", "BTC", 0.0003],
+        ["kucoin", "BTC", 0.0002],
+      ]),
+    });
+
+    // Four quotes for one symbol is four rows: `funding_rates` is keyed by
+    // (venue, symbol), and the disagreement between venues is the measurement.
+    expect(result.fundingCount).toBe(4);
+    expect(await persistedBoard()).toEqual([
+      { venue: "gate", symbol: "BTC" },
+      { venue: "kucoin", symbol: "BTC" },
+      { venue: "okx", symbol: "BTC" },
+      { venue: "bybit", symbol: "BTC" },
+    ]);
+
+    // Ordered by what each venue pays, so the single `fundingVenue` the toast
+    // shows is the one behind the headline carry figure beside it.
+    expect(result.fundingVenues).toEqual(["gate", "kucoin", "okx", "bybit"]);
+    expect(result.fundingVenue).toBe("gate");
+    expect(result.fundingVenueErrors).toBeUndefined();
+    expect(result.fundingError).toBeUndefined();
+  });
+
+  it("persists the survivors when one venue is unreachable", async () => {
+    const result = await runScan(env, "manual", {
+      now,
+      fetchFunding: boardOf(
+        [
+          ["gate", "BTC", 0.0003],
+          ["kucoin", "BTC", 0.0002],
+        ],
+        [
+          { venue: "bybit", count: 0, error: "HTTP 403" },
+          { venue: "okx", count: 0, error: "HTTP 429" },
+        ],
+      ),
+    });
+
+    // A dead venue is a degraded board, never a failed poll: the two that
+    // answered still land, and nothing reaches `scans.error`.
+    expect(result.fundingCount).toBe(2);
+    expect(result.fundingVenues).toEqual(["gate", "kucoin"]);
+    expect(result.fundingVenueErrors).toEqual(["bybit: HTTP 403", "okx: HTTP 429"]);
+    expect(result.fundingError).toBeUndefined();
+    expect(result.error).toBeUndefined();
+
+    const [scan] = await listScans(env.DB, 1);
+    expect(scan.error).toBeNull();
+    // The spread half is untouched by any of it.
+    expect(result.spreadsCount).toBe(2);
+  });
+
+  it("still reports a total outage as one funding failure", async () => {
+    const result = await runScan(env, "manual", {
+      now,
+      fetchFunding: async () => {
+        throw new Error(
+          "no funding-rate source available (bybit: HTTP 403; okx: HTTP 429;" +
+            " gate: HTTP 451; kucoin: HTTP 500)",
+        );
+      },
+    });
+
+    expect(result.fundingError).toContain("no funding-rate source available");
+    expect(result.fundingVenues).toEqual([]);
+    expect(result.fundingVenue).toBeNull();
+    expect(result.error).toBeUndefined();
+  });
+});
+
+describe("runScan - the per-venue board cap", () => {
+  /** Two full boards: every major plus 60 tail contracts paying far more. */
+  function wideBoard(): FundingFetcher {
+    return boardOf([
+      ...ASSETS.map((symbol) => [
+        "gate" as FundingVenue,
+        symbol,
+        0.00001,
+      ] as [FundingVenue, string, number]),
+      ...ASSETS.map((symbol) => [
+        "kucoin" as FundingVenue,
+        symbol,
+        0.00001,
+      ] as [FundingVenue, string, number]),
+      ...tail("gate", 60, 0.002),
+      ...tail("kucoin", 60, 0.001),
+    ]);
+  }
+
+  it("keeps every major plus each venue's best 25 of the tail", async () => {
+    const result = await runScan(env, "manual", { now, fetchFunding: wideBoard() });
+
+    // (11 majors + 25 tail) x 2 venues. 142 quotes in, 72 rows out.
+    expect(result.fundingCount).toBe((ASSETS.length + FUNDING_BOARD_TOP_N) * 2);
+
+    const rows = await persistedBoard();
+    for (const venue of ["gate", "kucoin"]) {
+      const mine = rows.filter((r) => r.venue === venue);
+      const majors = mine.filter((r) => ASSETS.includes(r.symbol));
+      const kept = mine.filter((r) => !ASSETS.includes(r.symbol));
+
+      // Majors survive despite paying an order of magnitude less than the tail:
+      // they are the continuous series the history route serves.
+      expect(majors, venue).toHaveLength(ASSETS.length);
+      expect(kept, venue).toHaveLength(FUNDING_BOARD_TOP_N);
+      // And the tail that survived is the *best* 25, not the first 25 seen.
+      const upper = venue.toUpperCase();
+      expect(kept.map((r) => r.symbol).sort(), venue).toEqual(
+        Array.from({ length: FUNDING_BOARD_TOP_N }, (_, i) => `TAIL${upper}${i}`).sort(),
+      );
+    }
+  });
+
+  it("caps per venue, so the poorer-paying venue is not crowded out", async () => {
+    // Every KuCoin row pays less than every Gate row; a global cap would have
+    // dropped KuCoin entirely and quietly ended the cross-venue comparison.
+    const rows = await runScan(env, "manual", { now, fetchFunding: wideBoard() }).then(
+      persistedBoard,
+    );
+    expect(rows.some((r) => r.venue === "kucoin" && r.symbol.startsWith("TAIL"))).toBe(
+      true,
+    );
+  });
+
+  it("chunks the insert and still prunes past the retention window", async () => {
+    // 72 rows is above the 50-statement chunk, so this board is written in more
+    // than one batch — and the prune rides in the last one, after every insert.
+    const stale = clock - 8 * DAY_MS;
+    await insertFundingRates(
+      env.DB,
+      null,
+      [
+        {
+          venue: "gate",
+          symbol: "BTC",
+          instrument: "BTC_USDT",
+          rate: 0.0001,
+          intervalMinutes: 480,
+          intervalSource: "api",
+          annualizedPct: 10.95,
+          netAnnualPct: 7.3,
+          nextFundingTs: null,
+          markPrice: null,
+        },
+      ],
+      stale,
+    );
+
+    const result = await runScan(env, "manual", { now, fetchFunding: wideBoard() });
+
+    const rows = await fundingRows();
+    expect(rows.map((r) => r.ts)).not.toContain(stale);
+    expect(rows).toHaveLength(result.fundingCount);
+    expect(result.fundingCount).toBeGreaterThan(FUNDING_INSERT_CHUNK);
   });
 });

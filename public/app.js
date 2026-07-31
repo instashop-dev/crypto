@@ -17,6 +17,17 @@
   const OPPS_LIMIT = 30;
   const TRADES_LIMIT = 30;
   const SCANS_LIMIT = 15;
+  /**
+   * Funding rows rendered.
+   *
+   * The other listings are capped server-side by `?limit=`; `/api/funding`
+   * serves one whole board and has no such parameter, because "the newest
+   * board" is a single poll's worth of rows and truncating it in SQL would make
+   * the count reported beside it a lie. Since Phase 14 that board is up to four
+   * venues wide, so the cap moved here — a display budget, applied after the
+   * server has ranked, exactly like the 30 on spreads and trades.
+   */
+  const FUNDING_LIMIT = 40;
   const TOAST_MS = 6000;
 
   // -- tiny helpers ---------------------------------------------------------
@@ -575,7 +586,8 @@
     }
 
     const now = Date.now();
-    body.innerHTML = rates
+    const shown = rates.slice(0, FUNDING_LIMIT);
+    body.innerHTML = shown
       .map((r) => {
         const assumed = r.intervalSource !== "api";
         const hours = isNum(r.intervalMinutes) ? r.intervalMinutes / 60 : NaN;
@@ -634,11 +646,19 @@
       })
       .join("");
 
-    const venue = data.venue ? esc(data.venue) : "unknown";
+    // Every venue that contributed, with its share of the board: since Phase 14
+    // the poll is fetch-all, so naming one source would hide a venue that has
+    // been dead for a week behind the three that are not.
+    const venues = Array.isArray(data.venues) && data.venues.length > 0
+      ? data.venues.map((v) => esc(v.venue) + " " + v.count).join(" + ")
+      : data.venue
+        ? esc(data.venue)
+        : "unknown";
     const age = isNum(data.ts) ? fmtRelative(data.ts, now) : "—";
     note.textContent =
-      venue +
+      venues +
       " · " +
+      (shown.length < rates.length ? "top " + shown.length + " of " : "") +
       rates.length +
       " perps · min " +
       (isNum(data.minAnnualPct) ? data.minAnnualPct : "—") +
@@ -793,16 +813,27 @@
           : (r.spreadsCount || 0) + " spreads · best " + bestSpread;
         // The funding half is polled on its own cadence, so it reports either a
         // fresh board, a deliberate skip, or its own upstream failure.
+        // A venue that failed while others served is a *degraded* board, not a
+        // failed poll, so it is appended to the count rather than replacing it.
+        const degraded =
+          Array.isArray(r.fundingVenueErrors) && r.fundingVenueErrors.length > 0
+            ? " (down: " + r.fundingVenueErrors.join(", ") + ")"
+            : "";
+        const venues = Array.isArray(r.fundingVenues) && r.fundingVenues.length > 0
+          ? r.fundingVenues.join("+") + " · "
+          : "";
         const funding = r.fundingError
           ? " · funding unavailable (" + r.fundingError + ")"
           : r.fundingSkipped
             ? " · funding not due"
             : " · " +
+              venues +
               (r.fundingCount || 0) +
               " perps · best carry " +
               (isNum(r.bestFundingNetAnnualPct)
                 ? fmtPct(r.bestFundingNetAnnualPct, 2)
-                : "n/a");
+                : "n/a") +
+              degraded;
         toast(
           "Scan " +
             (r.source || "unknown") +
