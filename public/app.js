@@ -28,6 +28,9 @@
    * server has ranked, exactly like the 30 on spreads and trades.
    */
   const FUNDING_LIMIT = 40;
+  /** Closed carry positions requested. Sparse by construction — a handful of
+   *  slots each held for days — so 30 is already months of book. */
+  const CARRY_LIMIT = 30;
   const TOAST_MS = 6000;
 
   // -- tiny helpers ---------------------------------------------------------
@@ -119,6 +122,17 @@
     return secs + "s";
   }
 
+  /** `"3d 4h"`, `"4h 12m"`, `"12m"` — an elapsed duration, counting up. */
+  function fmtDuration(ms) {
+    if (!isNum(ms) || ms < 0) return "—";
+    const mins = Math.floor(ms / 60000);
+    const days = Math.floor(mins / 1440);
+    const hours = Math.floor((mins % 1440) / 60);
+    if (days > 0) return days + "d " + hours + "h";
+    if (hours > 0) return hours + "h " + (mins % 60) + "m";
+    return mins + "m";
+  }
+
   /** `"42s ago"`, `"5m ago"`, `"2h ago"`, `"3d ago"`. */
   function fmtRelative(ts, now = Date.now()) {
     if (!isNum(ts)) return "—";
@@ -197,6 +211,8 @@
   const OPPS_COLS = 7;
   const SCANS_COLS = 8;
   const FUNDING_COLS = 8;
+  const CARRY_OPEN_COLS = 8;
+  const CARRY_CLOSED_COLS = 9;
 
   function setIndiaMode(on) {
     indiaMode = Boolean(on);
@@ -670,6 +686,168 @@
     note.classList.toggle("bad", Boolean(data.stale));
   }
 
+  /** Close reasons, shortened for the table. Unknown values render verbatim. */
+  const CLOSE_REASONS = {
+    max_hold: "max hold",
+    rate_below_exit: "rate < exit",
+    stale_data: "stale data",
+    manual: "manual",
+  };
+
+  /**
+   * The carry book: open positions above, closed ones below.
+   *
+   * The column that matters is the last one — realised annual % less predicted
+   * annual %. A negative number is the entry rate having over-promised, which is
+   * exactly what `src/engine/funding.ts` warns it will do; the panel exists to
+   * put a size on that rather than to repeat the warning.
+   */
+  function renderCarry(data) {
+    const openBody = $("carry-open-body");
+    const closedBody = $("carry-closed-body");
+    const note = $("carry-note");
+    const open = Array.isArray(data.open) ? data.open : [];
+    const closed = Array.isArray(data.closed) ? data.closed : [];
+    const summary = data.summary || {};
+    const settings = data.settings || {};
+    const now = Date.now();
+
+    if (open.length === 0) {
+      placeholder(
+        openBody,
+        CARRY_OPEN_COLS,
+        settings.enabled === false
+          ? "No open positions — funding_positions_enabled is off."
+          : "No open positions.",
+      );
+    } else {
+      openBody.innerHTML = open
+        .map(
+          (p) =>
+            '<tr class="data-row">' +
+            '<td class="mono"><span title="' +
+            esc(p.instrument || p.symbol) +
+            '">' +
+            esc(p.symbol) +
+            "</span></td>" +
+            '<td class="mono">' +
+            esc(p.venue) +
+            "</td>" +
+            '<td class="right num">' +
+            fmtNum(p.notionalUsdt, 2) +
+            "</td>" +
+            '<td class="right num ' +
+            signClass(p.predictedNetAnnualPct) +
+            '">' +
+            fmtPct(p.predictedNetAnnualPct, 2) +
+            "</td>" +
+            '<td class="right num ' +
+            signClass(p.accruedFundingUsdt) +
+            '">' +
+            fmtSigned(p.accruedFundingUsdt, 4) +
+            "</td>" +
+            // Settlements observed, not settlements elapsed: the two differ by
+            // exactly the boundaries that had no rate row behind them.
+            '<td class="right num">' +
+            (isNum(p.accrualCount) ? p.accrualCount : "—") +
+            "</td>" +
+            '<td class="right num nowrap">' +
+            esc(fmtDuration(now - p.entryTs)) +
+            "</td>" +
+            '<td class="right"><button type="button" class="btn-row"' +
+            ' data-close-position="' +
+            esc(p.id) +
+            '">close</button></td>' +
+            "</tr>",
+        )
+        .join("");
+    }
+
+    if (closed.length === 0) {
+      placeholder(closedBody, CARRY_CLOSED_COLS, "Nothing has closed yet.");
+    } else {
+      closedBody.innerHTML = closed
+        .map((p) => {
+          const error =
+            isNum(p.realizedAnnualPct) && isNum(p.predictedNetAnnualPct)
+              ? p.realizedAnnualPct - p.predictedNetAnnualPct
+              : NaN;
+          const reason = CLOSE_REASONS[p.closeReason] || p.closeReason || "—";
+          const held =
+            isNum(p.closeTs) && isNum(p.entryTs) ? p.closeTs - p.entryTs : NaN;
+
+          return (
+            '<tr class="data-row">' +
+            '<td class="num nowrap"><span title="' +
+            esc(new Date(p.closeTs).toISOString()) +
+            '">' +
+            fmtClock(p.closeTs) +
+            '</span> <span class="ago">' +
+            esc(fmtRelative(p.closeTs, now)) +
+            "</span></td>" +
+            '<td class="mono">' +
+            esc(p.symbol) +
+            "</td>" +
+            '<td class="mono">' +
+            esc(p.venue) +
+            "</td>" +
+            '<td><span class="tag">' +
+            esc(reason) +
+            "</span></td>" +
+            '<td class="right num nowrap">' +
+            esc(fmtDuration(held)) +
+            "</td>" +
+            '<td class="right num ' +
+            signClass(p.realizedPnlUsdt) +
+            '">' +
+            fmtSigned(p.realizedPnlUsdt, 4) +
+            "</td>" +
+            '<td class="right num ' +
+            signClass(p.predictedNetAnnualPct) +
+            '">' +
+            fmtPct(p.predictedNetAnnualPct, 2) +
+            "</td>" +
+            '<td class="right num ' +
+            signClass(p.realizedAnnualPct) +
+            '">' +
+            (isNum(p.realizedAnnualPct) ? fmtPct(p.realizedAnnualPct, 2) : "—") +
+            "</td>" +
+            '<td class="right num ' +
+            signClass(error) +
+            '">' +
+            (isNum(error) ? fmtPct(error, 2) : "—") +
+            "</td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    note.textContent =
+      (settings.enabled === false ? "off · " : "") +
+      (isNum(summary.openCount) ? summary.openCount : open.length) +
+      "/" +
+      (isNum(settings.maxPositions) ? settings.maxPositions : "—") +
+      " open · " +
+      fmtNum(summary.openNotionalUsdt, 0) +
+      " USDT · accrued " +
+      fmtSigned(summary.accruedUsdt, 4) +
+      " · realised " +
+      fmtSigned(summary.realizedPnlUsdt, 4) +
+      " · error " +
+      (isNum(summary.avgPredictionErrorPct)
+        ? fmtPct(summary.avgPredictionErrorPct, 2)
+        : "n/a");
+    note.classList.remove("bad");
+  }
+
+  function carryUnavailable(reason) {
+    placeholder($("carry-open-body"), CARRY_OPEN_COLS, "unavailable — " + reason, false);
+    placeholder($("carry-closed-body"), CARRY_CLOSED_COLS, "unavailable — " + reason, false);
+    $("carry-note").textContent = "unavailable";
+    $("carry-note").classList.add("bad");
+  }
+
   /** Header badge + age line, both driven by the newest scan row. */
   function renderStatus(scans) {
     const badge = $("source-badge");
@@ -712,6 +890,10 @@
     xchg_enabled: "set-xchg-enabled",
     funding_min_annual_pct: "set-funding-min",
     funding_hold_days: "set-funding-hold",
+    funding_positions_enabled: "set-positions-enabled",
+    funding_position_size_usdt: "set-position-size",
+    funding_max_positions: "set-max-positions",
+    funding_exit_annual_pct: "set-exit-annual",
   };
 
   function applySettings(s) {
@@ -738,6 +920,15 @@
       "%/" +
       s.funding_hold_days +
       "d" +
+      (s.funding_positions_enabled
+        ? " · pos " +
+          s.funding_max_positions +
+          "x" +
+          s.funding_position_size_usdt +
+          " exit " +
+          s.funding_exit_annual_pct +
+          "%"
+        : " · pos off") +
       (s.india_mode ? " · india " + s.tds_rate + "/" + s.tax_rate : "");
     settingsError("");
   }
@@ -834,12 +1025,27 @@
                 ? fmtPct(r.bestFundingNetAnnualPct, 2)
                 : "n/a") +
               degraded;
+        // The carry pass runs after the board has landed and fails on its own,
+        // so it is reported on its own — and stays silent when it did nothing.
+        const carryMoved =
+          r.positionsOpened || r.positionsClosed || r.carryAccruedUsdt;
+        const carry = r.carryError
+          ? " · carry failed (" + r.carryError + ")"
+          : carryMoved
+            ? " · carry +" +
+              (r.positionsOpened || 0) +
+              "/-" +
+              (r.positionsClosed || 0) +
+              " · accrued " +
+              fmtSigned(r.carryAccruedUsdt, 4)
+            : "";
         toast(
           "Scan " +
             (r.source || "unknown") +
             " · " +
             spreads +
             funding +
+            carry +
             " · " +
             r.durationMs +
             "ms",
@@ -856,9 +1062,40 @@
     }
   }
 
+  /**
+   * Close one open carry position by hand.
+   *
+   * Confirmed first: a close is the one irreversible thing this dashboard can
+   * do to a position — it writes a realised P&L, and the API refuses a second
+   * close with a 409 rather than overwriting it.
+   */
+  async function doClosePosition(btn) {
+    const id = btn.getAttribute("data-close-position");
+    if (!id) return;
+    const ok = window.confirm(
+      "Close carry position #" + id + " now?\n\n" +
+        "It is booked with reason 'manual' and its realised P&L is final.",
+    );
+    if (!ok) return;
+
+    btn.disabled = true;
+    try {
+      await getJson("/api/funding/positions/" + encodeURIComponent(id) + "/close", {
+        method: "POST",
+      });
+      toast("Position #" + id + " closed", "ok");
+    } catch (err) {
+      toast("Close failed: " + err.message, "error");
+    } finally {
+      btn.disabled = false;
+      refresh();
+    }
+  }
+
   async function doReset() {
     const ok = window.confirm(
-      "Reset the balance and wipe ALL history (trades, spreads, scans, funding)?\n\n" +
+      "Reset the balance and wipe ALL history (trades, spreads, scans, funding," +
+        " carry positions)?\n\n" +
         "Settings are kept. This cannot be undone.",
     );
     if (!ok) return;
@@ -889,10 +1126,11 @@
     if (inFlight) return;
     inFlight = true;
     try {
-      const [portfolio, opps, funding, trades, scans] = await Promise.allSettled([
+      const [portfolio, opps, funding, carry, trades, scans] = await Promise.allSettled([
         getJson("/api/portfolio"),
         getJson("/api/opportunities?limit=" + OPPS_LIMIT),
         getJson("/api/funding"),
+        getJson("/api/funding/positions?limit=" + CARRY_LIMIT),
         getJson("/api/trades?limit=" + TRADES_LIMIT),
         getJson("/api/scans?limit=" + SCANS_LIMIT),
       ]);
@@ -924,6 +1162,12 @@
         );
         $("funding-note").textContent = "unavailable";
         $("funding-note").classList.add("bad");
+      }
+
+      if (carry.status === "fulfilled") {
+        renderCarry(carry.value || {});
+      } else {
+        carryUnavailable(carry.reason.message);
       }
 
       if (trades.status === "fulfilled") {
@@ -988,6 +1232,13 @@
       row.hidden = nowHidden;
       btn.setAttribute("aria-expanded", nowHidden ? "false" : "true");
       btn.firstElementChild.textContent = nowHidden ? "▸" : "▾";
+    });
+
+    // Delegated for the same reason the legs toggle is: the body is replaced
+    // wholesale on every 5s poll.
+    $("carry-open-body").addEventListener("click", (event) => {
+      const btn = event.target.closest("button[data-close-position]");
+      if (btn) doClosePosition(btn);
     });
 
     for (const id of Object.values(SETTING_INPUTS)) {

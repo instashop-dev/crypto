@@ -638,6 +638,46 @@ table.grid tr.data-row:hover td {
 }
 
 /*
+ * The carry panel is the one panel with two tables: an open position and the
+ * closed row it becomes are the same book at two stages, and splitting them
+ * into two panels would put a position's outcome somewhere other than beside
+ * the position. Styled like a table header so the two read as sections of one
+ * listing rather than as two headings.
+ */
+.subhead {
+  margin: 0;
+  padding: 0.75rem 1.1rem 0.4rem;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+}
+
+/* An in-row action, sized to a table cell rather than to the topbar. */
+.btn-row {
+  font: inherit;
+  font-size: 0.6875rem;
+  line-height: 1;
+  color: var(--fg-dim);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.5rem;
+  cursor: pointer;
+}
+
+.btn-row:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+
+.btn-row:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/*
  * Strategy badges. Deliberately low-contrast next to .tag-exec: which strategy
  * produced a row is context, not an outcome, and the eye should still land on
  * the executed flag first.

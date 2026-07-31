@@ -26,13 +26,18 @@ import {
   type Strategy,
 } from "./config";
 import {
+  CARRY_STATUS_OPEN,
   ensureSeeded,
   getBalances,
+  getCarryTotals,
+  getFundingPosition,
   getPairs,
   getSettings,
   getTaxTotals,
+  listClosedFundingPositions,
   listFundingRatesForSymbol,
   listLatestFundingRates,
+  listOpenFundingPositions,
   listOpportunities,
   listOpportunitiesForScan,
   listScans,
@@ -40,12 +45,13 @@ import {
   replacePairs,
   resetAll,
   updateSettings,
+  type CarryTotals,
   type FundingRate,
   type Settings,
 } from "./db";
 import { round8 } from "./engine";
 import { FUNDING_VENUES } from "./funding";
-import { pollFundingRates, runScan } from "./scan";
+import { closeCarryPosition, pollFundingRates, runScan } from "./scan";
 import type { Env, FundingVenue } from "./types";
 
 const MEXC_PING_PATH = "/api/v3/ping";
@@ -68,6 +74,9 @@ const LIMITS = {
   /** Funding history is one symbol's time series, so it is sampled far denser
    *  than the other collections: 100 rows is ~8 hours of 5-minute polls. */
   funding: [100, 500],
+  /** Closed carry positions. Sparse by construction — a handful of slots each
+   *  held for days — so a small default already covers months. */
+  positions: [50, 200],
 } as const;
 
 /** Settings an operator may change at runtime. `initial_usdt` is not one of
@@ -83,8 +92,21 @@ const MUTABLE_SETTINGS = [
   "xchg_enabled",
   "funding_min_annual_pct",
   "funding_hold_days",
+  "funding_positions_enabled",
+  "funding_position_size_usdt",
+  "funding_max_positions",
+  "funding_exit_annual_pct",
 ] as const;
 type MutableSetting = (typeof MUTABLE_SETTINGS)[number];
+
+/**
+ * Ceiling on how many paper carry positions may be open at once.
+ *
+ * Twenty is far past any concentration a three-slot default implies and still
+ * bounded: the accrual pass walks every open position on every funding poll, so
+ * an unbounded value would turn a fat-fingered digit into a D1 read loop.
+ */
+const MAX_FUNDING_POSITIONS = 20;
 
 /**
  * Ceiling on the assumed carry holding period: 10 years.
@@ -295,6 +317,16 @@ export interface Portfolio {
   pnl: { absUsdt: number; pct: number };
   initialUsdt: number;
   tax: PortfolioTax;
+  /**
+   * Paper funding-carry positions, as a **section of its own**.
+   *
+   * Deliberately not folded into `equityUsdt`, `pnl` or `balances`. Migration
+   * 0005's header is explicit about why: the spot figures are the frozen record
+   * of an atomic fill era, a carry is held for days, and adding one to the other
+   * would produce a number that reconciles against nothing. Read them side by
+   * side; do not add them up.
+   */
+  carry: CarryTotals;
 }
 
 /**
@@ -308,10 +340,11 @@ export interface Portfolio {
  * fills stopped would make the old rows unreadable.
  */
 async function buildPortfolio(db: D1Database): Promise<Portfolio> {
-  const [balances, settings, totals] = await Promise.all([
+  const [balances, settings, totals, carry] = await Promise.all([
     getBalances(db),
     getSettings(db),
     getTaxTotals(db),
+    getCarryTotals(db),
   ]);
   const equityUsdt = balances.find((b) => b.asset === BASE_ASSET)?.amount ?? 0;
   const initialUsdt = settings.initial_usdt;
@@ -340,6 +373,7 @@ async function buildPortfolio(db: D1Database): Promise<Portfolio> {
       trades: totals.trades,
       profitableTrades: totals.profitableTrades,
     },
+    carry,
   };
 }
 
@@ -403,6 +437,31 @@ export function validateSettingsPatch(
         error: `funding_hold_days must be between 0 and ${MAX_FUNDING_HOLD_DAYS}`,
       };
     }
+    // A flag, as `india_mode` and `xchg_enabled` are, and rejected rather than
+    // coerced for the same reason.
+    if (key === "funding_positions_enabled" && value !== 0 && value !== 1) {
+      return { ok: false, error: "funding_positions_enabled must be 0 or 1" };
+    }
+    // Strictly positive: it is the notional of both legs and the denominator of
+    // every realised percentage, so a zero would make the whole position
+    // unpriceable rather than small.
+    if (key === "funding_position_size_usdt" && value <= 0) {
+      return { ok: false, error: "funding_position_size_usdt must be greater than 0" };
+    }
+    // A count, so a fractional value is a caller error rather than something to
+    // round: `2.5` positions is not a smaller book, it is a misunderstanding.
+    if (
+      key === "funding_max_positions" &&
+      (!Number.isInteger(value) || value < 1 || value > MAX_FUNDING_POSITIONS)
+    ) {
+      return {
+        ok: false,
+        error: `funding_max_positions must be a whole number between 1 and ${MAX_FUNDING_POSITIONS}`,
+      };
+    }
+    // `funding_exit_annual_pct` takes any finite number, exactly as
+    // `funding_min_annual_pct` does: it is a threshold on a figure that is
+    // routinely negative, and a negative bar simply holds a position longer.
     patch[key as MutableSetting] = value;
   }
 
@@ -697,6 +756,100 @@ export function createApp(): Hono<{ Bindings: Env }> {
       return c.json({ count, venue, venues, venueErrors, ts });
     } catch (err) {
       return c.json({ error: message(err) }, 502);
+    }
+  });
+
+  /**
+   * The paper carry book: every open position, the most recently closed ones,
+   * and the summary the dashboard's header line is built from.
+   *
+   * The pair worth reading is `predictedNetAnnualPct` against
+   * `realizedAnnualPct` on a closed row. The first is what the rate observed at
+   * entry said a year of it would pay; the second is what it actually paid over
+   * the days it was actually held. Their difference is the extrapolation error
+   * `src/engine/funding.ts` names as its dominant unknown — measured, not
+   * asserted. `summary.avgPredictionErrorPct` is the mean of it, and is `null`
+   * until something has closed, because an average of no positions is not zero.
+   *
+   * An empty book answers 200 with empty lists, exactly as `/api/funding` does
+   * with an empty board: "nothing open" is the state of every deployment for its
+   * first few hours.
+   */
+  app.get("/api/funding/positions", async (c) => {
+    try {
+      const [fallback, max] = LIMITS.positions;
+      const limit = parseLimit(c.req.query("limit"), fallback, max);
+
+      await ensureSeeded(c.env.DB);
+      const [open, closed, summary, settings] = await Promise.all([
+        listOpenFundingPositions(c.env.DB),
+        listClosedFundingPositions(c.env.DB, limit),
+        getCarryTotals(c.env.DB),
+        getSettings(c.env.DB),
+      ]);
+
+      return c.json({
+        openCount: open.length,
+        closedCount: closed.length,
+        limit,
+        summary,
+        // Echoed so the panel can say *why* the book looks the way it does —
+        // an empty book under `enabled: 0` is a switch, not a market.
+        settings: {
+          enabled: settings.funding_positions_enabled !== 0,
+          sizeUsdt: settings.funding_position_size_usdt,
+          maxPositions: settings.funding_max_positions,
+          minAnnualPct: settings.funding_min_annual_pct,
+          exitAnnualPct: settings.funding_exit_annual_pct,
+          holdDays: settings.funding_hold_days,
+        },
+        open,
+        closed,
+      });
+    } catch (err) {
+      return c.json({ error: message(err) }, 500);
+    }
+  });
+
+  /**
+   * Close one position by hand, with `close_reason = 'manual'`.
+   *
+   * 404 for an id that does not exist and **409** for one that is already
+   * closed — not 200. A second close would overwrite a realised P&L the scanner
+   * had already computed and silently rewrite the very series this table exists
+   * to produce, so "already closed" is a conflict, not a no-op.
+   */
+  app.post("/api/funding/positions/:id/close", async (c) => {
+    try {
+      const id = Number(c.req.param("id"));
+      if (!Number.isInteger(id) || id <= 0) {
+        return c.json({ error: "id must be a positive integer" }, 400);
+      }
+
+      await ensureSeeded(c.env.DB);
+      const position = await getFundingPosition(c.env.DB, id);
+      if (!position) return c.json({ error: `no such position: ${id}` }, 404);
+      if (position.status !== CARRY_STATUS_OPEN) {
+        return c.json(
+          { error: `position ${id} is already closed (${position.closeReason})` },
+          409,
+        );
+      }
+
+      const closed = await closeCarryPosition(
+        c.env.DB,
+        position,
+        "manual",
+        Date.now(),
+      );
+      if (!closed) {
+        // Lost a race with the scanner's own close rules between the read and
+        // the write. The position *is* closed, just not by this call.
+        return c.json({ error: `position ${id} is already closed` }, 409);
+      }
+      return c.json({ ok: true, position: await getFundingPosition(c.env.DB, id) });
+    } catch (err) {
+      return c.json({ error: message(err) }, 500);
     }
   });
 

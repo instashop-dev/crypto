@@ -93,13 +93,16 @@ export const DEFAULTS = {
   xchg_enabled: 1,
   /**
    * Net annualised percent a funding-rate carry must clear to be flagged as an
-   * opportunity on the dashboard.
+   * opportunity on the dashboard — **and, since Phase 15, the bar a board row
+   * must clear for a paper position to be opened on it.**
    *
-   * Display-only, and deliberately so: the funding scanner is an *observer*.
-   * Every quote it prices is persisted regardless of this number, because a
-   * carry position is held for days and the history is the point — a row that
-   * was 4% yesterday and 12% today is the signal, and a threshold applied at
-   * write time would have thrown the first half away.
+   * Still not a *write-time* gate on the board itself: every quote is persisted
+   * regardless of this number, because a carry is held for days and the history
+   * is the point — a row that was 4% yesterday and 12% today is the signal, and
+   * dropping rows below the bar would have thrown the first half away. What
+   * changed in Phase 15 is that the flag now also selects; raising it stops new
+   * positions being opened and re-labels the board, and it never closes one
+   * (`funding_exit_annual_pct` does that, deliberately from lower down).
    *
    * 5% is roughly the point above which the carry beats a T-bill, which is the
    * only honest benchmark for a delta-neutral trade.
@@ -115,6 +118,50 @@ export const DEFAULTS = {
    * a decision someone would actually make.
    */
   funding_hold_days: 30,
+  /**
+   * Paper carry positions on/off, `0` off / `1` on. Numeric for the same reason
+   * `india_mode` is: the settings table is "TEXT parsed as a finite number".
+   *
+   * **On by default**, unlike every other feature switch here, because these
+   * positions are the measurement the funding board exists to enable — the
+   * realized-vs-predicted pair in `funding_positions` is the only thing in the
+   * repo that tests the "this rate repeats 1095 times" extrapolation rather
+   * than restating it. Nothing they do touches `balances` or places an order,
+   * so the cost of having them on is a few rows a week.
+   */
+  funding_positions_enabled: 1,
+  /**
+   * Notional of each leg of a paper carry, in USDT: long this much spot, short
+   * this much perp.
+   *
+   * 1000 rather than a slice of `initial_usdt`, because these positions are
+   * deliberately *not* booked against the paper balance (see the header of
+   * migration 0005) — there is no pool for them to draw down, so a percentage
+   * of one would be a fiction. The figure only scales the USDT columns; every
+   * percentage the table reports is a ratio and is unaffected by it.
+   */
+  funding_position_size_usdt: 1000,
+  /**
+   * How many carry positions may be open at once.
+   *
+   * A concentration limit on a paper book, so it is about the *measurement*
+   * rather than about risk: three contracts is enough that one venue dropping
+   * a symbol does not empty the series, and few enough that the realised
+   * figures stay attributable to particular contracts instead of averaging into
+   * a portfolio nobody chose.
+   */
+  funding_max_positions: 3,
+  /**
+   * Net annualised % below which an open carry is closed.
+   *
+   * Zero — not `funding_min_annual_pct`. The bar to *open* is deliberately
+   * higher than the bar to *stay*: the round trip of fees is already paid on an
+   * open position, so a carry that has slipped from 12% to 4% is still earning
+   * where a new one at 4% might not clear its own entry cost. Closing at zero
+   * means "close when the funding has actually turned against us", which is the
+   * event worth measuring.
+   */
+  funding_exit_annual_pct: 0,
 } as const;
 
 export type Defaults = typeof DEFAULTS;

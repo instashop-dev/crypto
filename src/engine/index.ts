@@ -28,6 +28,22 @@ export {
   type VenueBook,
 } from "./crossExchange";
 export {
+  accrueAmount,
+  CARRY_STALE_CLOSE_MS,
+  DAYS_PER_YEAR,
+  MAX_CATCHUP_SETTLEMENTS,
+  MS_PER_DAY,
+  realizedFigures,
+  settlementBoundaries,
+  settlementsCrossed,
+  shouldClose,
+  type CarryCloseInput,
+  type CarryCloseReason,
+  type CarryCloseSettings,
+  type CarryRealized,
+  type CarryRealizedInput,
+} from "./carry";
+export {
   annualizedPct,
   DEFAULT_FUNDING_INTERVAL_MINUTES,
   feeDragAnnualPct,
