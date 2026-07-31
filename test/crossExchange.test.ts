@@ -15,6 +15,11 @@
  *
  * and the mirror direction (buy MEXC at 60510, sell Binance at 60000) is
  * deeply negative, as the module header proves it must be.
+ *
+ * Every figure is priced on a notional of 1 base unit and nothing is ever
+ * filled: since Phase 12 the engine measures spreads, it does not trade them.
+ * The tax block at the foot re-prices at 100 USDT to answer "what would this
+ * have cost", which is an analysis, not an order.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -22,7 +27,6 @@ import {
   evaluateSpread,
   NO_TAX,
   rankSpreads,
-  simulateSpread,
   spreadHops,
   spreadLabel,
   spreadQuoteTax,
@@ -95,7 +99,7 @@ describe("evaluateSpread - the worked example", () => {
     expect(q.label).toBe(spreadLabel("BTCUSDT", "binance-ws", "mexc-rest"));
   });
 
-  it("carries two legs tagged with the venue that filled them", () => {
+  it("carries two legs tagged with the venue that would fill them", () => {
     const { legs } = workedQuote();
 
     expect(legs).toHaveLength(2);
@@ -312,60 +316,6 @@ describe("rankSpreads", () => {
     // Still sorted, and still with at most one winner per market.
     expect(both[0].netPct).toBeGreaterThanOrEqual(both[3].netPct);
     expect(both.filter((q) => q.netPct > 0)).toHaveLength(2);
-  });
-});
-
-describe("simulateSpread", () => {
-  it("reproduces the quote's net percent at a 100 USDT notional", () => {
-    const q = workedQuote();
-    const trade = simulateSpread(q, BINANCE, MEXC, FEE, 100)!;
-
-    expect(trade).not.toBeNull();
-    expect(trade.cycle).toBe("BTCUSDT binance-ws>mexc-rest");
-    expect(trade.startAmount).toBe(100);
-    expect(trade.endAmount).toBe(100.61499833);
-    expect(trade.profit).toBe(0.61499833);
-    // Scale-free: the notional cancels out of the percentage exactly.
-    expect(trade.profitPct).toBe(q.netPct);
-    expect(trade.endAmount - trade.startAmount).toBeCloseTo(trade.profit, 8);
-  });
-
-  it("chains the legs at the real notional", () => {
-    const trade = simulateSpread(workedQuote(), BINANCE, MEXC, FEE, 100)!;
-
-    expect(trade.legs.map((l) => `${l.side} ${l.pair} @${l.venue}`)).toEqual([
-      "BUY BTCUSDT @binance-ws",
-      "SELL BTCUSDT @mexc-rest",
-    ]);
-    expect(trade.legs[0].inAmount).toBe(100);
-    expect(trade.legs[0].outAmount).toBe(0.00166472);
-    expect(trade.legs[1].inAmount).toBe(trade.legs[0].outAmount);
-    expect(trade.legs[1].outAmount).toBe(trade.endAmount);
-  });
-
-  it("resolves venues by name, not by argument position", () => {
-    const q = workedQuote();
-
-    const forward = simulateSpread(q, BINANCE, MEXC, FEE, 100)!;
-    const swapped = simulateSpread(q, MEXC, BINANCE, FEE, 100)!;
-
-    expect(swapped).toEqual(forward);
-    expect(swapped.legs[0].venue).toBe("binance-ws");
-  });
-
-  it("returns null when the books no longer price the quote", () => {
-    const q = workedQuote();
-    const gone = venue("mexc-rest", { ETHUSDT: [3000, 3001] });
-    const poisoned = venue("mexc-rest", { BTCUSDT: [0, 60510] });
-    const renamed = venue("kraken", { BTCUSDT: [60500, 60510] });
-
-    // Symbol delisted, quote poisoned, venue absent, notional unusable.
-    expect(simulateSpread(q, BINANCE, gone, FEE, 100)).toBeNull();
-    expect(simulateSpread(q, BINANCE, poisoned, FEE, 100)).toBeNull();
-    expect(simulateSpread(q, BINANCE, renamed, FEE, 100)).toBeNull();
-    expect(simulateSpread(q, BINANCE, MEXC, FEE, 0)).toBeNull();
-    expect(simulateSpread(q, BINANCE, MEXC, FEE, Number.NaN)).toBeNull();
-    expect(simulateSpread(q, BINANCE, MEXC, 1, 100)).toBeNull();
   });
 });
 

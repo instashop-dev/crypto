@@ -6,9 +6,9 @@
     <meta name="color-scheme" content="dark light" />
     <meta
       name="description"
-      content="Paper-trading triangular arbitrage scanner. No real orders are placed."
+      content="Cross-exchange spread and perpetual funding-rate observatory. Nothing is ever traded."
     />
-    <title>crypto-arb · paper trading</title>
+    <title>crypto-arb · market observatory</title>
     <!-- Inline data-URI so the page fetches nothing off-origin and the browser
          never falls back to a 404 /favicon.ico request. -->
     <link
@@ -26,7 +26,7 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <h1>
           crypto-arb<span class="brand-dot" aria-hidden="true">·</span
-          ><span class="brand-sub">paper trading</span>
+          ><span class="brand-sub">observation only</span>
         </h1>
       </div>
 
@@ -46,7 +46,7 @@
       <!-- ── Portfolio ─────────────────────────────────────────────────── -->
       <section class="panel" aria-labelledby="portfolio-heading">
         <div class="panel-head">
-          <h2 id="portfolio-heading">Portfolio</h2>
+          <h2 id="portfolio-heading">Portfolio <span class="tag">historical</span></h2>
           <span class="panel-note" id="portfolio-note"></span>
         </div>
 
@@ -114,33 +114,6 @@
         <div class="panel-body">
           <div class="settings-grid">
             <label class="field">
-              <span class="field-label">min_profit_pct</span>
-              <input
-                type="number"
-                step="0.001"
-                class="input num"
-                id="set-min-profit"
-                data-setting="min_profit_pct"
-                autocomplete="off"
-              />
-              <span class="field-hint">Net % a cycle must beat to fill.</span>
-            </label>
-
-            <label class="field">
-              <span class="field-label">trade_size_usdt</span>
-              <input
-                type="number"
-                step="1"
-                min="0"
-                class="input num"
-                id="set-trade-size"
-                data-setting="trade_size_usdt"
-                autocomplete="off"
-              />
-              <span class="field-hint">Notional simulated per cycle.</span>
-            </label>
-
-            <label class="field">
               <span class="field-label">fee_rate</span>
               <input
                 type="number"
@@ -164,7 +137,7 @@
                   id="set-india-mode"
                   data-setting="india_mode"
                 />
-                <span class="field-hint">Report Indian VDA tax on every fill.</span>
+                <span class="field-hint">Annotate spreads with Indian VDA tax.</span>
               </span>
             </label>
 
@@ -195,7 +168,9 @@
                 data-setting="xchg_min_profit_pct"
                 autocomplete="off"
               />
-              <span class="field-hint">Net % a spread must beat to fill.</span>
+              <span class="field-hint">
+                Net % a spread must clear to be flagged. Display only.
+              </span>
             </label>
 
             <label class="field field-check">
@@ -207,7 +182,7 @@
                   id="set-xchg-enabled"
                   data-setting="xchg_enabled"
                 />
-                <span class="field-hint">Scan cross-exchange spreads too.</span>
+                <span class="field-hint">Scan cross-exchange spreads at all.</span>
               </span>
             </label>
 
@@ -262,53 +237,39 @@
           </div>
 
           <p class="hint">
-            A <strong>negative</strong> <code>min_profit_pct</code> forces demo trades: every
-            scan fills its best cycle even when the edge is negative. The same applies to
-            <code>xchg_min_profit_pct</code> and the best <em>spread</em> — the two gates are
-            independent, so a scan can fill one, both or neither.
-            <code>initial_usdt</code> is immutable — it is the denominator of every P&amp;L
-            figure.
+            <strong>Nothing here places or simulates a trade.</strong> Both thresholds
+            (<code>xchg_min_profit_pct</code>, <code>funding_min_annual_pct</code>) are
+            display flags: every priced row is persisted whatever they say, and raising one
+            re-labels the rows already on disk rather than discarding anything.
+            <code>initial_usdt</code> is immutable — it is the denominator of the historical
+            P&amp;L above.
           </p>
 
           <p class="hint">
-            <strong>Cross-exchange.</strong> Buy a market on the cheaper venue and sell it on
-            the dearer one, in the same instant. Both books are read per scan (Binance over
-            WebSocket, MEXC over REST) and they are <em>not</em> simultaneous — the WS
-            snapshot accumulates over up to 4s while the REST reply is one instant — so
-            timing skew, not depth or fees, is the main source of spreads that were never
-            fillable. Turn <code>xchg_enabled</code> off to restore the triangles-only scan.
+            <strong>Cross-exchange.</strong> The same market quoted on two venues: what it
+            would cost to buy on the cheaper and sell on the dearer, in the same instant.
+            Both books are read per scan (Binance over WebSocket, MEXC over REST) and they
+            are <em>not</em> simultaneous — the WS snapshot accumulates over up to 4s while
+            the REST reply is one instant — so timing skew, not depth or fees, is the main
+            source of spreads that were never fillable. Treat a reported spread as an upper
+            bound on an upper bound. Turn <code>xchg_enabled</code> off to leave the scan
+            polling funding alone.
           </p>
 
           <p class="hint">
-            <strong>India mode.</strong> Every leg of a cycle disposes of a VDA — USDT
-            included — so all three attract TDS. Three legs × 1% TDS ≈ 3% of notional per
-            cycle vs ~0.3% in fees, which is why a profitable cycle can still drain the
-            balance. “Net P&amp;L” credits TDS back as a prepayment; “Equity” does not.
+            <strong>India mode.</strong> Both legs of a spread dispose of a VDA — USDT
+            included — so both attract TDS. Two legs × 1% TDS ≈ 2% of notional against a
+            spread edge measured in basis points, which is the arithmetic that ended the
+            fill experiment: the withholding is on turnover, not on gains.
           </p>
           <p class="form-error" id="settings-error" role="alert" hidden></p>
         </div>
       </details>
 
-      <!-- ── Opportunities ─────────────────────────────────────────────── -->
+      <!-- ── Spreads ───────────────────────────────────────────────────── -->
       <section class="panel" aria-labelledby="opps-heading">
         <div class="panel-head">
-          <h2 id="opps-heading">Opportunities</h2>
-          <!-- Server-side filter: the ?strategy= param, not a client-side slice,
-               so "newest 30 spreads" means 30 spreads. -->
-          <div
-            class="segmented"
-            id="opps-filter"
-            role="group"
-            aria-label="Filter opportunities by strategy"
-          >
-            <button type="button" data-strategy="" aria-pressed="true">All</button>
-            <button type="button" data-strategy="triangular" aria-pressed="false">
-              Triangular
-            </button>
-            <button type="button" data-strategy="cross_exchange" aria-pressed="false">
-              Cross-exchange
-            </button>
-          </div>
+          <h2 id="opps-heading">Cross-exchange spreads</h2>
           <span class="panel-note" id="opps-note">newest 30</span>
         </div>
         <div class="table-wrap">
@@ -318,10 +279,10 @@
                 <th scope="col" class="col-toggle"><span class="sr-only">Legs</span></th>
                 <th scope="col">Time</th>
                 <th scope="col">Strategy</th>
-                <th scope="col">Cycle</th>
+                <th scope="col">Market</th>
                 <th scope="col" class="right">Gross %</th>
                 <th scope="col" class="right">Net %</th>
-                <th scope="col">Executed</th>
+                <th scope="col">Status</th>
               </tr>
             </thead>
             <tbody id="opps-body">
@@ -331,6 +292,13 @@
             </tbody>
           </table>
         </div>
+        <p class="hint">
+          <strong>Observed, never filled.</strong> Every row is what the two books said at
+          one moment; “qualifies” only means the net figure cleared
+          <code>xchg_min_profit_pct</code>, judged fresh on every read. The two snapshots
+          are not simultaneous, so a qualifying row is a candidate for investigation, not a
+          trade that was available.
+        </p>
       </section>
 
       <!-- ── Funding rates ─────────────────────────────────────────────── -->
@@ -362,42 +330,45 @@
         </div>
         <p class="hint">
           <strong>Cash-and-carry, observed only.</strong> Long spot, short the perp,
-          collect funding &mdash; price risk cancels between the legs. No paper position is
-          ever opened: a carry is held for days and this bot's book is atomic. The
-          annualised figure assumes the <em>next</em> published rate repeats all year, which
-          it will not; basis, margin and liquidation are not modelled.
+          collect funding &mdash; price risk cancels between the legs. No position is ever
+          opened. The annualised figure assumes the <em>next</em> published rate repeats all
+          year, which it will not; basis, margin and liquidation are not modelled.
         </p>
       </section>
 
-      <!-- ── Trades ────────────────────────────────────────────────────── -->
-      <section class="panel" aria-labelledby="trades-heading">
-        <div class="panel-head">
-          <h2 id="trades-heading">Trades</h2>
-          <span class="panel-note" id="trades-note">newest 30 · simulated fills</span>
+      <!-- ── Trades (historical) ───────────────────────────────────────── -->
+      <details class="panel collapsible" id="trades-panel">
+        <summary>
+          <span class="summary-title">Trades</span>
+          <span class="panel-note" id="trades-note">
+            newest 30 · historical, nothing fills any more
+          </span>
+        </summary>
+        <div class="panel-body no-pad">
+          <div class="table-wrap">
+            <table class="grid" id="trades-table">
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">Strategy</th>
+                  <th scope="col">Cycle</th>
+                  <th scope="col" class="right">Start &rarr; End</th>
+                  <th scope="col" class="right">Profit</th>
+                  <th scope="col" class="right">Profit %</th>
+                  <!-- Revealed by app.js only while india_mode is on. -->
+                  <th scope="col" class="right" id="th-trades-tds" hidden>TDS</th>
+                  <th scope="col" class="right" id="th-trades-net" hidden>Net</th>
+                </tr>
+              </thead>
+              <tbody id="trades-body">
+                <tr class="placeholder-row">
+                  <td colspan="6">Loading&hellip;</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
-        <div class="table-wrap">
-          <table class="grid" id="trades-table">
-            <thead>
-              <tr>
-                <th scope="col">Time</th>
-                <th scope="col">Strategy</th>
-                <th scope="col">Cycle</th>
-                <th scope="col" class="right">Start &rarr; End</th>
-                <th scope="col" class="right">Profit</th>
-                <th scope="col" class="right">Profit %</th>
-                <!-- Revealed by app.js only while india_mode is on. -->
-                <th scope="col" class="right" id="th-trades-tds" hidden>TDS</th>
-                <th scope="col" class="right" id="th-trades-net" hidden>Net</th>
-              </tr>
-            </thead>
-            <tbody id="trades-body">
-              <tr class="placeholder-row">
-                <td colspan="6">Loading&hellip;</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
+      </details>
 
       <!-- ── Scans ─────────────────────────────────────────────────────── -->
       <details class="panel collapsible" id="scans-panel">
@@ -414,8 +385,6 @@
                   <th scope="col">Trigger</th>
                   <th scope="col">Source</th>
                   <th scope="col" class="right">Pairs</th>
-                  <th scope="col" class="right">Triangles</th>
-                  <th scope="col" class="right">Best net %</th>
                   <th scope="col" class="right">Spreads</th>
                   <th scope="col" class="right">Best spread %</th>
                   <th scope="col" class="right">Duration</th>
@@ -424,7 +393,7 @@
               </thead>
               <tbody id="scans-body">
                 <tr class="placeholder-row">
-                  <td colspan="10">Loading&hellip;</td>
+                  <td colspan="8">Loading&hellip;</td>
                 </tr>
               </tbody>
             </table>
@@ -434,7 +403,7 @@
     </main>
 
     <footer class="footer">
-      Paper trading only — no real orders. Data: Binance WS + MEXC REST
+      Observation only — nothing is traded or simulated. Data: Binance WS + MEXC REST
       (spot, cross-exchange spreads) · Bybit v5 + OKX v5 (perpetual funding rates).
     </footer>
 

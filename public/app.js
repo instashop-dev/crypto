@@ -1,7 +1,7 @@
 /**
  * Dashboard controller.
  *
- * One `refresh()` fans out to the four read endpoints with `Promise.allSettled`,
+ * One `refresh()` fans out to the five read endpoints with `Promise.allSettled`,
  * so a single failing route degrades exactly one section to an "unavailable"
  * state instead of stopping the poll loop. Polling pauses while the tab is
  * hidden — the cron scanner keeps working regardless, and a backgrounded tab
@@ -182,9 +182,9 @@
 
   /** Columns in the trades table: 6 normally, 8 with the TDS and Net columns. */
   const TRADES_COLS = () => (indiaMode ? 8 : 6);
-  /** Columns in the opportunities and scans tables. Fixed, unlike trades. */
+  /** Columns in the spreads and scans tables. Fixed, unlike trades. */
   const OPPS_COLS = 7;
-  const SCANS_COLS = 10;
+  const SCANS_COLS = 8;
   const FUNDING_COLS = 8;
 
   function setIndiaMode(on) {
@@ -198,16 +198,10 @@
   // -- strategy -------------------------------------------------------------
 
   /**
-   * Which strategy the Opportunities table is showing: `""` (all),
-   * `"triangular"` or `"cross_exchange"`.
-   *
-   * Module state, and applied as the API's `?strategy=` parameter rather than
-   * by filtering the fetched rows: a client-side filter of "newest 30" would
-   * show however many spreads happened to survive in the newest 30 rows
-   * overall, which on a busy scanner is routinely zero.
+   * Row badges. `triangular` is **historical** — that strategy was deleted, so
+   * the label only ever appears on rows written before it was, and the table
+   * would be unreadable without it.
    */
-  let oppsStrategy = "";
-
   const STRATEGY_LABELS = {
     triangular: "tri",
     cross_exchange: "x-chg",
@@ -310,10 +304,9 @@
     if (!Array.isArray(legs) || legs.length === 0) {
       return '<p class="legs-empty">No leg detail recorded.</p>';
     }
-    // A triangle's three legs all execute on one book, so a venue column there
-    // would be the same string three times. A spread's legs are the opposite
-    // case — the venue *is* the trade — so the column appears only when the
-    // legs actually carry one.
+    // A spread's venue *is* the trade, so the column is shown — but historical
+    // triangular rows carry no venue on their legs (all three executed on one
+    // book), and an empty column there would be noise.
     const withVenue = legs.some((leg) => leg && leg.venue);
 
     const rows = legs
@@ -353,18 +346,18 @@
     );
   }
 
-  function renderOpportunities(list) {
+  /**
+   * The spreads table.
+   *
+   * `qualifies` arrives from the server, already judged against the *current*
+   * `xchg_min_profit_pct`, so the badge never disagrees with the settings panel
+   * — exactly as the funding board does with its own threshold. It replaced an
+   * "executed" column when Phase 12 removed the fill paths.
+   */
+  function renderOpportunities(list, minProfitPct) {
     const body = $("opps-body");
     if (list.length === 0) {
-      placeholder(
-        body,
-        OPPS_COLS,
-        oppsStrategy
-          ? "No " +
-              (oppsStrategy === "cross_exchange" ? "cross-exchange" : "triangular") +
-              " opportunities recorded."
-          : "No opportunities yet — run a scan.",
-      );
+      placeholder(body, OPPS_COLS, "No spreads recorded yet — run a scan.");
       return;
     }
 
@@ -412,8 +405,8 @@
           fmtPct(o.netPct) +
           "</td>" +
           "<td>" +
-          (o.executed
-            ? '<span class="tag tag-exec">executed</span>'
+          (o.qualifies
+            ? '<span class="tag tag-exec">qualifies</span>'
             : '<span class="tag tag-skip">—</span>') +
           "</td>" +
           "</tr>" +
@@ -431,13 +424,7 @@
       .join("");
 
     $("opps-note").textContent =
-      "newest " +
-      list.length +
-      (oppsStrategy === "cross_exchange"
-        ? " spreads"
-        : oppsStrategy === "triangular"
-          ? " cycles"
-          : "");
+      "newest " + list.length + (isNum(minProfitPct) ? " · min " + minProfitPct + "%" : "");
     $("opps-note").classList.remove("bad");
   }
 
@@ -537,14 +524,6 @@
           "</td>" +
           '<td class="right num">' +
           (isNum(s.pairs_count) ? s.pairs_count : "—") +
-          "</td>" +
-          '<td class="right num">' +
-          (isNum(s.triangles_count) ? s.triangles_count : "—") +
-          "</td>" +
-          '<td class="right num ' +
-          signClass(s.best_net_pct) +
-          '">' +
-          (isNum(s.best_net_pct) ? fmtPct(s.best_net_pct) : "—") +
           "</td>" +
           '<td class="right num">' +
           (isNum(s.spreads_count) ? s.spreads_count : "—") +
@@ -704,8 +683,6 @@
   // -- settings -------------------------------------------------------------
 
   const SETTING_INPUTS = {
-    min_profit_pct: "set-min-profit",
-    trade_size_usdt: "set-trade-size",
     fee_rate: "set-fee-rate",
     india_mode: "set-india-mode",
     tds_rate: "set-tds-rate",
@@ -730,11 +707,7 @@
       }
     }
     $("settings-summary").textContent =
-      "min " +
-      s.min_profit_pct +
-      "% · size " +
-      s.trade_size_usdt +
-      " USDT · fee " +
+      "fee " +
       s.fee_rate +
       (s.xchg_enabled ? " · x-chg min " + s.xchg_min_profit_pct + "%" : " · x-chg off") +
       " · carry min " +
@@ -809,25 +782,12 @@
       } else if (r.error) {
         toast("Scan failed: " + r.error, "error");
       } else {
-        const best = isNum(r.bestNetPct) ? fmtPct(r.bestNetPct) : "n/a";
-        // Present only when india mode is on, and only for a fill.
-        const tax = r.tax
-          ? " · net after tax " +
-            fmtSigned(r.tax.netProfit, 4) +
-            " (TDS " +
-            fmtNum(r.tax.tdsWithheld, 4) +
-            ")"
-          : "";
-        // The spread half reports separately: it has its own count, its own
-        // best, its own gate, and its own failure mode.
+        // The spread half has its own count, its own best and its own failure
+        // mode, none of which can fail the scan.
         const bestSpread = isNum(r.bestSpreadNetPct) ? fmtPct(r.bestSpreadNetPct) : "n/a";
         const spreads = r.xchgError
-          ? " · spreads unavailable (" + r.xchgError + ")"
-          : " · " +
-            (r.spreadsCount || 0) +
-            " spreads · best " +
-            bestSpread +
-            (r.xchgExecuted ? " · spread trade executed" : "");
+          ? "spreads unavailable (" + r.xchgError + ")"
+          : (r.spreadsCount || 0) + " spreads · best " + bestSpread;
         // The funding half is polled on its own cadence, so it reports either a
         // fresh board, a deliberate skip, or its own upstream failure.
         const funding = r.fundingError
@@ -844,17 +804,12 @@
           "Scan " +
             (r.source || "unknown") +
             " · " +
-            r.trianglesCount +
-            " triangles · best " +
-            best +
-            (r.executed ? " · trade executed" : "") +
-            tax +
             spreads +
             funding +
             " · " +
             r.durationMs +
             "ms",
-          r.executed || r.xchgExecuted ? "ok" : "info",
+          "info",
         );
       }
     } catch (err) {
@@ -869,7 +824,7 @@
 
   async function doReset() {
     const ok = window.confirm(
-      "Reset the paper portfolio and wipe ALL history (trades, opportunities, scans)?\n\n" +
+      "Reset the balance and wipe ALL history (trades, spreads, scans, funding)?\n\n" +
         "Settings are kept. This cannot be undone.",
     );
     if (!ok) return;
@@ -902,11 +857,7 @@
     try {
       const [portfolio, opps, funding, trades, scans] = await Promise.allSettled([
         getJson("/api/portfolio"),
-        getJson(
-          "/api/opportunities?limit=" +
-            OPPS_LIMIT +
-            (oppsStrategy ? "&strategy=" + encodeURIComponent(oppsStrategy) : ""),
-        ),
+        getJson("/api/opportunities?limit=" + OPPS_LIMIT),
         getJson("/api/funding"),
         getJson("/api/trades?limit=" + TRADES_LIMIT),
         getJson("/api/scans?limit=" + SCANS_LIMIT),
@@ -916,7 +867,7 @@
       else portfolioUnavailable(portfolio.reason.message);
 
       if (opps.status === "fulfilled") {
-        renderOpportunities(opps.value.opportunities || []);
+        renderOpportunities(opps.value.opportunities || [], opps.value.minProfitPct);
       } else {
         placeholder(
           $("opps-body"),
@@ -1003,23 +954,6 @@
       row.hidden = nowHidden;
       btn.setAttribute("aria-expanded", nowHidden ? "false" : "true");
       btn.firstElementChild.textContent = nowHidden ? "▸" : "▾";
-    });
-
-    // Delegated too: the segmented control is static markup, but one listener
-    // keeps the pressed-state bookkeeping in a single place.
-    $("opps-filter").addEventListener("click", (event) => {
-      const btn = event.target.closest("button[data-strategy]");
-      if (!btn) return;
-      const next = btn.getAttribute("data-strategy") || "";
-      if (next === oppsStrategy) return;
-      oppsStrategy = next;
-      for (const other of $("opps-filter").querySelectorAll("button[data-strategy]")) {
-        other.setAttribute(
-          "aria-pressed",
-          (other.getAttribute("data-strategy") || "") === oppsStrategy ? "true" : "false",
-        );
-      }
-      refresh();
     });
 
     for (const id of Object.values(SETTING_INPUTS)) {

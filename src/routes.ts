@@ -3,8 +3,8 @@
  *
  * Handlers stay thin: they parse and validate input, call into `src/db.ts` or
  * `src/scan.ts`, and shape the response. All business rules (seeding, locking,
- * execution, atomicity) live behind those modules so the cron path in Phase 5
- * gets them for free without going through HTTP.
+ * ranking, atomicity) live behind those modules so the cron path gets them for
+ * free without going through HTTP.
  *
  * Errors always come back as `{ error: string }` with a meaningful status, so
  * the dashboard has exactly one failure shape to render.
@@ -54,7 +54,7 @@ const MEXC_PROBE_TIMEOUT_MS = 8000;
 const WS_PROBE_DEADLINE_MS = 5000;
 const WS_PROBE_SYMBOL = "BTCUSDT";
 
-/** Default markets for `/api/tickers` — one triangle's worth of legs. */
+/** Default markets for `/api/tickers` — a cheap, always-listed sample. */
 const DEFAULT_TICKER_SYMBOLS = ["BTCUSDT", "ETHUSDT", "ETHBTC"];
 /** Guard rail for the debug route so a stray query cannot build a huge stream URL. */
 const MAX_TICKER_SYMBOLS = 100;
@@ -73,8 +73,6 @@ const LIMITS = {
  *  them: it is the denominator of every P&L figure ever reported, so moving it
  *  would silently rewrite history rather than change behaviour. */
 const MUTABLE_SETTINGS = [
-  "min_profit_pct",
-  "trade_size_usdt",
   "fee_rate",
   "india_mode",
   "tds_rate",
@@ -261,14 +259,12 @@ export interface Portfolio {
 /**
  * Value the paper portfolio.
  *
- * Equity is the USDT balance alone. Every cycle is atomic and round-trips to
- * USDT, so no other asset is ever held between scans; marking non-USDT dust to
- * market would mean pricing assets we cannot have, using a snapshot we would
- * have to fetch, on the app's most-polled route.
- *
- * `equityUsdt` and `pnl` keep their pre-Phase-8 meaning exactly: the cash in
- * the account, TDS already gone. The `tax` block is strictly additive, so a
- * client that ignores it sees the same portfolio it always did.
+ * Equity is the USDT balance alone. Nothing has moved a balance since Phase 12
+ * removed the paper-fill paths, so this is a **frozen historical view**: the
+ * cash the fill-era scanner left behind, TDS already gone, against the
+ * `initial_usdt` it started from. Every field keeps the exact meaning it had,
+ * which is the point — a portfolio that silently redefined its numbers when
+ * fills stopped would make the old rows unreadable.
  */
 async function buildPortfolio(db: D1Database): Promise<Portfolio> {
   const [balances, settings, totals] = await Promise.all([
@@ -310,9 +306,10 @@ async function buildPortfolio(db: D1Database): Promise<Portfolio> {
  * Validate a `PUT /api/settings` body.
  *
  * Unknown keys are rejected rather than ignored: silently dropping a
- * misspelled `min_profit` would leave the operator convinced they had changed
- * the threshold. Negative `min_profit_pct` is explicitly allowed — it is how
- * the demo forces fills in a market with no real edge.
+ * misspelled `xchg_min_profit` would leave the operator convinced they had
+ * changed the threshold. Keys retired in Phase 12 (`min_profit_pct`,
+ * `trade_size_usdt`) are unknown keys now and are rejected as such, which is
+ * the honest answer — the behaviour they used to control no longer exists.
  */
 export function validateSettingsPatch(
   body: Record<string, unknown>,
@@ -330,9 +327,6 @@ export function validateSettingsPatch(
     if (typeof value !== "number" || !Number.isFinite(value)) {
       return { ok: false, error: `${key} must be a finite number` };
     }
-    if (key === "trade_size_usdt" && value <= 0) {
-      return { ok: false, error: "trade_size_usdt must be greater than 0" };
-    }
     if (key === "fee_rate" && (value < 0 || value > MAX_FEE_RATE)) {
       return { ok: false, error: `fee_rate must be between 0 and ${MAX_FEE_RATE}` };
     }
@@ -347,16 +341,13 @@ export function validateSettingsPatch(
     if (key === "tax_rate" && (value < 0 || value > MAX_TAX_RATE)) {
       return { ok: false, error: `tax_rate must be between 0 and ${MAX_TAX_RATE}` };
     }
-    // `xchg_min_profit_pct` needs no range check at all: like `min_profit_pct`
-    // it is a threshold in percent, and a negative value is the documented way
-    // to force demo fills. Any finite number is meaningful.
+    // `xchg_min_profit_pct` needs no range check at all: it is a display
+    // threshold on a figure that is routinely negative, so any finite number is
+    // meaningful and a negative one simply widens what qualifies.
     if (key === "xchg_enabled" && value !== 0 && value !== 1) {
       return { ok: false, error: "xchg_enabled must be 0 or 1" };
     }
-    // `funding_min_annual_pct` takes any finite number and needs no range
-    // check: it is a display threshold on a figure that is routinely negative,
-    // and unlike the two profit thresholds a negative value here is not a demo
-    // switch — nothing is ever filled — it simply widens what qualifies.
+    // `funding_min_annual_pct` is the same case, for the same reason.
     if (
       key === "funding_hold_days" &&
       (value <= 0 || value > MAX_FUNDING_HOLD_DAYS)
@@ -451,6 +442,20 @@ export function createApp(): Hono<{ Bindings: Env }> {
     }
   });
 
+  /**
+   * Ranked opportunities, newest first.
+   *
+   * `qualifies` is computed **here**, against the current
+   * `xchg_min_profit_pct`, exactly as `GET /api/funding` does with its own
+   * threshold — and for the same reason: it is a judgement about a
+   * measurement, not part of it, so raising the bar must re-classify yesterday's
+   * rows rather than leave them answering a question nobody asks any more.
+   *
+   * It replaced an execution gate in Phase 12. When the threshold decided which
+   * spread got filled it had to be applied at write time and the rows below it
+   * were the ones nobody could learn anything from; as a display flag it costs
+   * nothing and throws nothing away.
+   */
   app.get("/api/opportunities", async (c) => {
     try {
       const [fallback, max] = LIMITS.opportunities;
@@ -458,18 +463,34 @@ export function createApp(): Hono<{ Bindings: Env }> {
       const filter = parseStrategy(c.req.query("strategy"));
       if (!filter.ok) return c.json({ error: filter.error }, 400);
 
-      const opportunities = await listOpportunities(c.env.DB, limit, filter.strategy);
+      await ensureSeeded(c.env.DB);
+      const [opportunities, settings] = await Promise.all([
+        listOpportunities(c.env.DB, limit, filter.strategy),
+        getSettings(c.env.DB),
+      ]);
+
+      const minProfitPct = settings.xchg_min_profit_pct;
       return c.json({
         count: opportunities.length,
         limit,
         strategy: filter.strategy ?? null,
-        opportunities,
+        minProfitPct,
+        opportunities: opportunities.map((o) => ({
+          ...o,
+          qualifies: o.netPct >= minProfitPct,
+        })),
       });
     } catch (err) {
       return c.json({ error: message(err) }, 500);
     }
   });
 
+  /**
+   * The trade log — **historical only**. Nothing has written a row here since
+   * Phase 12 removed the paper-fill paths; the route stays because the rows it
+   * serves are the record of what the fill-era scanner did, and deleting the
+   * reader would have been the destructive half of a migration nobody asked for.
+   */
   app.get("/api/trades", async (c) => {
     try {
       const [fallback, max] = LIMITS.trades;

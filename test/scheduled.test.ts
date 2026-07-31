@@ -6,7 +6,7 @@
  * Trigger would hit — including the `waitUntil` hand-off, which
  * `waitOnExecutionContext` drains before assertions run.
  *
- * Same seams as `test/executor.test.ts`: in-memory D1 migrated by
+ * Same seams as `test/scan.test.ts`: in-memory D1 migrated by
  * `test/apply-migrations.ts`, WebSocket source swapped via `setWsCollector`,
  * MEXC intercepted with `fetchMock`. No network.
  */
@@ -72,8 +72,9 @@ const PAIRS = [
   { symbol: "ETHUSDT", base: "ETH", quote: "USDT" },
 ];
 
-/** The profitable book from `test/executor.test.ts`: +1.694% on USDT>BTC>ETH>USDT. */
-const PROFITABLE = new Map<string, BookTickerEntry>(
+/** A plain, well-formed book. MEXC is never intercepted here, so the spread
+ *  half degrades to `xchg_error` — which no assertion below depends on. */
+const BOOK = new Map<string, BookTickerEntry>(
   Object.entries({
     BTCUSDT: [59990, 60000],
     ETHBTC: [0.0499, 0.05],
@@ -124,8 +125,8 @@ describe("scheduled()", () => {
     expect(typeof worker.fetch).toBe("function");
   });
 
-  it("records a cron-triggered scan and executes the profitable cycle", async () => {
-    serveBook(PROFITABLE);
+  it("records a cron-triggered scan and books nothing", async () => {
+    serveBook(BOOK);
 
     await tick();
 
@@ -135,15 +136,12 @@ describe("scheduled()", () => {
     expect(scan.trigger).toBe("cron");
     expect(scan.source).toBe("binance-ws");
     expect(scan.pairs_count).toBe(3);
-    expect(scan.triangles_count).toBe(2);
-    expect(scan.best_net_pct).toBeCloseTo(1.694305898, 6);
-    expect(scan.executed_count).toBe(1);
     expect(scan.error).toBeNull();
 
-    const trades = await listTrades(env.DB, 10);
-    expect(trades).toHaveLength(1);
-    expect(trades[0].cycle).toBe("USDT>BTC>ETH>USDT");
-    expect(trades[0].profit).toBeCloseTo(1.694305898, 6);
+    // The cron path shares runScan with POST /api/scan, so it inherits the
+    // observation-only contract rather than restating it.
+    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(0);
+    expect(scan.executed_count).toBe(0);
   });
 
   it("returns while the scan is still in flight and settles it via waitUntil", async () => {
@@ -163,7 +161,7 @@ describe("scheduled()", () => {
       await gate;
       const out = new Map<string, BookTickerEntry>();
       for (const symbol of symbols) {
-        const entry = PROFITABLE.get(symbol);
+        const entry = BOOK.get(symbol);
         if (entry) out.set(symbol, entry);
       }
       return out;
@@ -178,12 +176,12 @@ describe("scheduled()", () => {
     await worker.scheduled(controller, env, ctx);
     await entered;
 
-    // Handler already returned, gate still shut: the scan row is open and no
-    // trade has been committed.
+    // Handler already returned, gate still shut: the scan row is open and its
+    // outcome columns are unwritten.
     const [open] = await listScans(env.DB, 10);
     expect(open.trigger).toBe("cron");
     expect(open.source).toBeNull();
-    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(0);
+    expect(open.duration_ms).toBe(0);
 
     release();
     await waitOnExecutionContext(ctx);
@@ -191,8 +189,7 @@ describe("scheduled()", () => {
     const [done] = await listScans(env.DB, 10);
     expect(done.id).toBe(open.id);
     expect(done.source).toBe("binance-ws");
-    expect(done.executed_count).toBe(1);
-    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(1);
+    expect(done.error).toBeNull();
   });
 
   it("does not throw when every market-data source is down, and logs the error", async () => {
@@ -210,12 +207,10 @@ describe("scheduled()", () => {
     expect(scan.trigger).toBe("cron");
     expect(scan.error).toContain("no market-data source available");
     expect(scan.source).toBeNull();
-    expect(scan.executed_count).toBe(0);
-    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(0);
   });
 
-  it("lands a funding board on the same tick as the trade", async () => {
-    serveBook(PROFITABLE);
+  it("lands a funding board on the same tick as the spread scan", async () => {
+    serveBook(BOOK);
 
     await tick();
 
@@ -235,7 +230,7 @@ describe("scheduled()", () => {
   });
 
   it("releases the lock so the next tick scans again", async () => {
-    serveBook(PROFITABLE);
+    serveBook(BOOK);
 
     await tick();
     await tick();
@@ -246,6 +241,7 @@ describe("scheduled()", () => {
     expect(scans).toHaveLength(2);
     expect(scans.map((s) => s.trigger)).toEqual(["cron", "cron"]);
     expect(scans.every((s) => s.error === null)).toBe(true);
-    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(2);
+    // Two scans, and still not one trade: the cron path fills nothing either.
+    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(0);
   });
 });

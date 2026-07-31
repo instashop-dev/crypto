@@ -1,26 +1,32 @@
 /**
  * Cross-exchange spread math: buy an asset on one venue, sell it on another.
  *
- * Pure module in the same sense as `./profit` and `./tax` — plain functions over
- * snapshot `Book`s, no I/O, no clock, no Workers imports, no dependency on
+ * **Observation only.** Nothing here simulates a fill, and nothing downstream
+ * books one: Phase 12 removed every paper-execution path in the repo because
+ * the measured edge never survived fees, withholding, or the timing skew
+ * documented below. This module prices, ranks and labels spreads so the scanner
+ * can persist what it saw; that record is the product.
+ *
+ * Pure module in the same sense as `./pricing` and `./tax` — plain functions
+ * over snapshot `Book`s, no I/O, no clock, no Workers imports, no dependency on
  * `src/` outside `src/engine/`. Everything is deterministic given
  * `(markets, venueA, venueB, feeRate, baseAsset)`.
  *
- * ## The trade
+ * ## The trade being measured
  *
- * For a market `X/USDT` listed on both venues, with notional `N` and a taker fee
- * `f` charged on the output of each leg:
+ * For a market `X/USDT` listed on both venues, on a notional of 1 base unit and
+ * a taker fee `f` charged on the output of each leg:
  *
  * ```
- * leg 1  BUY  X on venue A at askA:  base = (N / askA) * (1 - f)
+ * leg 1  BUY  X on venue A at askA:  base = (1 / askA) * (1 - f)
  * leg 2  SELL X on venue B at bidB:  out  = base * bidB * (1 - f)
  *
  * grossPct = (bidB / askA - 1) * 100
  * netPct   = ((bidB / askA) * (1 - f)^2 - 1) * 100
  * ```
  *
- * Unlike a triangle, the two legs trade the *same* market — the edge comes from
- * the two venues disagreeing about its price, not from a routing loop.
+ * Both legs trade the *same* market — the edge comes from the two venues
+ * disagreeing about its price, not from a routing loop.
  *
  * ## Why only one direction is ever emitted
  *
@@ -41,9 +47,9 @@
  *
  * ## Modelling simplifications
  *
- * - **Instant top-of-book fills.** Both legs fill entirely at the quoted best
- *   bid/ask regardless of size, exactly as `./profit` does. Real fills walk the
- *   book and are strictly worse, so reported spreads are an upper bound.
+ * - **Instant top-of-book fills.** Both legs are priced entirely at the quoted
+ *   best bid/ask regardless of size. Real fills walk the book and are strictly
+ *   worse, so reported spreads are an upper bound.
  * - **No transfer is simulated.** There is no withdrawal, no on-chain confirm-
  *   ation wait and no transfer fee, because a real desk running this strategy
  *   does not move coins per trade — it pre-positions inventory on both venues
@@ -60,10 +66,9 @@
  *   scanner like this reports far more "opportunities" than a real desk could
  *   ever fill, and it is why nothing here places an order.
  */
-import { round8 } from "./profit";
+import { round8 } from "./pricing";
 import { computeChainTax, type ChainHop, type TaxBreakdown, type TaxPolicy } from "./tax";
 import type { Book, BookEntry, ExecutedLeg } from "./types";
-import type { ExecutedTrade } from "./profit";
 
 /** One venue's snapshot, tagged with the name the label and legs carry. */
 export interface VenueBook {
@@ -123,11 +128,12 @@ function isUsable(entry: BookEntry | undefined): entry is BookEntry {
 }
 
 /**
- * Run the two conversions at full precision. `null` — never a `NaN` — when the
- * arithmetic would produce a non-finite or non-positive amount.
+ * Run the two conversions at full precision, on a notional of 1 base unit.
+ * `null` — never a `NaN` — when the arithmetic would produce a non-finite or
+ * non-positive amount.
  *
- * The intermediate `base` amount is deliberately **unrounded**: on a 100 USDT
- * notional a BTC leg holds ~1.7e-3, where 8-decimal quantisation is a ~1e-6
+ * The intermediate `base` amount is deliberately **unrounded**: on a unit
+ * notional a BTC leg holds ~1.7e-5, where 8-decimal quantisation is a ~1e-3
  * relative error against an edge measured in ~1e-4. `round8` is applied once, to
  * the reported leg amounts.
  */
@@ -135,11 +141,8 @@ function priceSpread(
   askA: number,
   bidB: number,
   feeRate: number,
-  startAmount: number,
 ): { base: number; out: number } | null {
-  if (!isPositive(startAmount)) return null;
-
-  const base = (startAmount / askA) * (1 - feeRate);
+  const base = (1 / askA) * (1 - feeRate);
   if (!isPositive(base)) return null;
 
   const out = base * bidB * (1 - feeRate);
@@ -155,7 +158,6 @@ function spreadLegs(
   sellVenue: string,
   buyPrice: number,
   sellPrice: number,
-  startAmount: number,
   priced: { base: number; out: number },
 ): ExecutedLeg[] {
   return [
@@ -164,7 +166,7 @@ function spreadLegs(
       side: "BUY",
       price: buyPrice,
       inAsset: market.quote,
-      inAmount: round8(startAmount),
+      inAmount: 1,
       outAsset: market.base,
       outAmount: round8(priced.base),
       venue: buyVenue,
@@ -218,13 +220,12 @@ export function evaluateSpread(
   const sellEntry = sell.book.get(market.symbol);
   if (!isUsable(buyEntry) || !isUsable(sellEntry)) return null;
 
-  const net = priceSpread(buyEntry.ask, sellEntry.bid, feeRate, 1);
+  const net = priceSpread(buyEntry.ask, sellEntry.bid, feeRate);
   if (!net) return null;
-  // Re-run at fee rate 0 rather than algebraically un-feeing the net figure, for
-  // the same reason `evaluateTriangle` does: the two agree only while both legs
-  // charge the same rate, and re-running keeps the number honest if that stops
-  // being true.
-  const gross = priceSpread(buyEntry.ask, sellEntry.bid, 0, 1);
+  // Re-run at fee rate 0 rather than algebraically un-feeing the net figure:
+  // the two agree only while both legs charge the same rate, and re-running
+  // keeps the number honest if that stops being true.
+  const gross = priceSpread(buyEntry.ask, sellEntry.bid, 0);
   if (!gross) return null;
 
   return {
@@ -238,15 +239,7 @@ export function evaluateSpread(
     label: spreadLabel(market.symbol, buy.venue, sell.venue),
     grossPct: round8((gross.out - 1) * 100),
     netPct: round8((net.out - 1) * 100),
-    legs: spreadLegs(
-      market,
-      buy.venue,
-      sell.venue,
-      buyEntry.ask,
-      sellEntry.bid,
-      1,
-      net,
-    ),
+    legs: spreadLegs(market, buy.venue, sell.venue, buyEntry.ask, sellEntry.bid, net),
   };
 }
 
@@ -300,61 +293,6 @@ export function rankSpreads(
   return quotes.sort((x, y) => y.netPct - x.netPct);
 }
 
-/**
- * Re-price a quoted spread at a real notional against the venues' current books.
- *
- * Returns the same {@link ExecutedTrade} shape a triangle produces, so
- * `commitTrade` books both strategies through one code path. `cycle` carries the
- * quote's label rather than an asset chain — a spread has no cycle, and forcing
- * `USDT>BTC>USDT` on it would be indistinguishable from a degenerate triangle.
- *
- * The venues are resolved **by name from the quote**, not by argument position:
- * `rankSpreads` may have emitted either direction, so passing `(a, b)` in a
- * fixed order and assuming `a` is the buy side would silently invert half the
- * fills. `null` when either named venue is absent or the book has moved out from
- * under the quote.
- */
-export function simulateSpread(
-  quote: SpreadQuote,
-  a: VenueBook,
-  b: VenueBook,
-  feeRate: number,
-  startAmount: number,
-): ExecutedTrade | null {
-  if (!isValidFee(feeRate) || !isPositive(startAmount)) return null;
-
-  const venues = [a, b].filter(Boolean);
-  const buy = venues.find((v) => v.venue === quote.buyVenue);
-  const sell = venues.find((v) => v.venue === quote.sellVenue);
-  if (!buy || !sell || buy.venue === sell.venue) return null;
-
-  const buyEntry = buy.book.get(quote.symbol);
-  const sellEntry = sell.book.get(quote.symbol);
-  if (!isUsable(buyEntry) || !isUsable(sellEntry)) return null;
-
-  const priced = priceSpread(buyEntry.ask, sellEntry.bid, feeRate, startAmount);
-  if (!priced) return null;
-
-  const profit = priced.out - startAmount;
-
-  return {
-    cycle: quote.label,
-    startAmount: round8(startAmount),
-    endAmount: round8(priced.out),
-    profit: round8(profit),
-    profitPct: round8((profit / startAmount) * 100),
-    legs: spreadLegs(
-      { symbol: quote.symbol, base: quote.base, quote: quote.quote },
-      buy.venue,
-      sell.venue,
-      buyEntry.ask,
-      sellEntry.bid,
-      startAmount,
-      priced,
-    ),
-  };
-}
-
 // ---------------------------------------------------------------------------
 // India mode
 // ---------------------------------------------------------------------------
@@ -364,9 +302,10 @@ export function simulateSpread(
  *
  * A spread is a **two-disposal** chain. Leg 1 disposes of USDT on the buy venue,
  * leg 2 disposes of X on the sell venue — and USDT is itself a VDA under Indian
- * law, so both attract TDS (see the long argument in `./tax`). Two legs instead
- * of three is the one structural advantage a spread has over a triangle here:
- * ~2% of notional withheld rather than ~3%.
+ * law, so both attract TDS (see the long argument in `./tax`). Two legs rather
+ * than the three of the deleted triangular strategy is the one structural
+ * advantage here: ~2% of notional withheld rather than ~3%. It is still an
+ * order of magnitude above the edge, which is why nothing is ever filled.
  */
 export function spreadHops(quote: SpreadQuote): ChainHop[] {
   return [
@@ -401,10 +340,10 @@ export function crossVenueBook(quote: SpreadQuote): Book {
 }
 
 /**
- * Tax one executed spread at a real notional. The two-leg analogue of
- * `computeTradeTax`; `null` when the chain cannot be priced.
+ * Tax one spread at a hypothetical notional — "what would this have cost".
+ * `null` when the chain cannot be priced.
  *
- * Re-priced from the quote rather than read off an `ExecutedTrade`, so no
+ * Re-priced from the quote rather than read off the reported `legs`, so no
  * `round8`-quantised amount can leak into the TDS base.
  */
 export function spreadTax(
@@ -435,7 +374,6 @@ export interface SpreadQuoteTax {
 /**
  * Tax figures for a ranked spread, on a notional of 1 base unit.
  *
- * Same construction as `quoteTax` for triangles, and for the same reasons:
  * `indiaNetPct` is a strictly increasing transform of the reported `netPct`, so
  * ranking is provably unchanged and these stay a display column; `tdsPct` is
  * derived from `tdsBase * tdsRate` rather than from the notional-1 `tdsWithheld`,

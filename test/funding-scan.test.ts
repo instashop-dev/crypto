@@ -2,7 +2,7 @@
  * The funding block of `runScan`, against the migrated in-memory D1.
  *
  * Three seams are stubbed and no request leaves the worker: the spot venues via
- * `setWsCollector` / `setRestFetcher` (the arbitrage half has to keep working,
+ * `setWsCollector` / `setRestFetcher` (the spread half has to keep working,
  * because half the point of these tests is that funding cannot break it), and
  * the funding board via `deps.fetchFunding`.
  *
@@ -21,8 +21,8 @@ import {
   getRawSetting,
   insertFundingRates,
   listLatestFundingRates,
+  listOpportunities,
   listScans,
-  listTrades,
   replacePairs,
   resetAll,
   setRawSetting,
@@ -43,14 +43,34 @@ const PAIRS = [
   { symbol: "ETHUSDT", base: "ETH", quote: "USDT" },
 ];
 
-/** The +1.694% book from test/executor.test.ts, so the arb half still fills. */
-const PROFITABLE = new Map<string, BookTickerEntry>(
+/** The Binance side of the spread half, which must keep working throughout. */
+const BINANCE = new Map<string, BookTickerEntry>(
   Object.entries({
     BTCUSDT: [59990, 60000],
     ETHBTC: [0.0499, 0.05],
     ETHUSDT: [3060, 3061],
   }).map(([symbol, [bid, ask]]) => [symbol, { symbol, bid, ask }]),
 );
+
+/** The MEXC side, quoting BTC dearer so two spreads are always priceable. */
+const MEXC = new Map<string, BookTickerEntry>(
+  Object.entries({
+    BTCUSDT: [60500, 60510],
+    ETHUSDT: [3050, 3051],
+  }).map(([symbol, [bid, ask]]) => [symbol, { symbol, bid, ask }]),
+);
+
+/** Serve `snapshot` for whatever symbols the scan asks for. */
+function serve(snapshot: Map<string, BookTickerEntry>) {
+  return async (symbols: string[]) => {
+    const out = new Map<string, BookTickerEntry>();
+    for (const symbol of symbols) {
+      const entry = snapshot.get(symbol);
+      if (entry) out.set(symbol, entry);
+    }
+    return out;
+  };
+}
 
 /** A frozen clock the scan and the stubs share. */
 let clock = 1_700_000_000_000;
@@ -67,16 +87,10 @@ beforeEach(async () => {
   clock = 1_700_000_000_000;
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
-  setWsCollector(async (symbols) => {
-    const out = new Map<string, BookTickerEntry>();
-    for (const symbol of symbols) {
-      const entry = PROFITABLE.get(symbol);
-      if (entry) out.set(symbol, entry);
-    }
-    return out;
-  });
-  // The cross-exchange half needs a second venue that is not the network.
-  setRestFetcher(async () => new Map());
+  // Both spot venues are served so the spread half genuinely produces rows:
+  // several tests below assert that a funding failure leaves them intact.
+  setWsCollector(serve(BINANCE));
+  setRestFetcher(serve(MEXC));
 });
 
 afterEach(() => {
@@ -208,8 +222,8 @@ describe("runScan - the poll gate", () => {
     expect(second.fundingVenue).toBeNull();
     expect(second.bestFundingNetAnnualPct).toBeNull();
     expect(second.fundingError).toBeUndefined();
-    // The arbitrage half is unaffected: it runs every scan, funding does not.
-    expect(second.executed).toBe(true);
+    // The spread half is unaffected: it runs every scan, funding does not.
+    expect(second.error).toBeUndefined();
     await expect(fundingRows()).resolves.toHaveLength(11);
   });
 
@@ -269,13 +283,19 @@ describe("runScan - a dead funding venue", () => {
     expect(result.fundingCount).toBe(0);
     expect(result.fundingVenue).toBeNull();
 
-    // The scan itself succeeded, and the arbitrage trade still committed.
+    // The scan itself succeeded, and the spread half completed its persistence
+    // regardless — the funding block runs last and in a catch of its own
+    // precisely so a dead perp venue cannot cost the spot half its rows.
     expect(result.error).toBeUndefined();
-    expect(result.executed).toBe(true);
+    expect(result.xchgError).toBeUndefined();
+    expect(result.spreadsCount).toBe(2);
+    expect(result.bestSpreadNetPct).toBeCloseTo(0.6317675, 8);
+    await expect(listOpportunities(env.DB, 50)).resolves.toHaveLength(2);
+
     const [scan] = await listScans(env.DB, 10);
     expect(scan.error).toBeNull();
-    expect(scan.executed_count).toBe(1);
-    await expect(listTrades(env.DB, 10)).resolves.toHaveLength(1);
+    expect(scan.xchg_error).toBeNull();
+    expect(scan.spreads_count).toBe(2);
     await expect(fundingRows()).resolves.toHaveLength(0);
   });
 

@@ -1,15 +1,23 @@
 /**
- * HTTP surface of Phase 4: portfolio, history listings, reset, settings and
- * pair refresh, all against the migrated in-memory D1.
+ * HTTP surface: portfolio, history listings, reset, settings, spreads, funding
+ * and pair refresh, all against the migrated in-memory D1.
+ *
+ * Since Phase 12 nothing the app can do writes a `trades` row or moves a
+ * balance, so the history fixtures below are inserted with raw SQL — which is
+ * exactly what they represent: rows the fill-era scanner left behind, which
+ * `GET /api/trades` and `GET /api/portfolio` must go on serving unchanged.
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { MEXC_BASE, setWsCollector, type WsCollector } from "../src/binance";
+import {
+  MEXC_BASE,
+  setRestFetcher,
+  setWsCollector,
+  type WsCollector,
+} from "../src/binance";
 import { ASSET_UNIVERSE, BASE_ASSET, DEFAULTS, perpAssets } from "../src/config";
 import {
-  commitTrade,
   ensureSeeded,
-  getBalance,
   getSettings,
   insertFundingRates,
   insertOpportunities,
@@ -29,6 +37,7 @@ beforeAll(() => {
 
 afterEach(() => {
   setWsCollector(null);
+  setRestFetcher(null);
   setFundingFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
@@ -68,8 +77,12 @@ const PAIRS = [
   { symbol: "ETHUSDT", base: "ETH", quote: "USDT" },
 ];
 
-/** See test/executor.test.ts for the arithmetic behind these numbers. */
-const PROFITABLE: Map<string, BookTickerEntry> = new Map(
+/**
+ * A well-formed Binance book. MEXC is never intercepted in this file, so every
+ * `POST /api/scan` here has exactly one venue and its spread half degrades —
+ * which is itself asserted below.
+ */
+const BOOK: Map<string, BookTickerEntry> = new Map(
   Object.entries({
     BTCUSDT: [59990, 60000],
     ETHBTC: [0.0499, 0.05],
@@ -77,21 +90,42 @@ const PROFITABLE: Map<string, BookTickerEntry> = new Map(
   }).map(([symbol, [bid, ask]]) => [symbol, { symbol, bid, ask }]),
 );
 
-const EXPECTED_PROFIT = 1.694305898;
-
 function stubWs(fn: WsCollector): void {
   setWsCollector(fn);
 }
 
-function serveProfitableBook(): void {
-  stubWs(async (symbols) => {
+/** The MEXC side, quoting BTC dearer — the spread the tests below observe. */
+const MEXC_BOOK: Map<string, BookTickerEntry> = new Map(
+  Object.entries({
+    BTCUSDT: [60500, 60510],
+    ETHUSDT: [3050, 3051],
+  }).map(([symbol, [bid, ask]]) => [symbol, { symbol, bid, ask }]),
+);
+
+/** `BTCUSDT binance-ws>mexc-rest` on the two books above, at 0.1%/leg. */
+const SPREAD_LABEL = "BTCUSDT binance-ws>mexc-rest";
+const SPREAD_NET_PCT = 0.6317675;
+const SPREAD_TDS_PCT = 2.007325;
+
+function serve(snapshot: Map<string, BookTickerEntry>) {
+  return async (symbols: string[]) => {
     const out = new Map<string, BookTickerEntry>();
     for (const symbol of symbols) {
-      const entry = PROFITABLE.get(symbol);
+      const entry = snapshot.get(symbol);
       if (entry) out.set(symbol, entry);
     }
     return out;
-  });
+  };
+}
+
+function serveBook(): void {
+  stubWs(serve(BOOK));
+}
+
+/** Both venues, so a scan over HTTP actually produces spread rows. */
+function serveBothVenues(): void {
+  stubWs(serve(BOOK));
+  setRestFetcher(serve(MEXC_BOOK));
 }
 
 async function get(path: string): Promise<Response> {
@@ -120,30 +154,105 @@ beforeEach(async () => {
   setFundingFetcher(serveFundingBoard);
 });
 
-/** Insert one synthetic trade + opportunity pair at a controlled timestamp. */
-async function seedHistory(ts: number, profit: number): Promise<number> {
+/** India-mode figures a historical row may carry. All zero means "untaxed". */
+interface SeedTax {
+  tdsBase: number;
+  tdsWithheld: number;
+  taxDue: number;
+  netProfit: number;
+  tdsRate: number;
+  taxRate: number;
+}
+
+const NO_SEED_TAX: SeedTax = {
+  tdsBase: 0,
+  tdsWithheld: 0,
+  taxDue: 0,
+  netProfit: 0,
+  tdsRate: 0,
+  taxRate: 0,
+};
+
+/**
+ * Insert one historical scan + opportunity + trade at a controlled timestamp,
+ * and move the balance the way the fill-era executor would have: by the profit
+ * less any TDS withheld.
+ *
+ * Raw SQL rather than a helper, because there is no longer a helper — this is a
+ * fixture reproducing what the database already contains in production, not a
+ * code path anything can still take.
+ */
+async function seedTrade(
+  ts: number,
+  profit: number,
+  options: {
+    strategy?: string;
+    source?: string;
+    cycle?: string;
+    tax?: SeedTax;
+    indiaNetPct?: number | null;
+    tdsPct?: number | null;
+  } = {},
+): Promise<number> {
+  const strategy = options.strategy ?? "triangular";
+  const source = options.source ?? "binance-ws";
+  const cycle = options.cycle ?? `USDT>BTC>ETH>USDT#${ts}`;
+  const tax = options.tax ?? { ...NO_SEED_TAX, netProfit: profit };
+
   const scanId = await insertScan(env.DB, "manual", ts);
   const [opportunityId] = await insertOpportunities(
     env.DB,
     scanId,
-    [{ cycle: `USDT>BTC>ETH>USDT#${ts}`, grossPct: profit, netPct: profit, legs: [] }],
+    [
+      {
+        cycle,
+        grossPct: profit,
+        netPct: profit,
+        legs: [],
+        indiaNetPct: options.indiaNetPct ?? null,
+        tdsPct: options.tdsPct ?? null,
+      },
+    ],
     ts,
+    strategy as "triangular" | "cross_exchange",
   );
-  await commitTrade(env.DB, {
-    scanId,
-    opportunityId,
-    source: "binance-ws",
-    ts,
-    trade: {
-      cycle: `USDT>BTC>ETH>USDT#${ts}`,
-      startAmount: 100,
-      endAmount: 100 + profit,
+
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO trades (ts, cycle, start_amount, end_amount, profit, profit_pct," +
+        " legs_json, source, opportunity_id, tds_base, tds_withheld, tax_due," +
+        " net_profit, tds_rate, tax_rate, strategy)" +
+        " VALUES (?1, ?2, 100, ?3, ?4, ?4, '[]', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    ).bind(
+      ts,
+      cycle,
+      100 + profit,
       profit,
-      profitPct: profit,
-      legs: [],
-    },
-  });
+      source,
+      opportunityId,
+      tax.tdsBase,
+      tax.tdsWithheld,
+      tax.taxDue,
+      tax.netProfit,
+      tax.tdsRate,
+      tax.taxRate,
+      strategy,
+    ),
+    env.DB.prepare("UPDATE opportunities SET executed = 1 WHERE id = ?1").bind(
+      opportunityId,
+    ),
+    env.DB.prepare("UPDATE scans SET executed_count = 1 WHERE id = ?1").bind(scanId),
+    env.DB.prepare("UPDATE balances SET amount = amount + ?1 WHERE asset = 'USDT'").bind(
+      profit - tax.tdsWithheld,
+    ),
+  ]);
+
   return scanId;
+}
+
+/** The common case: an untaxed triangular row, as most of the history is. */
+async function seedHistory(ts: number, profit: number): Promise<number> {
+  return seedTrade(ts, profit);
 }
 
 interface PortfolioTaxBody {
@@ -181,27 +290,35 @@ describe("GET /api/portfolio", () => {
     expect(body.pnl).toEqual({ absUsdt: 0, pct: 0 });
   });
 
-  it("reflects the profit of an executed scan", async () => {
-    serveProfitableBook();
+  it("reflects the historical trades still on disk", async () => {
+    await seedHistory(1_000, 1.694305898);
+
+    const body = (await (await get("/api/portfolio")).json()) as PortfolioBody;
+    expect(body.equityUsdt).toBeCloseTo(DEFAULTS.initial_usdt + 1.694305898, 6);
+    expect(body.pnl.absUsdt).toBeCloseTo(1.694305898, 6);
+    expect(body.pnl.pct).toBeCloseTo((1.694305898 / DEFAULTS.initial_usdt) * 100, 8);
+  });
+
+  it("is unmoved by a scan, because a scan no longer fills anything", async () => {
+    serveBook();
+
+    const before = (await (await get("/api/portfolio")).json()) as PortfolioBody;
     const scanRes = await send("/api/scan", "POST");
     expect(scanRes.status).toBe(200);
 
     const scan = (await scanRes.json()) as {
-      executed: boolean;
-      tradeId?: number;
       scanId: number;
-      opportunities: Array<{ cycle: string; executed: boolean }>;
+      opportunities: Array<{ executed: boolean }>;
     };
-    expect(scan.executed).toBe(true);
-    expect(scan.tradeId).toBeTypeOf("number");
-    expect(scan.opportunities).toHaveLength(2);
-    expect(scan.opportunities[0].cycle).toBe("USDT>BTC>ETH>USDT");
-    expect(scan.opportunities[0].executed).toBe(true);
+    expect(scan.scanId).toBeTypeOf("number");
+    expect(scan.opportunities.every((o) => !o.executed)).toBe(true);
 
-    const body = (await (await get("/api/portfolio")).json()) as PortfolioBody;
-    expect(body.equityUsdt).toBeCloseTo(DEFAULTS.initial_usdt + EXPECTED_PROFIT, 6);
-    expect(body.pnl.absUsdt).toBeCloseTo(EXPECTED_PROFIT, 6);
-    expect(body.pnl.pct).toBeCloseTo((EXPECTED_PROFIT / DEFAULTS.initial_usdt) * 100, 8);
+    const after = (await (await get("/api/portfolio")).json()) as PortfolioBody;
+    expect(after.equityUsdt).toBe(before.equityUsdt);
+    expect(after.pnl).toEqual(before.pnl);
+    await expect(get("/api/trades").then((r) => r.json())).resolves.toMatchObject({
+      count: 0,
+    });
   });
 });
 
@@ -232,6 +349,7 @@ describe("history listings", () => {
 
     expect(body.count).toBe(3);
     expect(body.opportunities.map((o) => o.ts)).toEqual([1_004, 1_003, 1_002]);
+    // Historical rows keep their `executed` flag; nothing sets it any more.
     expect(body.opportunities[0].executed).toBe(true);
     expect(body.opportunities[0].legs).toEqual([]);
   });
@@ -307,13 +425,13 @@ describe("POST /api/reset", () => {
   });
 
   it("keeps tuned settings across a reset", async () => {
-    await send("/api/settings", "PUT", { min_profit_pct: -0.5 });
+    await send("/api/settings", "PUT", { xchg_min_profit_pct: -0.5 });
     await send("/api/reset", "POST");
 
     const settings = (await (await get("/api/settings")).json()) as {
-      min_profit_pct: number;
+      xchg_min_profit_pct: number;
     };
-    expect(settings.min_profit_pct).toBe(-0.5);
+    expect(settings.xchg_min_profit_pct).toBe(-0.5);
   });
 });
 
@@ -324,26 +442,11 @@ describe("GET|PUT /api/settings", () => {
     await expect(res.json()).resolves.toEqual({ ...DEFAULTS });
   });
 
-  it("accepts a negative min_profit_pct (demo mode)", async () => {
-    const res = await send("/api/settings", "PUT", { min_profit_pct: -0.25 });
+  it("accepts a valid fee_rate", async () => {
+    const res = await send("/api/settings", "PUT", { fee_rate: 0.002 });
     expect(res.status).toBe(200);
-
-    const body = (await res.json()) as { min_profit_pct: number; fee_rate: number };
-    expect(body.min_profit_pct).toBe(-0.25);
-    expect(body.fee_rate).toBe(DEFAULTS.fee_rate);
-    await expect(getSettings(env.DB)).resolves.toMatchObject({ min_profit_pct: -0.25 });
-  });
-
-  it("accepts a valid fee_rate and trade size together", async () => {
-    const res = await send("/api/settings", "PUT", {
-      fee_rate: 0.002,
-      trade_size_usdt: 250,
-    });
-    expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toMatchObject({
-      fee_rate: 0.002,
-      trade_size_usdt: 250,
-    });
+    await expect(res.json()).resolves.toMatchObject({ fee_rate: 0.002 });
+    await expect(getSettings(env.DB)).resolves.toMatchObject({ fee_rate: 0.002 });
   });
 
   it("rejects an out-of-range fee_rate", async () => {
@@ -357,20 +460,28 @@ describe("GET|PUT /api/settings", () => {
     });
   });
 
-  it("rejects a negative fee_rate and a non-positive trade size", async () => {
+  it("rejects a negative fee_rate", async () => {
     await expect(
       send("/api/settings", "PUT", { fee_rate: -0.001 }).then((r) => r.status),
-    ).resolves.toBe(400);
-    await expect(
-      send("/api/settings", "PUT", { trade_size_usdt: 0 }).then((r) => r.status),
     ).resolves.toBe(400);
   });
 
   it("rejects unknown keys with 400", async () => {
-    const res = await send("/api/settings", "PUT", { min_profit: 1 });
+    const res = await send("/api/settings", "PUT", { xchg_min_profit: 1 });
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("min_profit");
+    expect(body.error).toContain("xchg_min_profit");
+  });
+
+  it("rejects the settings Phase 12 retired, rather than silently accepting them", async () => {
+    // The behaviour they controlled no longer exists, so pretending to store
+    // them would be the dishonest answer.
+    for (const key of ["min_profit_pct", "trade_size_usdt"]) {
+      const res = await send("/api/settings", "PUT", { [key]: 1 });
+      expect(res.status, key).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error, key).toContain(key);
+    }
   });
 
   it("rejects initial_usdt, which is the P&L baseline rather than a tunable", async () => {
@@ -385,25 +496,8 @@ describe("GET|PUT /api/settings", () => {
   });
 
   it("rejects a non-numeric value", async () => {
-    const res = await send("/api/settings", "PUT", { trade_size_usdt: "100" });
+    const res = await send("/api/settings", "PUT", { fee_rate: "0.001" });
     expect(res.status).toBe(400);
-  });
-
-  it("applies a changed trade size to the next scan", async () => {
-    await send("/api/settings", "PUT", { trade_size_usdt: 200 });
-    serveProfitableBook();
-
-    await send("/api/scan", "POST");
-
-    const body = (await (await get("/api/trades")).json()) as {
-      trades: Array<{ startAmount: number; profit: number }>;
-    };
-    expect(body.trades[0].startAmount).toBe(200);
-    expect(body.trades[0].profit).toBeCloseTo(EXPECTED_PROFIT * 2, 6);
-    await expect(getBalance(env.DB, "USDT")).resolves.toBeCloseTo(
-      DEFAULTS.initial_usdt + EXPECTED_PROFIT * 2,
-      6,
-    );
   });
 });
 
@@ -411,11 +505,26 @@ describe("GET|PUT /api/settings", () => {
 // India mode over HTTP
 // ---------------------------------------------------------------------------
 //
-// Figures derived in test/tax.test.ts; on the PROFITABLE book at 100 USDT:
+// Figures derived in test/tax.test.ts, for a 100 USDT three-hop cycle:
 //   gross +1.6943059  tds 3.01679452  tax 0.50829177  net 1.18601413
+//
+// They belong to a fill that happened before Phase 12, which is exactly what
+// these tests cover: the portfolio and trade routes must go on reporting the
+// history correctly now that nothing adds to it.
+const GROSS_PROFIT = 1.694305898;
 const TDS_WITHHELD = 3.01679452;
 const TAX_DUE = 0.50829177;
 const NET_PROFIT = 1.18601413;
+
+/** A historical india-mode fill, with the rates that were in force. */
+const TAXED = {
+  tdsBase: 301.679452,
+  tdsWithheld: TDS_WITHHELD,
+  taxDue: TAX_DUE,
+  netProfit: NET_PROFIT,
+  tdsRate: 0.01,
+  taxRate: 0.3,
+};
 
 async function portfolio(): Promise<PortfolioBody> {
   return (await (await get("/api/portfolio")).json()) as PortfolioBody;
@@ -500,17 +609,16 @@ describe("GET /api/portfolio - tax block", () => {
     expect(body.pnl).toEqual({ absUsdt: 0, pct: 0 });
   });
 
-  it("reports the worked figures after an india-mode scan", async () => {
+  it("reports the worked figures for a historical india-mode fill", async () => {
     await send("/api/settings", "PUT", { india_mode: 1 });
-    serveProfitableBook();
-    await send("/api/scan", "POST");
+    await seedTrade(7_000, GROSS_PROFIT, { tax: TAXED });
 
     const body = await portfolio();
 
     expect(body.tax.indiaMode).toBe(true);
     expect(body.tax.trades).toBe(1);
     expect(body.tax.profitableTrades).toBe(1);
-    expect(body.tax.grossProfitUsdt).toBeCloseTo(EXPECTED_PROFIT, 6);
+    expect(body.tax.grossProfitUsdt).toBeCloseTo(GROSS_PROFIT, 6);
     expect(body.tax.tdsWithheldUsdt).toBeCloseTo(TDS_WITHHELD, 8);
     expect(body.tax.taxDueUsdt).toBeCloseTo(TAX_DUE, 8);
     expect(body.tax.netProfitUsdt).toBeCloseTo(NET_PROFIT, 8);
@@ -521,7 +629,7 @@ describe("GET /api/portfolio - tax block", () => {
 
     // Equity is the cash view: TDS already gone, so a winning cycle is down.
     expect(body.equityUsdt).toBeCloseTo(
-      DEFAULTS.initial_usdt + EXPECTED_PROFIT - TDS_WITHHELD,
+      DEFAULTS.initial_usdt + GROSS_PROFIT - TDS_WITHHELD,
       8,
     );
     expect(body.pnl.absUsdt).toBeLessThan(0);
@@ -539,8 +647,7 @@ describe("GET /api/portfolio - tax block", () => {
 
   it("zeroes the tax totals on reset", async () => {
     await send("/api/settings", "PUT", { india_mode: 1 });
-    serveProfitableBook();
-    await send("/api/scan", "POST");
+    await seedTrade(7_100, GROSS_PROFIT, { tax: TAXED });
     expect((await portfolio()).tax.tdsWithheldUsdt).toBeGreaterThan(0);
 
     const res = await send("/api/reset", "POST");
@@ -558,9 +665,7 @@ describe("GET /api/portfolio - tax block", () => {
 
 describe("history listings - tax fields", () => {
   it("exposes the tax columns on trades, falling back for untaxed rows", async () => {
-    await send("/api/settings", "PUT", { india_mode: 1 });
-    serveProfitableBook();
-    await send("/api/scan", "POST");
+    await seedTrade(2_500, GROSS_PROFIT, { tax: TAXED });
     // An insert that carries no tax at all, as every pre-Phase-8 row does.
     await seedHistory(3_000, 5);
 
@@ -596,10 +701,8 @@ describe("history listings - tax fields", () => {
     expect(taxed.tdsBase).toBeCloseTo(301.679452, 6);
   });
 
-  it("exposes indiaNetPct/tdsPct on opportunities, null when the mode is off", async () => {
-    // Written with the mode off.
-    await seedHistory(4_000, 5);
-    serveProfitableBook();
+  it("exposes indiaNetPct/tdsPct on spreads, null when the mode is off", async () => {
+    serveBothVenues();
     await send("/api/scan", "POST");
 
     const off = (await (await get("/api/opportunities")).json()) as {
@@ -609,11 +712,12 @@ describe("history listings - tax fields", () => {
         tdsPct: number | null;
       }>;
     };
+    expect(off.opportunities.length).toBeGreaterThan(0);
     expect(off.opportunities.every((o) => o.indiaNetPct === null)).toBe(true);
     expect(off.opportunities.every((o) => o.tdsPct === null)).toBe(true);
 
     await send("/api/settings", "PUT", { india_mode: 1 });
-    serveProfitableBook();
+    serveBothVenues();
     await send("/api/scan", "POST");
 
     const on = (await (await get("/api/opportunities")).json()) as {
@@ -624,35 +728,12 @@ describe("history listings - tax fields", () => {
         tdsPct: number | null;
       }>;
     };
-    const best = on.opportunities.find((o) => o.cycle === "USDT>BTC>ETH>USDT");
+    const best = on.opportunities.find((o) => o.cycle === SPREAD_LABEL);
     expect(best).toBeDefined();
+    expect(best!.netPct).toBeCloseTo(SPREAD_NET_PCT, 8);
     expect(best!.indiaNetPct).toBeCloseTo(best!.netPct * 0.7, 8);
-    expect(best!.tdsPct).toBeCloseTo(3.01679452, 8);
-  });
-});
-
-describe("POST /api/scan - tax block", () => {
-  it("carries the tax figures when india mode is on and omits them when off", async () => {
-    serveProfitableBook();
-    const plain = (await (await send("/api/scan", "POST")).json()) as {
-      executed: boolean;
-      tax?: unknown;
-    };
-    expect(plain.executed).toBe(true);
-    expect(plain.tax).toBeUndefined();
-
-    await send("/api/settings", "PUT", { india_mode: 1 });
-    serveProfitableBook();
-    const taxed = (await (await send("/api/scan", "POST")).json()) as {
-      executed: boolean;
-      tax?: { tdsWithheld: number; taxDue: number; netProfit: number };
-    };
-    expect(taxed.executed).toBe(true);
-    expect(taxed.tax).toEqual({
-      tdsWithheld: TDS_WITHHELD,
-      taxDue: TAX_DUE,
-      netProfit: NET_PROFIT,
-    });
+    // Two legs, so ~2% of notional withheld — against an edge of ~0.63%.
+    expect(best!.tdsPct).toBeCloseTo(SPREAD_TDS_PCT, 6);
   });
 });
 
@@ -662,31 +743,11 @@ describe("POST /api/scan - tax block", () => {
 
 /** One synthetic cross-exchange opportunity + trade, at a controlled timestamp. */
 async function seedSpreadHistory(ts: number, profit: number): Promise<number> {
-  const scanId = await insertScan(env.DB, "manual", ts);
-  const cycle = `BTCUSDT binance-ws>mexc-rest#${ts}`;
-  const [opportunityId] = await insertOpportunities(
-    env.DB,
-    scanId,
-    [{ cycle, grossPct: profit, netPct: profit, legs: [] }],
-    ts,
-    "cross_exchange",
-  );
-  await commitTrade(env.DB, {
-    scanId,
-    opportunityId,
-    source: "binance-ws+mexc-rest",
-    ts,
+  return seedTrade(ts, profit, {
     strategy: "cross_exchange",
-    trade: {
-      cycle,
-      startAmount: 100,
-      endAmount: 100 + profit,
-      profit,
-      profitPct: profit,
-      legs: [],
-    },
+    source: "binance-ws+mexc-rest",
+    cycle: `BTCUSDT binance-ws>mexc-rest#${ts}`,
   });
-  return scanId;
 }
 
 describe("history listings - ?strategy filter", () => {
@@ -820,48 +881,120 @@ describe("PUT /api/settings - cross-exchange", () => {
 });
 
 describe("POST /api/scan - cross-exchange block", () => {
-  it("reports the spread figures alongside the triangular ones", async () => {
-    // No MEXC venue is reachable here (nothing is intercepted), so the spread
-    // scanner degrades: the response still carries its fields, the scan itself
-    // still succeeds, and `error` stays clean.
-    serveProfitableBook();
+  it("reports the spread figures and records them as opportunities", async () => {
+    serveBothVenues();
     const body = (await (await send("/api/scan", "POST")).json()) as {
-      executed: boolean;
       error?: string;
+      source: string;
       spreadsCount: number;
       bestSpreadNetPct: number | null;
-      xchgExecuted: boolean;
       xchgError?: string;
-      opportunities: Array<{ strategy: string }>;
+      opportunities: Array<{ strategy: string; cycle: string; executed: boolean }>;
     };
 
     expect(body.error).toBeUndefined();
-    expect(body.executed).toBe(true);
-    expect(body.spreadsCount).toBe(0);
-    expect(body.bestSpreadNetPct).toBeNull();
-    expect(body.xchgExecuted).toBe(false);
-    expect(body.xchgError).toContain("mexc-rest");
-    expect(body.opportunities.every((o) => o.strategy === "triangular")).toBe(true);
+    expect(body.xchgError).toBeUndefined();
+    expect(body.source).toBe("binance-ws");
+    expect(body.spreadsCount).toBe(2);
+    expect(body.bestSpreadNetPct).toBeCloseTo(SPREAD_NET_PCT, 8);
+    // Only spreads are written now, and none of them is filled.
+    expect(body.opportunities.every((o) => o.strategy === "cross_exchange")).toBe(true);
+    expect(body.opportunities.every((o) => !o.executed)).toBe(true);
+    expect(body.opportunities.map((o) => o.cycle)).toContain(SPREAD_LABEL);
   });
 
-  it("exposes the new scan columns in the listing", async () => {
-    serveProfitableBook();
+  it("degrades to xchgError when only one venue answers", async () => {
+    // No MEXC venue is reachable here (nothing is intercepted), so the spread
+    // scanner degrades: the response still carries its fields, the scan itself
+    // still succeeds, and `error` stays clean.
+    serveBook();
+    const body = (await (await send("/api/scan", "POST")).json()) as {
+      error?: string;
+      spreadsCount: number;
+      bestSpreadNetPct: number | null;
+      xchgError?: string;
+      opportunities: unknown[];
+    };
+
+    expect(body.error).toBeUndefined();
+    expect(body.spreadsCount).toBe(0);
+    expect(body.bestSpreadNetPct).toBeNull();
+    expect(body.xchgError).toContain("mexc-rest");
+    expect(body.opportunities).toEqual([]);
+  });
+
+  it("exposes the spread columns in the scan listing", async () => {
+    serveBothVenues();
     await send("/api/scan", "POST");
 
     const body = (await (await get("/api/scans")).json()) as {
       scans: Array<{
         spreads_count: number;
         best_spread_net_pct: number | null;
+        triangles_count: number;
+        best_net_pct: number | null;
+        executed_count: number;
         xchg_error: string | null;
         error: string | null;
       }>;
     };
     const [scan] = body.scans;
-    expect(scan.spreads_count).toBe(0);
-    expect(scan.best_spread_net_pct).toBeNull();
-    // A missing second venue is recorded, but it is not a scan failure.
-    expect(scan.xchg_error).toContain("mexc-rest");
+    expect(scan.spreads_count).toBe(2);
+    expect(scan.best_spread_net_pct).toBeCloseTo(SPREAD_NET_PCT, 8);
+    expect(scan.xchg_error).toBeNull();
     expect(scan.error).toBeNull();
+    // The retired triangular columns are still served, at their defaults.
+    expect(scan.triangles_count).toBe(0);
+    expect(scan.best_net_pct).toBeNull();
+    expect(scan.executed_count).toBe(0);
+  });
+});
+
+describe("GET /api/opportunities - the qualifies flag", () => {
+  it("judges every row against the current threshold, not a stored one", async () => {
+    serveBothVenues();
+    await send("/api/scan", "POST");
+
+    type Body = {
+      minProfitPct: number;
+      opportunities: Array<{ cycle: string; netPct: number; qualifies: boolean }>;
+    };
+    const read = async () =>
+      (await (await get("/api/opportunities")).json()) as Body;
+
+    const before = await read();
+    expect(before.minProfitPct).toBe(DEFAULTS.xchg_min_profit_pct);
+    const qualifying = before.opportunities.filter((o) => o.qualifies);
+    expect(qualifying.length).toBeGreaterThan(0);
+    expect(
+      qualifying.every((o) => o.netPct >= DEFAULTS.xchg_min_profit_pct),
+    ).toBe(true);
+
+    // Raising the bar must re-classify rows already on disk: qualifying is a
+    // judgement about a measurement, not part of it.
+    await send("/api/settings", "PUT", { xchg_min_profit_pct: 1000 });
+    const after = await read();
+    expect(after.minProfitPct).toBe(1000);
+    expect(after.opportunities.every((o) => !o.qualifies)).toBe(true);
+    // The stored percentages themselves did not move.
+    expect(after.opportunities[0].netPct).toBe(before.opportunities[0].netPct);
+
+    await send("/api/settings", "PUT", { xchg_min_profit_pct: -1000 });
+    expect((await read()).opportunities.every((o) => o.qualifies)).toBe(true);
+  });
+
+  it("nothing is ever marked executed, however good the spread looks", async () => {
+    serveBothVenues();
+    await send("/api/scan", "POST");
+
+    const body = (await (await get("/api/opportunities")).json()) as {
+      opportunities: Array<{ qualifies: boolean; executed: boolean }>;
+    };
+    expect(body.opportunities.some((o) => o.qualifies)).toBe(true);
+    expect(body.opportunities.every((o) => !o.executed)).toBe(true);
+    await expect(get("/api/trades").then((r) => r.json())).resolves.toMatchObject({
+      count: 0,
+    });
   });
 });
 
@@ -994,7 +1127,7 @@ describe("GET /api/funding", () => {
   });
 
   it("returns the newest board, best net carry first", async () => {
-    serveProfitableBook();
+    serveBook();
     await send("/api/scan", "POST");
 
     const body = await funding();
@@ -1017,7 +1150,7 @@ describe("GET /api/funding", () => {
   });
 
   it("recomputes qualifies against the current threshold, not the stored one", async () => {
-    serveProfitableBook();
+    serveBook();
     await send("/api/scan", "POST");
 
     const before = await funding();
@@ -1231,11 +1364,10 @@ describe("PUT /api/settings - funding", () => {
 });
 
 describe("POST /api/scan - funding block", () => {
-  it("carries the funding figures alongside the arbitrage ones", async () => {
-    serveProfitableBook();
+  it("carries the funding figures alongside the spread ones", async () => {
+    serveBook();
     const body = (await (await send("/api/scan", "POST")).json()) as {
       error?: string;
-      executed: boolean;
       fundingVenue: string | null;
       fundingCount: number;
       bestFundingNetAnnualPct: number | null;
@@ -1244,7 +1376,6 @@ describe("POST /api/scan - funding block", () => {
     };
 
     expect(body.error).toBeUndefined();
-    expect(body.executed).toBe(true);
     expect(body.fundingVenue).toBe("bybit");
     expect(body.fundingCount).toBe(11);
     expect(body.bestFundingNetAnnualPct).toBeCloseTo(17.03333333, 6);
@@ -1253,9 +1384,9 @@ describe("POST /api/scan - funding block", () => {
   });
 
   it("reports the funding half as skipped on an immediate second scan", async () => {
-    serveProfitableBook();
+    serveBook();
     await send("/api/scan", "POST");
-    serveProfitableBook();
+    serveBook();
 
     const body = (await (await send("/api/scan", "POST")).json()) as {
       fundingSkipped?: boolean;
@@ -1268,7 +1399,7 @@ describe("POST /api/scan - funding block", () => {
   });
 
   it("never lets a dead perp venue reach scans.error", async () => {
-    serveProfitableBook();
+    serveBook();
     setFundingFetcher(async () => {
       throw new Error(
         "no funding-rate source available (bybit: HTTP 403; okx: HTTP 429)",
@@ -1277,11 +1408,9 @@ describe("POST /api/scan - funding block", () => {
 
     const body = (await (await send("/api/scan", "POST")).json()) as {
       error?: string;
-      executed: boolean;
       fundingError?: string;
     };
     expect(body.error).toBeUndefined();
-    expect(body.executed).toBe(true);
     expect(body.fundingError).toContain("no funding-rate source available");
 
     const scans = (await (await get("/api/scans")).json()) as {
