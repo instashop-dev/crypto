@@ -15,6 +15,7 @@ import { getDualSnapshot, discoverPairs, type DualSnapshot } from "./binance";
 import {
   ASSET_UNIVERSE,
   BASE_ASSET,
+  FUNDING_BOARD_BOTTOM_N,
   FUNDING_BOARD_TOP_N,
   FUNDING_INTERVAL_CACHE_TTL_MS,
   FUNDING_POLL_INTERVAL_MS,
@@ -215,12 +216,27 @@ async function loadFundingIntervals(
   return cached?.intervals ?? {};
 }
 
+/** One venue's share of a persisted board. */
+export interface FundingVenueCount {
+  venue: FundingVenue;
+  count: number;
+}
+
 /** What one funding poll produced. */
 export interface FundingPollResult {
   /** The venue behind the best-paying persisted row; `null` if none. */
   venue: FundingVenue | null;
-  /** Venues that contributed at least one row, best-paying first. */
-  venues: FundingVenue[];
+  /**
+   * Venues that contributed at least one row, with their share of the board,
+   * best-paying first.
+   *
+   * Objects rather than bare names so `POST /api/funding/refresh` reports the
+   * *same* `venues` shape `GET /api/funding` does — the two describe the same
+   * board, and a caller that had to know which endpoint it asked in order to
+   * read the field was a trap. {@link ScanResult.fundingVenues} stays a name
+   * list: the scan toast names sources, it does not tabulate them.
+   */
+  venues: FundingVenueCount[];
   /** `venue: reason`, one per venue that contributed nothing. */
   venueErrors: string[];
   ts: number;
@@ -257,14 +273,20 @@ export async function pollFundingRates(
   // Priced across all venues at once, so the ranking answers "the best carry
   // available anywhere" rather than "the best carry on each venue separately".
   // The per-venue cap is applied *after* pricing, because which of a venue's
-  // 850 contracts are its best 25 is not knowable before the fee drag is.
+  // 850 contracts are its best 20 and worst 5 is not knowable before the fee
+  // drag is.
   const ranked = rankFundingOpportunities(
     snapshot.quotes,
     settings.fee_rate,
     settings.perp_fee_rate,
     settings.funding_hold_days,
   );
-  const kept = capFundingBoard(ranked, assets, FUNDING_BOARD_TOP_N);
+  const kept = capFundingBoard(
+    ranked,
+    assets,
+    FUNDING_BOARD_TOP_N,
+    FUNDING_BOARD_BOTTOM_N,
+  );
 
   const rows: FundingRateInput[] = kept.map((r) => ({
     venue: r.quote.venue,
@@ -283,14 +305,22 @@ export async function pollFundingRates(
   // Ordered by what each venue actually pays rather than by the order they were
   // polled in: the first name is the one the dashboard shows beside the best
   // carry figure, so it has to be the venue that produced it.
-  const venues: FundingVenue[] = [];
+  const venues: FundingVenueCount[] = [];
+  const byVenue = new Map<FundingVenue, FundingVenueCount>();
   for (const row of kept) {
     const venue = row.quote.venue;
-    if (!venues.includes(venue)) venues.push(venue);
+    const seen = byVenue.get(venue);
+    if (seen) {
+      seen.count++;
+      continue;
+    }
+    const entry = { venue, count: 1 };
+    byVenue.set(venue, entry);
+    venues.push(entry);
   }
 
   return {
-    venue: venues[0] ?? null,
+    venue: venues[0]?.venue ?? null,
     venues,
     venueErrors: snapshot.venues
       .filter((v) => v.error !== null)
@@ -459,7 +489,9 @@ export async function runScan(
     } else {
       const poll = await pollFundingRates(env, scanId, deps, startedAt);
       fundingVenue = poll.venue;
-      fundingVenues = poll.venues;
+      // Names only: the scan toast lists sources, and the per-venue counts the
+      // poll returns are what `/api/funding` is for.
+      fundingVenues = poll.venues.map((v) => v.venue);
       fundingVenueErrors = poll.venueErrors;
       fundingCount = poll.count;
       bestFundingNetAnnualPct = poll.bestNetAnnualPct;

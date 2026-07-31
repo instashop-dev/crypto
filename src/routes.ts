@@ -234,6 +234,10 @@ function parseFundingVenue(
 /**
  * Per-venue row counts for a board, in the order the venues first appear —
  * which, since the board is sorted by net carry, means best-paying venue first.
+ *
+ * Deliberately the same `{venue, count}` shape
+ * {@link import("./scan").FundingPollResult.venues} carries, so the read
+ * and the refresh endpoints describe a board identically.
  */
 function summariseVenues(rates: FundingRate[]): Array<{ venue: string; count: number }> {
   const counts = new Map<string, number>();
@@ -678,6 +682,10 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * single market. 502 rather than 500 when *every* venue fails — the failure
    * is upstream, exactly as it is for `/api/tickers`. One venue failing is a
    * 200 with the survivors' board and the dead one named in `venueErrors`.
+   *
+   * `venues` is `[{venue, count}]`, the same shape `GET /api/funding` reports:
+   * both describe one board, so a reader must not have to know which endpoint
+   * produced the field in order to parse it.
    */
   app.post("/api/funding/refresh", async (c) => {
     try {

@@ -11,6 +11,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   ASSET_UNIVERSE,
   BASE_ASSET,
+  FUNDING_BOARD_BOTTOM_N,
   FUNDING_BOARD_TOP_N,
   perpAssets,
 } from "../src/config";
@@ -726,7 +727,8 @@ describe("capFundingBoard", () => {
       row("gate", "ETH", 2),
     ];
 
-    const kept = capFundingBoard(ranked, MAJORS, 2);
+    // No negative-tail budget here, so this is the top half of the cap alone.
+    const kept = capFundingBoard(ranked, MAJORS, 2, 0);
 
     expect(kept.map((r) => `${r.quote.venue}:${r.quote.symbol}`)).toEqual([
       "gate:AAA",
@@ -741,6 +743,57 @@ describe("capFundingBoard", () => {
     ]);
   });
 
+  it("keeps each venue's deepest negatives, which the top alone would discard", () => {
+    // One venue, 30 non-majors: 20 positive, then a long slide into the sort of
+    // rate the engine calls the headline result of the day it happens.
+    const ranked = [
+      ...Array.from({ length: 25 }, (_, i) => row("gate", `POS${i}`, 100 - i)),
+      row("gate", "NEG1", -40),
+      row("gate", "NEG2", -900),
+      row("gate", "LA", -1548),
+    ];
+
+    const kept = capFundingBoard(ranked, MAJORS, 20, 5);
+    const symbols = kept.map((r) => r.quote.symbol);
+
+    // The whole point: -1548%/yr is persisted rather than capped away by 20
+    // rows that pay less than 100% and are nowhere near as interesting.
+    expect(symbols).toContain("LA");
+    expect(symbols).toContain("NEG2");
+    expect(symbols).toContain("NEG1");
+    // Bottom 5 = LA, NEG2, NEG1 and the two worst positives above them.
+    expect(symbols.slice(-5)).toEqual(["POS23", "POS24", "NEG1", "NEG2", "LA"]);
+    // The budget did not grow to make room: still 25 non-major rows, 20 + 5.
+    expect(kept).toHaveLength(FUNDING_BOARD_TOP_N + FUNDING_BOARD_BOTTOM_N);
+    expect(symbols.slice(0, 20)).toEqual(
+      Array.from({ length: 20 }, (_, i) => `POS${i}`),
+    );
+    // The five rows between the two halves are what the budget cost.
+    expect(symbols).not.toContain("POS20");
+    expect(symbols).not.toContain("POS22");
+  });
+
+  it("splits the budget per venue, negatives included", () => {
+    const ranked = [
+      ...Array.from({ length: 6 }, (_, i) => row("gate", `G${i}`, 100 - i)),
+      ...Array.from({ length: 6 }, (_, i) => row("kucoin", `K${i}`, 50 - i)),
+      row("kucoin", "KWORST", -700),
+      row("gate", "GWORST", -800),
+    ];
+
+    const kept = capFundingBoard(ranked, MAJORS, 2, 1);
+    // Each venue: its best 2 and its single worst. Neither venue's deep
+    // negative is crowded out by the other venue's better-paying rows.
+    expect(kept.map((r) => r.quote.symbol)).toEqual([
+      "G0",
+      "G1",
+      "K0",
+      "K1",
+      "KWORST",
+      "GWORST",
+    ]);
+  });
+
   it("counts the cap per venue, so one hot venue cannot crowd the others out", () => {
     const ranked = [
       row("gate", "AAA", 99),
@@ -750,7 +803,7 @@ describe("capFundingBoard", () => {
 
     // Gate fills its budget on the first two rows; KuCoin's much worse row is
     // still kept, because the cross-venue comparison is the product.
-    const kept = capFundingBoard(ranked, MAJORS, 2);
+    const kept = capFundingBoard(ranked, MAJORS, 2, 0);
     expect(kept.map((r) => r.quote.venue)).toEqual(["gate", "gate", "kucoin"]);
   });
 
@@ -759,21 +812,33 @@ describe("capFundingBoard", () => {
       [row("gate", "zzz", 10), row("gate", "btc", 5), row("gate", "yyy", 1)],
       MAJORS,
       1,
+      0,
     );
     expect(kept.map((r) => r.quote.symbol)).toEqual(["zzz", "btc"]);
   });
 
   it("handles the empty, the generous and the zero budget", () => {
-    expect(capFundingBoard([], MAJORS, 25)).toEqual([]);
+    expect(capFundingBoard([], MAJORS, 25, 5)).toEqual([]);
     const ranked = [row("gate", "AAA", 1), row("gate", "BBB", 1)];
-    expect(capFundingBoard(ranked, MAJORS, 25)).toHaveLength(2);
-    // Zero is a real budget, not a missing one: majors only.
-    expect(capFundingBoard(ranked, MAJORS, 0)).toHaveLength(0);
+    expect(capFundingBoard(ranked, MAJORS, 25, 5)).toHaveLength(2);
+    // A venue with fewer rows than the budget keeps each of them *once*: the
+    // two halves overlap and are deduplicated, not concatenated.
+    expect(capFundingBoard(ranked, MAJORS, 2, 2)).toHaveLength(2);
+    // Zero is a real budget, not a missing one: majors only. Both halves have
+    // to be zeroed, and `slice(-0)` must not read as "the whole board".
+    expect(capFundingBoard(ranked, MAJORS, 0, 0)).toHaveLength(0);
+    // Only the negative half: the worst row, not the best one.
+    expect(capFundingBoard(ranked, MAJORS, 0, 1).map((r) => r.quote.symbol)).toEqual([
+      "BBB",
+    ]);
   });
 
   it("defaults to the shipped budget", () => {
     const ranked = Array.from({ length: 40 }, (_, i) => row("gate", `A${i}`, 40 - i));
-    expect(capFundingBoard(ranked, MAJORS)).toHaveLength(FUNDING_BOARD_TOP_N);
+    const kept = capFundingBoard(ranked, MAJORS);
+    expect(kept).toHaveLength(FUNDING_BOARD_TOP_N + FUNDING_BOARD_BOTTOM_N);
+    // The shipped default keeps the bottom of the board, not only the top.
+    expect(kept.map((r) => r.quote.symbol).slice(-1)).toEqual(["A39"]);
   });
 });
 

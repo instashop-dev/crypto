@@ -857,11 +857,23 @@ export const FUNDING_INSERT_CHUNK = 50;
  *
  * **The board is no longer one transaction.** It was, while it fit in a single
  * `batch()`; a multi-venue board does not, and D1 has no cross-batch
- * transaction. So a reader polling mid-write can now observe a *partial* board
- * — fewer rows at the newest `ts`, never a mixture of two polls, since every
- * row of a poll shares one timestamp. That is a two-second cosmetic
- * undercount on a table read every five seconds, against the alternative of
- * exceeding D1's statement limit and writing no board at all.
+ * transaction. So a reader can observe a *partial* board — fewer rows at the
+ * newest `ts`, never a mixture of two polls, since every row of a poll shares
+ * one timestamp.
+ *
+ * **A chunk that fails part-way leaves that truncated board in place for a full
+ * poll interval, not for the length of the write.** The chunks that already
+ * landed carry the new `ts`, so `getLatestFundingTs` returns it, and the poll
+ * gate in `runScan` then declines to poll again for the whole
+ * `FUNDING_POLL_INTERVAL_MS` (5 minutes) — during which `/api/funding` serves
+ * the truncated board as if it were complete, and the venues whose rows were in
+ * the lost chunks look like venues that quoted nothing. The throw does reach
+ * `ScanResult.fundingError`, so the failure is visible in the scan toast and in
+ * `wrangler tail`; the board itself carries no mark of being short.
+ *
+ * That is the accepted cost of the alternative — exceeding D1's statement limit
+ * and writing no board at all — but it is a five-minute stale-and-wrong window,
+ * not a sub-second cosmetic one.
  */
 export async function insertFundingRates(
   db: D1Database,

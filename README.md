@@ -38,7 +38,7 @@ POST /api/scan ──────────►    │
                               │                   concurrent + allSettled
         [funding]     annualise the next funding rate of every quoted perp, net
                       of 4 legs of fees over the assumed holding period → rank →
-                      persist the majors + each venue's best 25
+                      persist the majors + each venue's best 20 and worst 5
                               │
                               ▼
         D1 (SQLite): pairs · scans · opportunities · funding_rates · settings
@@ -363,10 +363,17 @@ work.
 **Universe and cap.** Each full-board venue persists the 11 majors
 unconditionally — they are the continuous series `/api/funding/history` serves,
 and dropping BTC the day its funding went flat would put a hole in exactly the
-chart someone reads to see funding go flat — plus its own best
-`FUNDING_BOARD_TOP_N = 25` remaining contracts by net annual carry. The cap is
-per venue, not global, so one hot venue cannot crowd every other one off the
-board and quietly end the cross-venue comparison.
+chart someone reads to see funding go flat — plus a 25-row budget of its own
+tail, split `FUNDING_BOARD_TOP_N = 20` best and `FUNDING_BOARD_BOTTOM_N = 5`
+worst by net annual carry. The cap is per venue, not global, so one hot venue
+cannot crowd every other one off the board and quietly end the cross-venue
+comparison.
+
+The budget is split because the ranking is signed. A deeply negative rate is a
+headline result — the engine keeps negative rows on exactly those grounds — and
+a pure "top 25" cap discarded every one of them, so the most extreme figure on
+the board (a live Gate capture had `LA_USDT` at roughly -1548%/yr) was
+systematically the one row that could never be persisted.
 
 **Cadence and retention.** The board is polled at most every 5 minutes, gated on
 `MAX(ts)` in `funding_rates` — funding settles every 8 hours, so a minutely scan
@@ -375,7 +382,11 @@ the prune rides in the last `batch()` of the insert, after every row has landed.
 Inserts are chunked at 50 statements per batch (D1 caps statements per batch, and
 a four-venue board is ~144 rows), so a board is no longer written as one
 transaction: a reader polling mid-write can see a *partial* board — never a
-mixture of two polls, since every row of a poll shares one timestamp.
+mixture of two polls, since every row of a poll shares one timestamp. A chunk
+that *fails* part-way is worse than that: the chunks already written carry the
+new `ts`, so the 5-minute poll gate declines to retry and `/api/funding` serves
+the truncated board for the rest of the interval. The scan reports the failure
+in `fundingError`; the board does not.
 `POST /api/funding/refresh` bypasses the gate and writes rows with
 `scan_id = NULL`.
 

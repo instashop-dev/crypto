@@ -1365,13 +1365,15 @@ describe("POST /api/funding/refresh", () => {
     const body = (await res.json()) as {
       count: number;
       venue: string;
-      venues: string[];
+      venues: Array<{ venue: string; count: number }>;
       venueErrors: string[];
       ts: number;
     };
     expect(body.count).toBe(11);
     expect(body.venue).toBe("bybit");
-    expect(body.venues).toEqual(["bybit"]);
+    // The same `{venue, count}` shape `GET /api/funding` reports: both describe
+    // one board, so neither may make the reader ask which endpoint it came from.
+    expect(body.venues).toEqual([{ venue: "bybit", count: 11 }]);
     expect(body.venueErrors).toEqual([]);
     expect(typeof body.ts).toBe("number");
 

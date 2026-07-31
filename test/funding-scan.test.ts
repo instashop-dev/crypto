@@ -16,6 +16,7 @@ import { setRestFetcher, setWsCollector } from "../src/binance";
 import {
   ASSET_UNIVERSE,
   BASE_ASSET,
+  FUNDING_BOARD_BOTTOM_N,
   FUNDING_BOARD_TOP_N,
   perpAssets,
 } from "../src/config";
@@ -703,11 +704,13 @@ describe("runScan - the per-venue board cap", () => {
     ]);
   }
 
-  it("keeps every major plus each venue's best 25 of the tail", async () => {
+  const TAIL_BUDGET = FUNDING_BOARD_TOP_N + FUNDING_BOARD_BOTTOM_N;
+
+  it("keeps every major plus each venue's best 20 and worst 5 of the tail", async () => {
     const result = await runScan(env, "manual", { now, fetchFunding: wideBoard() });
 
-    // (11 majors + 25 tail) x 2 venues. 142 quotes in, 72 rows out.
-    expect(result.fundingCount).toBe((ASSETS.length + FUNDING_BOARD_TOP_N) * 2);
+    // (11 majors + 20 + 5 tail) x 2 venues. 142 quotes in, 72 rows out.
+    expect(result.fundingCount).toBe((ASSETS.length + TAIL_BUDGET) * 2);
 
     const rows = await persistedBoard();
     for (const venue of ["gate", "kucoin"]) {
@@ -718,12 +721,40 @@ describe("runScan - the per-venue board cap", () => {
       // Majors survive despite paying an order of magnitude less than the tail:
       // they are the continuous series the history route serves.
       expect(majors, venue).toHaveLength(ASSETS.length);
-      expect(kept, venue).toHaveLength(FUNDING_BOARD_TOP_N);
-      // And the tail that survived is the *best* 25, not the first 25 seen.
+      expect(kept, venue).toHaveLength(TAIL_BUDGET);
+      // The tail that survived is this venue's best 20 and worst 5 — the ones
+      // in between are what the budget cost.
       const upper = venue.toUpperCase();
-      expect(kept.map((r) => r.symbol).sort(), venue).toEqual(
-        Array.from({ length: FUNDING_BOARD_TOP_N }, (_, i) => `TAIL${upper}${i}`).sort(),
+      const best = Array.from({ length: FUNDING_BOARD_TOP_N }, (_, i) => `TAIL${upper}${i}`);
+      const worst = Array.from(
+        { length: FUNDING_BOARD_BOTTOM_N },
+        (_, i) => `TAIL${upper}${60 - FUNDING_BOARD_BOTTOM_N + i}`,
       );
+      expect(kept.map((r) => r.symbol).sort(), venue).toEqual(
+        [...best, ...worst].sort(),
+      );
+    }
+  });
+
+  it("persists the deepest negative on each venue rather than capping it away", async () => {
+    // 60 rows paying well, then one paying catastrophically: the sort of
+    // contract the engine calls the headline result of the day it happens. A
+    // one-sided top-25 cap would have thrown it away every single poll.
+    const fetchFunding = boardOf([
+      ...tail("gate", 60, 0.002),
+      ["gate" as FundingVenue, "GATEDEEPNEG", -0.05] as [FundingVenue, string, number],
+      ...tail("kucoin", 60, 0.001),
+      ["kucoin" as FundingVenue, "KUDEEPNEG", -0.04] as [FundingVenue, string, number],
+    ]);
+
+    const rows = await runScan(env, "manual", { now, fetchFunding }).then(persistedBoard);
+    const symbols = rows.map((r) => r.symbol);
+
+    expect(symbols).toContain("GATEDEEPNEG");
+    expect(symbols).toContain("KUDEEPNEG");
+    // And the budget did not grow to make room for them.
+    for (const venue of ["gate", "kucoin"]) {
+      expect(rows.filter((r) => r.venue === venue), venue).toHaveLength(TAIL_BUDGET);
     }
   });
 
@@ -768,5 +799,57 @@ describe("runScan - the per-venue board cap", () => {
     expect(rows.map((r) => r.ts)).not.toContain(stale);
     expect(rows).toHaveLength(result.fundingCount);
     expect(result.fundingCount).toBeGreaterThan(FUNDING_INSERT_CHUNK);
+  });
+});
+
+describe("insertFundingRates - the chunk boundary", () => {
+  const row = (symbol: string) => ({
+    venue: "gate",
+    symbol,
+    instrument: `${symbol}_USDT`,
+    rate: 0.0001,
+    intervalMinutes: 480,
+    intervalSource: "api",
+    annualizedPct: 10.95,
+    netAnnualPct: 7.3,
+    nextFundingTs: null,
+    markPrice: null,
+  });
+
+  it("prunes in a chunk of its own when the rows divide evenly", async () => {
+    // `rows.length % FUNDING_INSERT_CHUNK === 0` is the one board size where
+    // the last insert chunk is full, so the DELETE cannot ride along and is
+    // pushed into a batch by itself. Off-by-one here would either lose the
+    // prune or overrun the statement limit, and neither shows up at 72 rows.
+    const stale = clock - 8 * DAY_MS;
+    await insertFundingRates(env.DB, null, [row("OLD")], stale);
+    await expect(fundingRows()).resolves.toHaveLength(1);
+
+    const board = Array.from({ length: FUNDING_INSERT_CHUNK }, (_, i) => row(`A${i}`));
+    expect(board.length % FUNDING_INSERT_CHUNK).toBe(0);
+
+    const written = await insertFundingRates(env.DB, null, board, clock);
+    expect(written).toBe(FUNDING_INSERT_CHUNK);
+
+    const rows = await fundingRows();
+    // Every row landed and the stale one was pruned despite the DELETE having
+    // no full chunk to attach itself to.
+    expect(rows).toHaveLength(FUNDING_INSERT_CHUNK);
+    expect(rows.map((r) => r.ts)).not.toContain(stale);
+    expect(rows.every((r) => r.ts === clock)).toBe(true);
+  });
+
+  it("still prunes one chunk under the boundary, where the DELETE rides along", async () => {
+    const stale = clock - 8 * DAY_MS;
+    await insertFundingRates(env.DB, null, [row("OLD")], stale);
+
+    const board = Array.from({ length: FUNDING_INSERT_CHUNK - 1 }, (_, i) =>
+      row(`A${i}`),
+    );
+    await insertFundingRates(env.DB, null, board, clock);
+
+    const rows = await fundingRows();
+    expect(rows).toHaveLength(FUNDING_INSERT_CHUNK - 1);
+    expect(rows.map((r) => r.ts)).not.toContain(stale);
   });
 });

@@ -42,7 +42,7 @@
  * That is a structural guarantee, not a convention.
  */
 import { USER_AGENT } from "./binance";
-import { FUNDING_BOARD_TOP_N } from "./config";
+import { FUNDING_BOARD_BOTTOM_N, FUNDING_BOARD_TOP_N } from "./config";
 import { DEFAULT_FUNDING_INTERVAL_MINUTES } from "./engine";
 import type { Env, FundingVenue } from "./types";
 
@@ -531,6 +531,10 @@ export async function fetchOkxFunding(
  * A **deny** list rather than an allow list on purpose: crypto perps carry an
  * empty `contract_type`, and an allow list of `""` would silently empty the
  * whole board the day Gate starts labelling them `"crypto"`.
+ *
+ * KuCoin has no equivalent list because its board carried no non-crypto perps
+ * when it was captured — an observed asymmetry, not a principled one, so the
+ * day KuCoin lists tokenised equities it needs a list of its own.
  */
 const GATE_NON_CRYPTO_TYPES = new Set([
   "stocks",
@@ -819,7 +823,7 @@ export async function getFundingSnapshot(
 /**
  * Trim a ranked board to what is worth persisting, **per venue**.
  *
- * Two rules, and the reason for each:
+ * Three rules, and the reason for each:
  *
  * - **Every major is kept**, whatever it pays. They are the continuous series
  *   the history route serves, and dropping BTC on the day its funding went flat
@@ -827,36 +831,59 @@ export async function getFundingSnapshot(
  * - **Plus that venue's best `topN` of everything else.** The tail is the point
  *   of polling a full board, but a 850-contract venue writing its whole board
  *   every 5 minutes is ~1.7M rows a week for nothing.
+ * - **Plus that venue's *worst* `bottomN`.** The budget is split rather than
+ *   spent entirely on the top because the ranking is signed: the engine keeps
+ *   negative rows on purpose ("a deeply negative rate is the headline result of
+ *   the scan on the day it happens"), and a one-sided cap then discarded every
+ *   one of them. A -1548%/yr contract is not a row worth less than the 20th
+ *   best positive one; it is the most interesting row on the board.
  *
  * Per venue, not globally: a venue whose whole board happens to pay less than
  * another's must still contribute its own top rows, or a single hot venue would
  * crowd every other one out of the board entirely and the cross-venue
  * comparison would quietly stop existing.
  *
+ * The two halves are **deduplicated**, so a venue with fewer than
+ * `topN + bottomN` non-majors keeps all of them once rather than twice. The
+ * per-venue non-major budget is therefore `topN + bottomN` at most.
+ *
  * **Precondition:** `ranked` is sorted by net annual carry, best first — which
  * is exactly what {@link import("./engine").rankFundingOpportunities} returns.
+ * It is what makes "the last `bottomN` of a venue's rows" mean "its worst".
  * Input order is preserved in the output, so the caller's ranking survives.
  */
 export function capFundingBoard<
   T extends { quote: { venue: string; symbol: string } },
->(ranked: readonly T[], majors: Iterable<string>, topN: number = FUNDING_BOARD_TOP_N): T[] {
+>(
+  ranked: readonly T[],
+  majors: Iterable<string>,
+  topN: number = FUNDING_BOARD_TOP_N,
+  bottomN: number = FUNDING_BOARD_BOTTOM_N,
+): T[] {
   const majorSet = new Set(normaliseAssets([...majors]));
-  const tailCount = new Map<string, number>();
-  const kept: T[] = [];
+  const isMajor = (row: T) => majorSet.has(row.quote.symbol.toUpperCase());
 
-  for (const row of ranked) {
-    const { venue, symbol } = row.quote;
-    if (majorSet.has(symbol.toUpperCase())) {
-      kept.push(row);
-      continue;
-    }
-    const seen = tailCount.get(venue) ?? 0;
-    if (seen >= topN) continue;
-    tailCount.set(venue, seen + 1);
-    kept.push(row);
+  // Where each venue's non-major rows sit in `ranked`, in ranked order — so the
+  // head of the list is that venue's best-paying tail and the end is its worst.
+  const positions = new Map<string, number[]>();
+  ranked.forEach((row, i) => {
+    if (isMajor(row)) return;
+    const venue = row.quote.venue;
+    const seen = positions.get(venue);
+    if (seen) seen.push(i);
+    else positions.set(venue, [i]);
+  });
+
+  const top = Math.max(0, topN);
+  const bottom = Math.max(0, bottomN);
+  const keep = new Set<number>();
+  for (const indices of positions.values()) {
+    for (const i of indices.slice(0, top)) keep.add(i);
+    // Guarded: `slice(-0)` is `slice(0)`, i.e. the whole board.
+    if (bottom > 0) for (const i of indices.slice(-bottom)) keep.add(i);
   }
 
-  return kept;
+  return ranked.filter((row, i) => isMajor(row) || keep.has(i));
 }
 
 /** Signature of {@link getFundingSnapshot}; the seam tests substitute. */
