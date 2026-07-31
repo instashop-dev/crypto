@@ -505,6 +505,12 @@ main {
   padding-left: 0.75rem;
 }
 
+/* The funding panel is a plain <section>, so its hint has no `.panel-body` to
+   inherit padding from; every other hint on the page sits inside one. */
+.panel > .hint {
+  margin: 0.9rem 1.1rem 1.1rem;
+}
+
 .form-error {
   margin: 0.75rem 0 0;
   font-size: 0.8125rem;

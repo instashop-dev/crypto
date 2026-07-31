@@ -1,0 +1,123 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "list": [
+      {
+        "symbol": "BTCUSDT",
+        "lastPrice": "60250.10",
+        "indexPrice": "60248.31",
+        "markPrice": "60251.40",
+        "prevPrice24h": "59120.00",
+        "price24hPcnt": "0.019115",
+        "highPrice24h": "60800.00",
+        "lowPrice24h": "58990.50",
+        "openInterest": "51234.812",
+        "openInterestValue": "3086938000.00",
+        "turnover24h": "4820193822.11",
+        "volume24h": "80112.443",
+        "fundingRate": "0.0001",
+        "nextFundingTime": "1672387200000",
+        "bid1Price": "60250.00",
+        "bid1Size": "12.331",
+        "ask1Price": "60250.20",
+        "ask1Size": "8.902"
+      },
+      {
+        "symbol": "ETHUSDT",
+        "lastPrice": "3060.55",
+        "indexPrice": "3060.11",
+        "markPrice": "3060.90",
+        "openInterest": "410221.55",
+        "turnover24h": "2011933822.10",
+        "volume24h": "660112.11",
+        "fundingRate": "0.00025",
+        "nextFundingTime": "1672387200000",
+        "bid1Price": "3060.50",
+        "ask1Price": "3060.60"
+      },
+      {
+        "symbol": "SOLUSDT",
+        "lastPrice": "140.22",
+        "markPrice": "140.25",
+        "fundingRate": "-0.001034",
+        "nextFundingTime": "1672387200000",
+        "bid1Price": "140.21",
+        "ask1Price": "140.23"
+      },
+      {
+        "symbol": "BNBUSDT",
+        "lastPrice": "585.10",
+        "markPrice": "585.30",
+        "fundingRate": "0.00005",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "XRPUSDT",
+        "lastPrice": "0.6122",
+        "markPrice": "0.6123",
+        "fundingRate": "0.000075",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "ADAUSDT",
+        "lastPrice": "0.4411",
+        "markPrice": "0.4412",
+        "fundingRate": "-0.00002",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "LTCUSDT",
+        "lastPrice": "82.44",
+        "markPrice": "82.46",
+        "fundingRate": "0.0001",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "TRXUSDT",
+        "lastPrice": "0.1211",
+        "markPrice": "0.1212",
+        "fundingRate": "0.0002",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "AVAXUSDT",
+        "lastPrice": "27.11",
+        "markPrice": "27.13",
+        "fundingRate": "0.00012",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "LINKUSDT",
+        "lastPrice": "14.02",
+        "markPrice": "14.03",
+        "fundingRate": "0.00008",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "DOGEUSDT",
+        "lastPrice": "0.1044",
+        "markPrice": "0.1045",
+        "fundingRate": "",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "1000PEPEUSDT",
+        "lastPrice": "0.008122",
+        "markPrice": "0.008123",
+        "fundingRate": "0.0004",
+        "nextFundingTime": "1672387200000"
+      },
+      {
+        "symbol": "WIFUSDT",
+        "lastPrice": "2.4411",
+        "markPrice": "2.4415",
+        "fundingRate": "0.0009",
+        "nextFundingTime": "1672387200000"
+      }
+    ]
+  },
+  "retExtInfo": {},
+  "time": 1672376496048
+}

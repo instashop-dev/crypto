@@ -37,6 +37,19 @@ export {
   type VenueBook,
 } from "./crossExchange";
 export {
+  annualizedPct,
+  DEFAULT_FUNDING_INTERVAL_MINUTES,
+  feeDragAnnualPct,
+  FUNDING_ROUND_TRIP_LEGS,
+  MINUTES_PER_YEAR,
+  netAnnualPct,
+  periodsPerYear,
+  rankFundingOpportunities,
+  roundTripFeeFraction,
+  type FundingInput,
+  type FundingOpportunity,
+} from "./funding";
+export {
   computeChainTax,
   computeTradeTax,
   disposalValues,

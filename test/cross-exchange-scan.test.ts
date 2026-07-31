@@ -38,6 +38,7 @@ import {
   replacePairs,
   updateSettings,
 } from "../src/db";
+import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { runScan } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
@@ -46,9 +47,34 @@ beforeAll(() => {
   fetchMock.disableNetConnect();
 });
 
+/**
+ * A minimal funding board, so the funding poll every scan now performs stays
+ * off the network. Nothing here asserts on it; see test/funding-scan.test.ts.
+ */
+const serveFundingBoard: FundingFetcher = async (assets) => ({
+  venue: "bybit",
+  ts: Date.now(),
+  quotes: new Map(
+    assets.map((symbol) => [
+      symbol,
+      {
+        venue: "bybit" as const,
+        symbol,
+        instrument: `${symbol}USDT`,
+        rate: 0.0001,
+        intervalMinutes: 480,
+        intervalSource: "api" as const,
+        nextFundingTs: null,
+        markPrice: null,
+      },
+    ]),
+  ),
+});
+
 afterEach(() => {
   setWsCollector(null);
   setRestFetcher(null);
+  setFundingFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -154,6 +180,7 @@ async function tradeRows(): Promise<
 beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
+  setFundingFetcher(serveFundingBoard);
 });
 
 describe("runScan - both strategies", () => {

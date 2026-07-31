@@ -38,6 +38,8 @@ export interface Settings {
   tax_rate: number;
   xchg_min_profit_pct: number;
   xchg_enabled: number;
+  funding_min_annual_pct: number;
+  funding_hold_days: number;
 }
 
 export type SettingKey = keyof Settings;
@@ -57,6 +59,8 @@ export const SETTING_KEYS: readonly SettingKey[] = [
   "tax_rate",
   "xchg_min_profit_pct",
   "xchg_enabled",
+  "funding_min_annual_pct",
+  "funding_hold_days",
 ] as const;
 
 /**
@@ -155,6 +159,81 @@ export async function setRawSetting(
 
 export async function deleteRawSetting(db: D1Database, key: string): Promise<void> {
   await db.prepare("DELETE FROM settings WHERE key = ?1").bind(key).run();
+}
+
+/**
+ * Key of the cached perp funding-interval map.
+ *
+ * Lives in `settings` for exactly the reason {@link SCAN_LOCK_KEY} does: it is
+ * one mutable blob with no relational content, no history worth keeping and no
+ * query beyond "give me the whole thing". A table for it would be four columns
+ * of ceremony around a single row. {@link getSettings} already ignores unknown
+ * keys, so a JSON value here can never leak into a numeric tunable.
+ */
+export const FUNDING_INTERVALS_KEY = "funding_intervals";
+
+/** The cached map plus the moment it was written, for TTL comparison. */
+export interface FundingIntervalCache {
+  ts: number;
+  /** Venue instrument (`BTCUSDT`) to settlement cadence in minutes. */
+  intervals: Record<string, number>;
+}
+
+/**
+ * Read the funding-interval cache.
+ *
+ * Returns `null` for a missing row, a corrupt JSON value, a wrong-shaped
+ * object *or* a read that threw. Every one of those means the same thing to the
+ * caller — "no cadences known" — and the scanner's answer to it is to tag its
+ * rows `interval_source = 'assumed'` and carry on. A cache is never worth
+ * failing a poll over.
+ */
+export async function getFundingIntervals(
+  db: D1Database,
+): Promise<FundingIntervalCache | null> {
+  let raw: string | null = null;
+  try {
+    raw = await getRawSetting(db, FUNDING_INTERVALS_KEY);
+  } catch {
+    return null;
+  }
+  if (raw === null) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<FundingIntervalCache> | null;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (!Number.isFinite(parsed.ts)) return null;
+    const intervals = parsed.intervals;
+    if (!intervals || typeof intervals !== "object" || Array.isArray(intervals)) {
+      return null;
+    }
+
+    // Re-validated on the way out, not trusted because it is ours: this row is
+    // hand-editable, and a string where a number belongs would otherwise reach
+    // the annualisation math.
+    const clean: Record<string, number> = {};
+    for (const [instrument, minutes] of Object.entries(intervals)) {
+      if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
+        clean[instrument] = minutes;
+      }
+    }
+    return { ts: parsed.ts as number, intervals: clean };
+  } catch {
+    return null;
+  }
+}
+
+/** Write the funding-interval cache. Failures are swallowed, as above. */
+export async function setFundingIntervals(
+  db: D1Database,
+  intervals: Record<string, number>,
+  ts: number = Date.now(),
+): Promise<void> {
+  try {
+    await setRawSetting(db, FUNDING_INTERVALS_KEY, JSON.stringify({ ts, intervals }));
+  } catch {
+    /* the next poll re-fetches; a cold cache only costs one request */
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,11 +880,188 @@ export async function commitTrade(
 }
 
 // ---------------------------------------------------------------------------
+// Funding rates
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a funding row is kept: 7 days.
+ *
+ * Unlike trades and opportunities — which are the permanent record of what the
+ * paper portfolio did — funding rows are a *sampled time series*, written every
+ * 5 minutes whether anything changed or not. A week is enough to see a rate
+ * regime shift (funding turns over on the scale of days) and bounds the table
+ * at ~22k rows for an 11-asset universe, which keeps the free-tier D1 read
+ * budget uneventful. Pruning is amortised into the insert batch rather than run
+ * as a separate job: there is no scheduler here that could own it, and a
+ * retention pass that only runs when rows are added can never fall behind.
+ */
+export const FUNDING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface FundingRateRow {
+  id: number;
+  /** `NULL` for a manual refresh — that poll belongs to no scan. */
+  scan_id: number | null;
+  ts: number;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  rate: number;
+  interval_minutes: number;
+  interval_source: string;
+  annualized_pct: number;
+  net_annual_pct: number;
+  next_funding_ts: number | null;
+  mark_price: number | null;
+}
+
+/** The shape the API hands out: camel-cased, nulls preserved. */
+export interface FundingRate {
+  id: number;
+  scanId: number | null;
+  ts: number;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  rate: number;
+  intervalMinutes: number;
+  intervalSource: string;
+  annualizedPct: number;
+  netAnnualPct: number;
+  nextFundingTs: number | null;
+  markPrice: number | null;
+}
+
+export function toFundingRate(row: FundingRateRow): FundingRate {
+  return {
+    id: row.id,
+    scanId: row.scan_id ?? null,
+    ts: row.ts,
+    venue: row.venue,
+    symbol: row.symbol,
+    instrument: row.instrument,
+    rate: row.rate,
+    intervalMinutes: row.interval_minutes,
+    intervalSource: row.interval_source,
+    annualizedPct: row.annualized_pct,
+    netAnnualPct: row.net_annual_pct,
+    nextFundingTs: row.next_funding_ts ?? null,
+    markPrice: row.mark_price ?? null,
+  };
+}
+
+/** What the scanner hands us, narrowed to just what is persisted. */
+export interface FundingRateInput {
+  venue: string;
+  symbol: string;
+  instrument: string;
+  rate: number;
+  intervalMinutes: number;
+  intervalSource: string;
+  annualizedPct: number;
+  netAnnualPct: number;
+  nextFundingTs: number | null;
+  markPrice: number | null;
+}
+
+/**
+ * Persist one poll's board and prune everything older than the retention
+ * window, in a single `batch()`.
+ *
+ * One batch, not two calls, for the same reason {@link commitTrade} is one: the
+ * batch is an implicit transaction, so a reader can never observe a moment in
+ * which the new board has landed but the old rows have not been pruned — or,
+ * worse, in which the prune ran and the insert then failed, leaving a gap. The
+ * `DELETE` is relative to *this poll's* `ts` rather than to `Date.now()` so a
+ * back-dated poll (a test, a replay) prunes against its own clock.
+ */
+export async function insertFundingRates(
+  db: D1Database,
+  scanId: number | null,
+  rows: FundingRateInput[],
+  ts: number = Date.now(),
+): Promise<number> {
+  if (rows.length === 0) return 0;
+
+  const statements: D1PreparedStatement[] = rows.map((r) =>
+    db
+      .prepare(
+        "INSERT INTO funding_rates (scan_id, ts, venue, symbol, instrument, rate," +
+          " interval_minutes, interval_source, annualized_pct, net_annual_pct," +
+          " next_funding_ts, mark_price)" +
+          " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+      )
+      .bind(
+        scanId,
+        ts,
+        r.venue,
+        r.symbol,
+        r.instrument,
+        r.rate,
+        r.intervalMinutes,
+        r.intervalSource,
+        r.annualizedPct,
+        r.netAnnualPct,
+        r.nextFundingTs,
+        r.markPrice,
+      ),
+  );
+
+  statements.push(
+    db.prepare("DELETE FROM funding_rates WHERE ts < ?1").bind(ts - FUNDING_RETENTION_MS),
+  );
+
+  await db.batch(statements);
+  return rows.length;
+}
+
+/** Timestamp of the newest funding row; `null` when the table is empty. */
+export async function getLatestFundingTs(db: D1Database): Promise<number | null> {
+  const row = await db
+    .prepare("SELECT MAX(ts) AS ts FROM funding_rates")
+    .first<{ ts: number | null }>();
+  return row?.ts ?? null;
+}
+
+/**
+ * The newest complete board, best net carry first.
+ *
+ * Selected by `ts = (SELECT MAX(ts) …)` rather than by `ORDER BY ts DESC LIMIT
+ * n`: one poll writes one timestamp for all of its rows, so this returns
+ * exactly one board and never a mixture of two — which is what a `LIMIT` would
+ * silently produce if the universe size ever changed between polls.
+ */
+export async function listLatestFundingRates(db: D1Database): Promise<FundingRate[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM funding_rates WHERE ts = (SELECT MAX(ts) FROM funding_rates)" +
+        " ORDER BY net_annual_pct DESC, symbol ASC",
+    )
+    .all<FundingRateRow>();
+  return (results ?? []).map(toFundingRate);
+}
+
+/** One symbol's history, newest first. An unknown symbol is simply empty. */
+export async function listFundingRatesForSymbol(
+  db: D1Database,
+  symbol: string,
+  limit: number,
+): Promise<FundingRate[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM funding_rates WHERE symbol = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
+    )
+    .bind(symbol, limit)
+    .all<FundingRateRow>();
+  return (results ?? []).map(toFundingRate);
+}
+
+// ---------------------------------------------------------------------------
 // Reset
 // ---------------------------------------------------------------------------
 
 export interface ResetOptions {
-  /** Also drop trades, opportunities and scans. Defaults to `true` at the API. */
+  /** Also drop trades, opportunities, scans and funding rows. Defaults to
+   *  `true` at the API. */
   wipeHistory: boolean;
 }
 
@@ -837,6 +1093,10 @@ export async function resetAll(
       db.prepare("DELETE FROM trades"),
       db.prepare("DELETE FROM opportunities"),
       db.prepare("DELETE FROM scans"),
+      // Funding rows reference `scan_id`, so leaving them behind would strand
+      // them against scans that no longer exist. The interval cache is *not*
+      // dropped: it is a property of the exchanges, not of this portfolio.
+      db.prepare("DELETE FROM funding_rates"),
     );
   }
 

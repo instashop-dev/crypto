@@ -25,6 +25,16 @@ export interface BookTickerEntry {
 /** Which upstream produced a snapshot. Persisted per scan for diagnostics. */
 export type SnapshotSource = "binance-ws" | "mexc-rest";
 
+/**
+ * Which perpetual-futures venue produced a funding snapshot.
+ *
+ * A separate vocabulary from {@link SnapshotSource} rather than an extension of
+ * it: these are *perp* venues quoting a funding rate, not spot books, and the
+ * two never appear in the same column. Merging them would let a `funding_rates`
+ * row claim it came from a spot WebSocket.
+ */
+export type FundingVenue = "bybit" | "okx";
+
 /** A point-in-time view of the order-book tops for a set of symbols. */
 export interface Snapshot {
   source: SnapshotSource;

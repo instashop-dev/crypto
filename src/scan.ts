@@ -7,6 +7,9 @@ import { discoverPairs, getDualSnapshot, getSnapshot, type DualSnapshot } from "
 import {
   ASSET_UNIVERSE,
   BASE_ASSET,
+  FUNDING_INTERVAL_CACHE_TTL_MS,
+  FUNDING_POLL_INTERVAL_MS,
+  perpAssets,
   STRATEGY_CROSS_EXCHANGE,
   STRATEGY_TRIANGULAR,
 } from "./config";
@@ -15,22 +18,28 @@ import {
   ensureSeeded,
   finalizeScan,
   getBalance,
+  getFundingIntervals,
+  getLatestFundingTs,
   getPairs,
   getRawSetting,
   getSettings,
+  insertFundingRates,
   insertOpportunities,
   insertScan,
   replacePairs,
   SCAN_LOCK_KEY,
+  setFundingIntervals,
   setRawSetting,
   deleteRawSetting,
   toTaxPolicy,
+  type FundingRateInput,
   type OpportunityInput,
   type PairRow,
 } from "./db";
 import {
   computeTradeTax,
   quoteTax,
+  rankFundingOpportunities,
   rankOpportunities,
   rankSpreads,
   simulateExecution,
@@ -39,7 +48,12 @@ import {
   spreadTax,
   type VenueBook,
 } from "./engine";
-import type { Env, PairInfo, SnapshotSource } from "./types";
+import {
+  fetchBybitIntervals,
+  getFundingFetcher,
+  type FundingFetcher,
+} from "./funding";
+import type { Env, FundingVenue, PairInfo, SnapshotSource } from "./types";
 
 /** How many ranked cycles are kept per scan. */
 export const OPPORTUNITIES_PER_SCAN = 10;
@@ -96,6 +110,15 @@ export interface ScanResult {
   xchgTradeId?: number;
   /** Why cross-exchange produced nothing. Never sets {@link error}. */
   xchgError?: string;
+  /** Which perp venue answered this scan's funding poll; `null` if none did. */
+  fundingVenue: FundingVenue | null;
+  /** Funding rows persisted this scan; `0` when the poll was skipped. */
+  fundingCount: number;
+  bestFundingNetAnnualPct: number | null;
+  /** Why the funding poll produced nothing. Never sets {@link error}. */
+  fundingError?: string;
+  /** Set when the poll gate declined: the board is younger than the interval. */
+  fundingSkipped?: boolean;
 }
 
 /** Injection seams. Production passes nothing; tests override the clock. */
@@ -104,6 +127,17 @@ export interface ScanDeps {
   discover?: (universe: string[], env: Env) => Promise<PairInfo[]>;
   /** Dual-venue snapshot seam; defaults to the real two-source fetch. */
   getSnapshots?: (symbols: string[], env: Env) => Promise<DualSnapshot>;
+  /** Funding-board seam; defaults to the module-level fetcher in `./funding`. */
+  fetchFunding?: FundingFetcher;
+  /** Funding-interval seam; defaults to the real Bybit instruments-info call. */
+  fetchFundingIntervals?: (
+    assets: string[],
+    env: Env,
+  ) => Promise<Record<string, number>>;
+  /** Override the funding poll gate. Tests use it to force a second poll. */
+  fundingPollIntervalMs?: number;
+  /** Override the funding-interval cache TTL. */
+  fundingIntervalTtlMs?: number;
 }
 
 function errorMessage(err: unknown): string {
@@ -152,6 +186,102 @@ async function acquireLock(db: D1Database, now: number): Promise<boolean> {
 }
 
 /**
+ * Load the funding-interval cache, refreshing it from Bybit when stale.
+ *
+ * Every failure mode — cold cache, corrupt JSON, unreachable venue, refused
+ * write — degrades to "use whatever we have, possibly nothing", which the
+ * pricing layer turns into `interval_source = 'assumed'`. A cadence lookup must
+ * never be able to fail a poll: an assumed 8 hours is wrong at worst by a
+ * factor, a missing board is wrong by everything.
+ */
+async function loadFundingIntervals(
+  env: Env,
+  assets: string[],
+  now: number,
+  deps: ScanDeps,
+): Promise<Record<string, number>> {
+  const cached = await getFundingIntervals(env.DB);
+  const ttl = deps.fundingIntervalTtlMs ?? FUNDING_INTERVAL_CACHE_TTL_MS;
+  if (cached && now - cached.ts < ttl) return cached.intervals;
+
+  try {
+    const fresh = await (deps.fetchFundingIntervals ?? fetchBybitIntervals)(assets, env);
+    // An empty answer is not worth caching: it would pin `assumed` in place for
+    // a whole day over what is most likely a transient upstream hiccup.
+    if (Object.keys(fresh).length > 0) {
+      await setFundingIntervals(env.DB, fresh, now);
+      return fresh;
+    }
+  } catch {
+    /* stale or absent cadences only cost interval_source='assumed' */
+  }
+
+  return cached?.intervals ?? {};
+}
+
+/** What one funding poll produced. */
+export interface FundingPollResult {
+  venue: FundingVenue;
+  ts: number;
+  count: number;
+  bestNetAnnualPct: number | null;
+}
+
+/**
+ * Poll the funding board once and persist it. **Unconditional** — the caller
+ * owns the "is it time yet" decision (see the gate in {@link runScan} and the
+ * deliberate absence of one on `POST /api/funding/refresh`).
+ *
+ * Throws when no venue answered, so the scan can record it in `fundingError`
+ * and the route can answer 502. Every priced row is stored, including negative
+ * ones and ones below `funding_min_annual_pct`: the threshold is a display
+ * judgement made at read time, and a carry position is held for days, so the
+ * series is the product.
+ */
+export async function pollFundingRates(
+  env: Env,
+  scanId: number | null,
+  deps: ScanDeps = {},
+  now: number = Date.now(),
+): Promise<FundingPollResult> {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const assets = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
+
+  const intervals = await loadFundingIntervals(env, assets, now, deps);
+  const snapshot = await (deps.fetchFunding ?? getFundingFetcher())(assets, env, {
+    intervals,
+  });
+
+  const ranked = rankFundingOpportunities(
+    snapshot.quotes.values(),
+    settings.fee_rate,
+    settings.funding_hold_days,
+  );
+
+  const rows: FundingRateInput[] = ranked.map((r) => ({
+    venue: r.quote.venue,
+    symbol: r.symbol,
+    instrument: r.quote.instrument,
+    rate: r.quote.rate,
+    intervalMinutes: r.quote.intervalMinutes,
+    intervalSource: r.quote.intervalSource,
+    annualizedPct: r.annualizedPct,
+    netAnnualPct: r.netAnnualPct,
+    nextFundingTs: r.quote.nextFundingTs,
+    markPrice: r.quote.markPrice,
+  }));
+  await insertFundingRates(db, scanId, rows, snapshot.ts);
+
+  return {
+    venue: snapshot.venue,
+    ts: snapshot.ts,
+    count: rows.length,
+    bestNetAnnualPct: ranked.length > 0 ? ranked[0].netAnnualPct : null,
+  };
+}
+
+/**
  * One full scan: snapshot -> rank -> persist -> (maybe) one simulated trade.
  *
  * Never throws. Any failure is caught, recorded on the scan row and returned in
@@ -184,6 +314,9 @@ export async function runScan(
       spreadsCount: 0,
       bestSpreadNetPct: null,
       xchgExecuted: false,
+      fundingVenue: null,
+      fundingCount: 0,
+      bestFundingNetAnnualPct: null,
     };
   }
 
@@ -202,6 +335,11 @@ export async function runScan(
   let xchgExecuted = false;
   let xchgTradeId: number | undefined;
   let xchgError: string | null = null;
+  let fundingVenue: FundingVenue | null = null;
+  let fundingCount = 0;
+  let bestFundingNetAnnualPct: number | null = null;
+  let fundingError: string | null = null;
+  let fundingSkipped = false;
 
   try {
     const settings = await getSettings(db);
@@ -430,14 +568,45 @@ export async function runScan(
     }
   } catch (err) {
     error = errorMessage(err);
-  } finally {
-    // Best-effort cleanup: a failed unlock must not mask the scan's own error,
-    // and the TTL is the backstop if it does fail.
-    try {
-      await deleteRawSetting(db, SCAN_LOCK_KEY);
-    } catch {
-      /* lock expires on its own via SCAN_LOCK_TTL_MS */
+  }
+
+  // -- funding rates --------------------------------------------------------
+  //
+  // Last, still inside the lock, and in a `catch` of its own — the same
+  // contract the cross-exchange block has, one level stricter. It sits *outside*
+  // the arbitrage try/catch rather than at the end of it because funding needs
+  // no pairs and no spot book: a scan that failed for want of market data can
+  // still report a perfectly good funding board, and there is no reason to lose
+  // it. Nothing here can ever reach `scans.error`; the funding tables are not
+  // even referenced by the `scans` row.
+  try {
+    const pollMs = deps.fundingPollIntervalMs ?? FUNDING_POLL_INTERVAL_MS;
+    const lastTs = await getLatestFundingTs(db);
+    // Funding settles every 8 hours, so a minutely scan has nothing to learn by
+    // asking every minute. `lastTs === null` forces the first poll: a cold
+    // database must fill the board immediately rather than wait out an interval
+    // it has no baseline for.
+    if (lastTs !== null && startedAt - lastTs < pollMs) {
+      fundingSkipped = true;
+    } else {
+      const poll = await pollFundingRates(env, scanId, deps, startedAt);
+      fundingVenue = poll.venue;
+      fundingCount = poll.count;
+      bestFundingNetAnnualPct = poll.bestNetAnnualPct;
     }
+  } catch (err) {
+    fundingError = errorMessage(err);
+    // Logged rather than persisted: `scans` has no column for it by design, and
+    // an operator watching `wrangler tail` should still see a dead perp venue.
+    console.warn(`funding poll failed: ${fundingError}`);
+  }
+
+  // Best-effort cleanup: a failed unlock must not mask the scan's own error,
+  // and the TTL is the backstop if it does fail.
+  try {
+    await deleteRawSetting(db, SCAN_LOCK_KEY);
+  } catch {
+    /* lock expires on its own via SCAN_LOCK_TTL_MS */
   }
 
   const durationMs = now() - startedAt;
@@ -473,5 +642,10 @@ export async function runScan(
     xchgExecuted,
     ...(xchgTradeId != null ? { xchgTradeId } : {}),
     ...(xchgError != null ? { xchgError } : {}),
+    fundingVenue,
+    fundingCount,
+    bestFundingNetAnnualPct,
+    ...(fundingError != null ? { fundingError } : {}),
+    ...(fundingSkipped ? { fundingSkipped } : {}),
   };
 }
