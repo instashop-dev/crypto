@@ -32,6 +32,7 @@
 
       <div class="status" aria-live="polite">
         <span class="badge" id="source-badge" data-state="idle">no scans yet</span>
+        <span class="badge" id="india-badge" data-state="warn" hidden>India mode</span>
         <span class="status-age" id="scan-age">&mdash;</span>
       </div>
 
@@ -69,6 +70,31 @@
             <span class="stat-label">Trades</span>
             <span class="stat-value num" id="stat-trades">&mdash;</span>
             <span class="stat-unit" id="stat-trades-unit">booked</span>
+          </div>
+        </div>
+
+        <!-- Shown only while india_mode is on: `Equity` above is the cash view
+             (TDS already gone), these four are the post-tax view. -->
+        <div class="stats" id="tax-stats" hidden>
+          <div class="stat">
+            <span class="stat-label">Net P&amp;L (post-tax)</span>
+            <span class="stat-value num" id="stat-tax-net">&mdash;</span>
+            <span class="stat-unit">USDT, after 30%</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">TDS withheld</span>
+            <span class="stat-value num" id="stat-tax-tds">&mdash;</span>
+            <span class="stat-unit">USDT, creditable</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Tax due</span>
+            <span class="stat-value num" id="stat-tax-due">&mdash;</span>
+            <span class="stat-unit">USDT, liability</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Net equity</span>
+            <span class="stat-value num" id="stat-tax-equity">&mdash;</span>
+            <span class="stat-unit">equity + TDS &minus; tax</span>
           </div>
         </div>
 
@@ -128,6 +154,53 @@
               />
               <span class="field-hint">Taker fee per leg (0.001 = 0.1%).</span>
             </label>
+
+            <label class="field field-check">
+              <span class="field-label">india_mode</span>
+              <span class="check-row">
+                <input
+                  type="checkbox"
+                  class="input-check"
+                  id="set-india-mode"
+                  data-setting="india_mode"
+                />
+                <span class="field-hint">Report Indian VDA tax on every fill.</span>
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">tds_rate</span>
+              <input
+                type="number"
+                step="0.001"
+                min="0"
+                max="0.05"
+                class="input num"
+                id="set-tds-rate"
+                data-setting="tds_rate"
+                autocomplete="off"
+              />
+              <span class="field-hint">
+                Section 194S withholding per leg (0.01 = 1%).
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">tax_rate</span>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                max="0.5"
+                class="input num"
+                id="set-tax-rate"
+                data-setting="tax_rate"
+                autocomplete="off"
+              />
+              <span class="field-hint">
+                Section 115BBH rate on gains (0.3 = 30%; 0.312 adds cess).
+              </span>
+            </label>
           </div>
 
           <p class="hint">
@@ -135,6 +208,13 @@
             scan fills its best cycle even when the edge is negative.
             <code>initial_usdt</code> is immutable — it is the denominator of every P&amp;L
             figure.
+          </p>
+
+          <p class="hint">
+            <strong>India mode.</strong> Every leg of a cycle disposes of a VDA — USDT
+            included — so all three attract TDS. Three legs × 1% TDS ≈ 3% of notional per
+            cycle vs ~0.3% in fees, which is why a profitable cycle can still drain the
+            balance. “Net P&amp;L” credits TDS back as a prepayment; “Equity” does not.
           </p>
           <p class="form-error" id="settings-error" role="alert" hidden></p>
         </div>
@@ -182,6 +262,9 @@
                 <th scope="col" class="right">Start &rarr; End</th>
                 <th scope="col" class="right">Profit</th>
                 <th scope="col" class="right">Profit %</th>
+                <!-- Revealed by app.js only while india_mode is on. -->
+                <th scope="col" class="right" id="th-trades-tds" hidden>TDS</th>
+                <th scope="col" class="right" id="th-trades-net" hidden>Net</th>
               </tr>
             </thead>
             <tbody id="trades-body">

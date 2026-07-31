@@ -21,3 +21,17 @@ export {
   type ExecutedTrade,
   type TriangleQuote,
 } from "./profit";
+export {
+  computeChainTax,
+  computeTradeTax,
+  disposalValues,
+  NO_TAX,
+  priceChain,
+  quoteTax,
+  taxOnProfit,
+  type ChainHop,
+  type DisposalLeg,
+  type QuoteTax,
+  type TaxBreakdown,
+  type TaxPolicy,
+} from "./tax";

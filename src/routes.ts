@@ -24,6 +24,7 @@ import {
   getBalances,
   getPairs,
   getSettings,
+  getTaxTotals,
   listOpportunities,
   listOpportunitiesForScan,
   listScans,
@@ -33,6 +34,7 @@ import {
   updateSettings,
   type Settings,
 } from "./db";
+import { round8 } from "./engine";
 import { runScan } from "./scan";
 import type { Env } from "./types";
 
@@ -58,12 +60,27 @@ const LIMITS = {
 /** Settings an operator may change at runtime. `initial_usdt` is not one of
  *  them: it is the denominator of every P&L figure ever reported, so moving it
  *  would silently rewrite history rather than change behaviour. */
-const MUTABLE_SETTINGS = ["min_profit_pct", "trade_size_usdt", "fee_rate"] as const;
+const MUTABLE_SETTINGS = [
+  "min_profit_pct",
+  "trade_size_usdt",
+  "fee_rate",
+  "india_mode",
+  "tds_rate",
+  "tax_rate",
+] as const;
 type MutableSetting = (typeof MUTABLE_SETTINGS)[number];
 
 /** Sanity ceiling on the fee rate: 1% per leg is already an absurd taker fee,
  *  and a fat-fingered 0.1 (10%) would make every cycle unprofitable forever. */
 const MAX_FEE_RATE = 0.01;
+
+/** Ceiling on the 194S withholding. The statutory rate is 1%; 5% leaves room
+ *  for a stress test without letting a typo withhold the whole notional. */
+const MAX_TDS_RATE = 0.05;
+
+/** Ceiling on the 115BBH rate. The statutory rate is 30% (31.2% with cess);
+ *  50% is generous headroom and still short of confiscating every gain. */
+const MAX_TAX_RATE = 0.5;
 
 export interface HealthSource {
   name: "binance-ws" | "mexc-rest";
@@ -150,11 +167,40 @@ async function readJsonBody(c: {
   }
 }
 
+/**
+ * The India-mode view of the same portfolio.
+ *
+ * Three of these are the same two numbers under different names, deliberately:
+ * `tdsWithheldUsdt` / `tdsReceivableUsdt` and `taxDueUsdt` / `taxLiabilityUsdt`
+ * are the cash-flow name and the balance-sheet name for one figure each. The
+ * dashboard shows them in different places and conflating them is exactly the
+ * mistake this feature exists to prevent.
+ */
+export interface PortfolioTax {
+  indiaMode: boolean;
+  tdsRate: number;
+  taxRate: number;
+  grossProfitUsdt: number;
+  tdsWithheldUsdt: number;
+  taxDueUsdt: number;
+  /** Σ(gross − tax): the economic result, ignoring when the cash moves. */
+  netProfitUsdt: number;
+  /** Cash already withheld and creditable against the year's bill. */
+  tdsReceivableUsdt: number;
+  /** Tax assessed but not yet paid. */
+  taxLiabilityUsdt: number;
+  /** `equity + receivable − liability` — equity once the tax year settles. */
+  netEquityUsdt: number;
+  trades: number;
+  profitableTrades: number;
+}
+
 export interface Portfolio {
   balances: Array<{ asset: string; amount: number }>;
   equityUsdt: number;
   pnl: { absUsdt: number; pct: number };
   initialUsdt: number;
+  tax: PortfolioTax;
 }
 
 /**
@@ -164,9 +210,17 @@ export interface Portfolio {
  * USDT, so no other asset is ever held between scans; marking non-USDT dust to
  * market would mean pricing assets we cannot have, using a snapshot we would
  * have to fetch, on the app's most-polled route.
+ *
+ * `equityUsdt` and `pnl` keep their pre-Phase-8 meaning exactly: the cash in
+ * the account, TDS already gone. The `tax` block is strictly additive, so a
+ * client that ignores it sees the same portfolio it always did.
  */
 async function buildPortfolio(db: D1Database): Promise<Portfolio> {
-  const [balances, settings] = await Promise.all([getBalances(db), getSettings(db)]);
+  const [balances, settings, totals] = await Promise.all([
+    getBalances(db),
+    getSettings(db),
+    getTaxTotals(db),
+  ]);
   const equityUsdt = balances.find((b) => b.asset === BASE_ASSET)?.amount ?? 0;
   const initialUsdt = settings.initial_usdt;
   const absUsdt = equityUsdt - initialUsdt;
@@ -180,6 +234,20 @@ async function buildPortfolio(db: D1Database): Promise<Portfolio> {
       pct: initialUsdt > 0 ? (absUsdt / initialUsdt) * 100 : 0,
     },
     initialUsdt,
+    tax: {
+      indiaMode: settings.india_mode !== 0,
+      tdsRate: settings.tds_rate,
+      taxRate: settings.tax_rate,
+      grossProfitUsdt: totals.grossProfit,
+      tdsWithheldUsdt: totals.tdsWithheld,
+      taxDueUsdt: totals.taxDue,
+      netProfitUsdt: totals.netProfit,
+      tdsReceivableUsdt: totals.tdsWithheld,
+      taxLiabilityUsdt: totals.taxDue,
+      netEquityUsdt: round8(equityUsdt + totals.tdsWithheld - totals.taxDue),
+      trades: totals.trades,
+      profitableTrades: totals.profitableTrades,
+    },
   };
 }
 
@@ -212,6 +280,17 @@ export function validateSettingsPatch(
     }
     if (key === "fee_rate" && (value < 0 || value > MAX_FEE_RATE)) {
       return { ok: false, error: `fee_rate must be between 0 and ${MAX_FEE_RATE}` };
+    }
+    // A flag, not a rate: `1.5` or `2` almost certainly means the caller thinks
+    // this field means something else, so it is rejected rather than coerced.
+    if (key === "india_mode" && value !== 0 && value !== 1) {
+      return { ok: false, error: "india_mode must be 0 or 1" };
+    }
+    if (key === "tds_rate" && (value < 0 || value > MAX_TDS_RATE)) {
+      return { ok: false, error: `tds_rate must be between 0 and ${MAX_TDS_RATE}` };
+    }
+    if (key === "tax_rate" && (value < 0 || value > MAX_TAX_RATE)) {
+      return { ok: false, error: `tax_rate must be between 0 and ${MAX_TAX_RATE}` };
     }
     patch[key as MutableSetting] = value;
   }

@@ -41,6 +41,22 @@ export const DEFAULTS = {
   trade_size_usdt: 100,
   /** Starting paper balance, in USDT. */
   initial_usdt: 10000,
+  /**
+   * India-mode toggle, `0` off / `1` on. Numeric rather than boolean because
+   * the whole settings table is "TEXT parsed as a finite number" — a lone
+   * boolean would need its own parse path and its own failure mode.
+   *
+   * Off by default: it is a reporting overlay for one jurisdiction, and turning
+   * it on must be a deliberate act, not something a fresh deployment inherits.
+   */
+  india_mode: 0,
+  /** Section 194S withholding per VDA transfer, as a fraction (0.01 = 1%). */
+  tds_rate: 0.01,
+  /**
+   * Section 115BBH rate on gains, as a fraction (0.3 = 30%). Set `0.312` to
+   * include the 4% health-and-education cess.
+   */
+  tax_rate: 0.3,
 } as const;
 
 export type Defaults = typeof DEFAULTS;

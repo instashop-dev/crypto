@@ -51,15 +51,29 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/opportunities?limit=50` | Ranked cycles per scan, with per-leg detail |
 | `GET /api/trades?limit=50` | Simulated fills |
 | `GET /api/scans?limit=20` | Scan log (trigger, source, duration, errors) |
-| `GET/PUT /api/settings` | `min_profit_pct` (negative = demo mode: forces fills), `trade_size_usdt`, `fee_rate` |
+| `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
+
+### Settings
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `min_profit_pct` | `0.05` | any | Net % a cycle must beat to fill. **Negative = demo mode**: every scan fills its best cycle. |
+| `trade_size_usdt` | `100` | `> 0` | Notional simulated per cycle. |
+| `fee_rate` | `0.001` | `0`–`0.01` | Taker fee per leg. |
+| `india_mode` | `0` | `0` or `1` | Report Indian VDA tax on every fill (see below). |
+| `tds_rate` | `0.01` | `0`–`0.05` | Section 194S withholding per VDA transfer. |
+| `tax_rate` | `0.3` | `0`–`0.5` | Section 115BBH rate on gains. Use `0.312` to include the 4% cess. |
+
+`initial_usdt` is immutable — it is the denominator of every P&L figure ever
+reported, so moving it would rewrite history rather than change behaviour.
 
 ## Development
 
 ```bash
 npm install
-npm test                                        # 110 tests: pure engine math +
+npm test                                        # 155 tests: pure engine math +
                                                 # workerd integration (in-memory D1,
                                                 # mocked network)
 npx wrangler d1 migrations apply crypto-arb --local
@@ -81,6 +95,63 @@ With real fees (0.1%/leg → ~0.3006% break-even) genuine triangular edges on a
 1-minute scan are rare — expect the bot to observe, rank, and decline. That is
 the correct behavior, not a bug. Set `min_profit_pct` negative to watch the
 execution pipeline fire on demand.
+
+### India mode
+
+Set `india_mode: 1` to overlay the Indian virtual-digital-asset tax regime on
+every fill. Two levies, and they behave nothing alike:
+
+- **Section 194S — 1% TDS**, withheld by the exchange on the *consideration* of
+  every VDA transfer. Cash leaves immediately, but it is a **prepayment**
+  creditable against the year's bill.
+- **Section 115BBH — 30% on gains** (31.2% with cess), with **no loss set-off**
+  and no deduction except cost of acquisition. Charged per trade on
+  `max(profit, 0)`; a losing cycle does not shelter a winning one.
+
+**Every leg is a disposal.** `BUY`/`SELL` here is an exchange-listing artefact —
+`USDT → BTC` is only a "BUY" because the market is spelled `BTCUSDT`. What 194S
+cares about is that a VDA changed hands, and **USDT is itself a VDA** under
+Indian law. So all three legs of a triangle attract TDS, and the tax base is
+~3× the notional rather than 1×.
+
+Two P&L views, both reported:
+
+| View | Formula | Where |
+|---|---|---|
+| **Economic** | `netProfit = profit − taxDue` | "Net P&L (post-tax)", `netEquityUsdt` |
+| **Cash** | balance moves by `profit − tdsWithheld` | "Equity", `pnl` |
+
+Subtracting both would double-count — TDS *is* a prepayment of the tax, not a
+second charge.
+
+Worked example, on the repo's own +1.694305898% fixture (100 USDT, 0.1%/leg,
+`USDT>BTC>ETH>USDT`, TDS 1%, tax 30%):
+
+```
+legs      100 USDT -> 0.001665 BTC -> 0.0332667 ETH -> 101.694305898 USDT
+gross     +1.694305898
+disposals 100.000000 + 99.883350 + 101.796102  =  301.679452  (3.02x notional)
+TDS       1% of 301.679452                     =    3.01679452
+tax due   30% of 1.694305898                   =    0.50829177
+net P&L   1.694305898 - 0.50829177             =    1.18601413   (economic)
+cash      1.694305898 - 3.01679452             =   -1.32248862   (NEGATIVE)
+```
+
+**The conclusion is blunt: three legs × 1% TDS ≈ 3% of notional per cycle, an
+order of magnitude above the ~0.3% fee break-even and far beyond any real
+triangular edge.** A cycle needs a net return above ~3.02% just to break even on
+cash flow. Nothing in this repo's live scans has ever come close. Round-tripping
+capital through a jurisdiction that withholds on turnover rather than on gains
+is structurally incompatible with high-frequency arbitrage — that is the
+finding, not a limitation of the model.
+
+Modelling simplifications (all documented in `src/engine/tax.ts`): no INR FX;
+TDS is not compounded into the chain, so `endAmount` and `profitPct` stay
+byte-identical with the mode on or off; the 194S de-minimis thresholds are
+ignored (a minutely scanner clears them within the hour); cess is not
+hard-coded (set `tax_rate: 0.312`); and 115BBH allows only cost of acquisition
+as a deduction anyway, which for an atomic cycle is exactly the start notional.
+**None of this is tax advice.**
 
 ## Simplifications (MVP)
 

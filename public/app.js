@@ -148,6 +148,30 @@
     }, TOAST_MS);
   }
 
+  // -- india mode -----------------------------------------------------------
+
+  /**
+   * Whether the last portfolio poll reported india mode on.
+   *
+   * Held at module scope because three unrelated renderers key off it — the
+   * tax stat row, the header badge and the trades table's column count — and
+   * they do not all run from the same response. `/api/portfolio` is the single
+   * source of truth: the settings panel can be mid-edit, the server's answer
+   * cannot.
+   */
+  let indiaMode = false;
+
+  /** Columns in the trades table: 5 normally, 7 with the TDS and Net columns. */
+  const TRADES_COLS = () => (indiaMode ? 7 : 5);
+
+  function setIndiaMode(on) {
+    indiaMode = Boolean(on);
+    $("tax-stats").hidden = !indiaMode;
+    $("india-badge").hidden = !indiaMode;
+    $("th-trades-tds").hidden = !indiaMode;
+    $("th-trades-net").hidden = !indiaMode;
+  }
+
   // -- rendering: portfolio -------------------------------------------------
 
   function renderPortfolio(p) {
@@ -171,10 +195,36 @@
 
     $("portfolio-note").textContent = "initial " + fmtNum(p.initialUsdt, 2) + " USDT";
     $("portfolio-note").classList.remove("bad");
+
+    const tax = p.tax || {};
+    setIndiaMode(tax.indiaMode);
+    if (indiaMode) {
+      // Net P&L and net equity are signed against the initial balance; the two
+      // tax figures are magnitudes, so they stay neutral rather than pretending
+      // that "more withheld" is a gain.
+      const net = tax.netProfitUsdt;
+      const netEl = $("stat-tax-net");
+      netEl.textContent = fmtSigned(net, 4);
+      netEl.className = "stat-value num " + signClass(net);
+
+      $("stat-tax-tds").textContent = fmtNum(tax.tdsWithheldUsdt, 4);
+      $("stat-tax-tds").className = "stat-value num flat";
+      $("stat-tax-due").textContent = fmtNum(tax.taxDueUsdt, 4);
+      $("stat-tax-due").className = "stat-value num flat";
+
+      const equityDelta = isNum(tax.netEquityUsdt) && isNum(p.initialUsdt)
+        ? tax.netEquityUsdt - p.initialUsdt
+        : NaN;
+      const eqEl = $("stat-tax-equity");
+      eqEl.textContent = fmtNum(tax.netEquityUsdt, 2);
+      eqEl.className = "stat-value num " + signClass(equityDelta);
+    }
   }
 
+  const TAX_STAT_IDS = ["stat-tax-net", "stat-tax-tds", "stat-tax-due", "stat-tax-equity"];
+
   function portfolioUnavailable(reason) {
-    for (const id of ["stat-equity", "stat-pnl-abs", "stat-pnl-pct"]) {
+    for (const id of ["stat-equity", "stat-pnl-abs", "stat-pnl-pct", ...TAX_STAT_IDS]) {
       const el = $(id);
       el.textContent = "—";
       el.className = "stat-value num flat";
@@ -318,7 +368,7 @@
   function renderTrades(list) {
     const body = $("trades-body");
     if (list.length === 0) {
-      placeholder(body, 5, "No trades booked yet.");
+      placeholder(body, TRADES_COLS(), "No trades booked yet.");
       return;
     }
     const now = Date.now();
@@ -352,6 +402,20 @@
           '">' +
           fmtPct(t.profitPct) +
           "</td>" +
+          (indiaMode
+            ? // TDS is always a debit, so it is rendered negative even though
+              // the stored figure is a magnitude.
+              '<td class="right num ' +
+              (isNum(t.tdsWithheld) && t.tdsWithheld > 0 ? "down" : "flat") +
+              '">' +
+              (isNum(t.tdsWithheld) ? fmtSigned(-t.tdsWithheld, 4) : "—") +
+              "</td>" +
+              '<td class="right num ' +
+              signClass(t.netProfit) +
+              '">' +
+              fmtSigned(t.netProfit, 4) +
+              "</td>"
+            : "") +
           "</tr>",
       )
       .join("");
@@ -440,6 +504,9 @@
     min_profit_pct: "set-min-profit",
     trade_size_usdt: "set-trade-size",
     fee_rate: "set-fee-rate",
+    india_mode: "set-india-mode",
+    tds_rate: "set-tds-rate",
+    tax_rate: "set-tax-rate",
   };
 
   function applySettings(s) {
@@ -447,10 +514,22 @@
       const input = $(id);
       // Never stomp on a field the operator is mid-edit.
       if (document.activeElement === input) continue;
-      input.value = isNum(s[key]) ? String(s[key]) : "";
+      // `india_mode` is a 0/1 number on the wire and a checkbox in the DOM;
+      // everything else is a plain number in both.
+      if (input.type === "checkbox") {
+        input.checked = isNum(s[key]) ? s[key] !== 0 : false;
+      } else {
+        input.value = isNum(s[key]) ? String(s[key]) : "";
+      }
     }
     $("settings-summary").textContent =
-      "min " + s.min_profit_pct + "% · size " + s.trade_size_usdt + " USDT · fee " + s.fee_rate;
+      "min " +
+      s.min_profit_pct +
+      "% · size " +
+      s.trade_size_usdt +
+      " USDT · fee " +
+      s.fee_rate +
+      (s.india_mode ? " · india " + s.tds_rate + "/" + s.tax_rate : "");
     settingsError("");
   }
 
@@ -471,8 +550,11 @@
 
   async function saveSetting(input) {
     const key = input.dataset.setting;
-    const value = Number(input.value);
-    if (input.value.trim() === "" || !Number.isFinite(value)) {
+    // A checkbox has no meaningful `.value`; the API wants the 0/1 the settings
+    // table stores, so the translation happens here rather than server-side.
+    const isCheck = input.type === "checkbox";
+    const value = isCheck ? (input.checked ? 1 : 0) : Number(input.value);
+    if (!isCheck && (input.value.trim() === "" || !Number.isFinite(value))) {
       settingsError(key + " must be a finite number");
       return;
     }
@@ -487,6 +569,9 @@
       input.disabled = false;
       applySettings(updated);
       toast("Saved " + key + " = " + value, "ok");
+      // Toggling the mode changes what the portfolio panel and the trades table
+      // are supposed to show, and that state only arrives with a fresh poll.
+      if (key === "india_mode") refresh();
     } catch (err) {
       input.disabled = false;
       settingsError(err.message);
@@ -512,6 +597,14 @@
         toast("Scan failed: " + r.error, "error");
       } else {
         const best = isNum(r.bestNetPct) ? fmtPct(r.bestNetPct) : "n/a";
+        // Present only when india mode is on, and only for a fill.
+        const tax = r.tax
+          ? " · net after tax " +
+            fmtSigned(r.tax.netProfit, 4) +
+            " (TDS " +
+            fmtNum(r.tax.tdsWithheld, 4) +
+            ")"
+          : "";
         toast(
           "Scan " +
             (r.source || "unknown") +
@@ -520,6 +613,7 @@
             " triangles · best " +
             best +
             (r.executed ? " · trade executed" : "") +
+            tax +
             " · " +
             r.durationMs +
             "ms",
@@ -592,7 +686,12 @@
         $("stat-trades-unit").textContent =
           list.length >= TRADES_LIMIT ? "booked (newest " + TRADES_LIMIT + ")" : "booked";
       } else {
-        placeholder($("trades-body"), 5, "unavailable — " + trades.reason.message, false);
+        placeholder(
+          $("trades-body"),
+          TRADES_COLS(),
+          "unavailable — " + trades.reason.message,
+          false,
+        );
         $("stat-trades").textContent = "—";
       }
 
