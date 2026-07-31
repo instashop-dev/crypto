@@ -478,7 +478,13 @@
                 <th scope="col" class="right">Held</th>
                 <th scope="col" class="right">Realised</th>
                 <th scope="col" class="right">Predicted %</th>
-                <th scope="col" class="right">Realised %</th>
+                <th
+                  scope="col"
+                  class="right"
+                  title="Annualised over the ACTUAL hold, so a short hold scales hard: a 3-day result is multiplied by ~122. It says what happened over those days, scaled — not what a year would pay."
+                >
+                  Realised %
+                </th>
                 <th scope="col" class="right">Error</th>
               </tr>
             </thead>
@@ -508,6 +514,14 @@
           times&rdquo; extrapolation error &mdash; measured here rather than asserted.
           Basis and mark-to-market are not modelled at all, so a realised figure is the
           <em>funding</em> result, not the trade&rsquo;s.
+        </p>
+        <p class="hint">
+          <strong>Realised % annualises a short hold aggressively.</strong> It scales the
+          days actually held up to a year &mdash; a position closed after three days is
+          multiplied by about 122, so a few cents of funding either way becomes a
+          double-digit percentage. Read it against &ldquo;Held&rdquo; and against
+          &ldquo;Realised&rdquo; in USDT, which is the figure that does not move when the
+          hold is short.
         </p>
       </section>
 

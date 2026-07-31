@@ -34,6 +34,21 @@
  *   is missing data, and inventing a payment for it is the one error that would
  *   flatter the realised figure without leaving a trace. `accrualCount` is
  *   stored so the hole is visible.
+ * - **The settlement cadence is snapshotted at entry, like the fee rates.** A
+ *   position accrues on the `interval_minutes` its entry row carried, for the
+ *   whole hold. Venues do change a contract's cadence — 8h to 4h to 1h is a
+ *   routine listing-desk decision on a volatile perp — and when one does
+ *   mid-hold, this keeps accruing on the *stale* grid: at a shortened cadence
+ *   it books fewer settlements than really paid, at a lengthened one it books
+ *   boundaries the venue no longer settles on (each priced by whatever row
+ *   preceded it, so the error is a count error, not a rate error). The
+ *   alternative — re-reading the cadence every pass — makes a position's grid
+ *   move under it and re-dates every settlement it already booked, which is
+ *   worse: nothing opens on a guessed interval in the first place
+ *   (`interval_source = 'api'` only), and a real cadence change is rare enough
+ *   to be worth a wrong count on one position rather than a moving grid on all
+ *   of them. `entry_annualized_pct` was computed from the same snapshot, so at
+ *   least the prediction and the accrual disagree with reality identically.
  * - **Funding is not compounded.** It accumulates in USDT beside the position
  *   and never grows the notional, matching `./funding.ts`'s simple returns.
  * - **The short leg's sign convention is the venue's**: a positive rate means
@@ -89,11 +104,13 @@ export type CarryCloseReason =
  * `nowTs`, oldest first.
  *
  * **Where the boundaries fall.** Funding settles on the venue's own schedule,
- * not on the scanner's, so the grid is anchored to `anchorTs` — the
- * `next_funding_ts` the venue published on the rate row — and steps backwards
- * and forwards from it in whole intervals. When the venue publishes no such
- * timestamp the grid is anchored to the **epoch** instead, i.e. to whole
- * multiples of the interval since 1970-01-01T00:00Z. For the 8-hour cadence
+ * not on the scanner's, so the grid is anchored to `anchorTs` — a point known
+ * to be on the venue's schedule, in practice the `next_funding_ts` it published
+ * or a boundary this position already accrued on (the caller in `src/scan.ts`
+ * picks, and prefers the latter because it cannot change under a running
+ * position) — and steps backwards and forwards from it in whole intervals. When
+ * there is no such timestamp the grid is anchored to the **epoch** instead, i.e.
+ * to whole multiples of the interval since 1970-01-01T00:00Z. For the 8-hour cadence
  * almost every contract uses, epoch multiples land on 00:00 / 08:00 / 16:00 UTC,
  * which is exactly where the venues settle — so the fallback is usually the same
  * grid, and where it is not it is at least a *fixed* one. Anchoring to the

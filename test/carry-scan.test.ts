@@ -430,6 +430,54 @@ describe("runScan - accrual", () => {
     expect(btc.lastAccrualTs).toBe(T0 + HOUR_MS);
   });
 
+  it("keeps one grid when the venue's published anchor flickers", async () => {
+    // Regression. The anchor used to be re-read from the newest rate row on
+    // every pass, so a venue that publishes `nextFundingTime`, omits it on the
+    // next poll and then publishes a *shifted* one moved the grid's phase under
+    // a running position — and a boundary the last pass stopped at is no longer
+    // on the grid the next pass computes, so a settlement gets paid twice (or
+    // dropped). The position's own `last_accrual_ts` is the anchor once it has
+    // one, so the grid it has been accruing on is the grid it keeps.
+    await updateSettings(env.DB, { funding_max_positions: 1 });
+
+    // A venue settling an hour off the epoch grid: T0+1h, T0+9h, T0+17h. It
+    // quotes the next boundary on that grid each poll, as a real venue does.
+    const PHASE = T0 + HOUR_MS;
+    const published = (shift = 0): FundingFetcher => {
+      const base = PHASE + shift;
+      return board({
+        nextFundingTs:
+          base + Math.floor((clock - base) / PERIOD_MS + 1) * PERIOD_MS,
+      });
+    };
+
+    // Entry, with the anchor published.
+    await runScan(env, "manual", deps(published()));
+
+    // Still published: the first boundary, T0+1h, is accrued and becomes the
+    // position's anchor.
+    clock = T0 + 2 * HOUR_MS;
+    await runScan(env, "manual", deps(published()));
+
+    // The venue stops publishing. On the old anchor this fell back to the epoch
+    // grid and paid T0+8h — an hour early, and off the position's own schedule.
+    clock = T0 + 9 * HOUR_MS + 30 * 60_000;
+    await runScan(env, "manual", deps(board()));
+
+    // Published again, and 20 minutes later than before. On the old anchor this
+    // grid no longer passed through what the last pass had booked, so it paid
+    // *two* boundaries and the settlement around T0+9h was collected twice.
+    clock = T0 + 17 * HOUR_MS + 30 * 60_000;
+    await runScan(env, "manual", deps(published(20 * 60_000)));
+
+    const [btc] = await openPositions();
+    // Three settlements elapsed on the venue's schedule — T0+1h, T0+9h, T0+17h
+    // — and each was paid exactly once.
+    expect(btc.accrualCount).toBe(3);
+    expect(btc.accruedFundingUsdt).toBeCloseTo(3 * PER_SETTLEMENT, 8);
+    expect(btc.lastAccrualTs).toBe(T0 + 17 * HOUR_MS);
+  });
+
   it("accrues each position independently", async () => {
     await updateSettings(env.DB, { funding_max_positions: 2 });
     await runScan(env, "manual", deps(board()));

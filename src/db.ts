@@ -183,6 +183,26 @@ export async function deleteRawSetting(db: D1Database, key: string): Promise<voi
  */
 export const FUNDING_INTERVALS_KEY = "funding_intervals";
 
+/**
+ * Key of the scan's own funding-poll marker: the clock of the last funding poll
+ * **the scan performed**, as a decimal string.
+ *
+ * A settings row for the same reason {@link SCAN_LOCK_KEY} is one — a single
+ * mutable scalar with no history worth keeping — and it exists because the
+ * obvious alternative is wrong. The gate used to read `MAX(ts)` from
+ * `funding_rates`, but `POST /api/funding/refresh` writes that table too, so a
+ * refresh hit more often than `FUNDING_POLL_INTERVAL_MS` moved the gate forward
+ * for ever and the scheduled poll never came due again — and with it the carry
+ * pass, which only runs behind a scan's own poll, starved indefinitely. A
+ * marker only the scan writes cannot be pushed around by an unauthenticated
+ * POST: refresh goes on writing boards, and the scan's cadence is its own.
+ *
+ * Written **after** a poll succeeds, so a poll that threw part-way (a board
+ * chunk that failed, a venue outage) is retried by the next scan rather than
+ * waiting out an interval it never completed.
+ */
+export const FUNDING_POLL_TS_KEY = "funding_last_poll_ts";
+
 /** The cached map plus the moment it was written, for TTL comparison. */
 export interface FundingIntervalCache {
   ts: number;
@@ -869,19 +889,21 @@ export const FUNDING_INSERT_CHUNK = 50;
  * newest `ts`, never a mixture of two polls, since every row of a poll shares
  * one timestamp.
  *
- * **A chunk that fails part-way leaves that truncated board in place for a full
- * poll interval, not for the length of the write.** The chunks that already
- * landed carry the new `ts`, so `getLatestFundingTs` returns it, and the poll
- * gate in `runScan` then declines to poll again for the whole
- * `FUNDING_POLL_INTERVAL_MS` (5 minutes) — during which `/api/funding` serves
- * the truncated board as if it were complete, and the venues whose rows were in
- * the lost chunks look like venues that quoted nothing. The throw does reach
- * `ScanResult.fundingError`, so the failure is visible in the scan toast and in
- * `wrangler tail`; the board itself carries no mark of being short.
+ * **A chunk that fails part-way leaves that truncated board in place until the
+ * next scan.** The chunks that already landed carry the new `ts`, so
+ * `/api/funding` serves the truncated board as if it were complete and the
+ * venues whose rows were in the lost chunks look like venues that quoted
+ * nothing. The throw does reach `ScanResult.fundingError`, so the failure is
+ * visible in the scan toast and in `wrangler tail`; the board itself carries no
+ * mark of being short.
+ *
+ * The window is one scan rather than one poll interval because the gate reads
+ * {@link FUNDING_POLL_TS_KEY}, which is written only *after* a poll returns: a
+ * poll that threw here never advanced it, so the next scan polls again
+ * immediately instead of waiting out `FUNDING_POLL_INTERVAL_MS`.
  *
  * That is the accepted cost of the alternative — exceeding D1's statement limit
- * and writing no board at all — but it is a five-minute stale-and-wrong window,
- * not a sub-second cosmetic one.
+ * and writing no board at all.
  */
 export async function insertFundingRates(
   db: D1Database,
@@ -931,14 +953,6 @@ export async function insertFundingRates(
     await db.batch(chunk);
   }
   return rows.length;
-}
-
-/** Timestamp of the newest funding row; `null` when the table is empty. */
-export async function getLatestFundingTs(db: D1Database): Promise<number | null> {
-  const row = await db
-    .prepare("SELECT MAX(ts) AS ts FROM funding_rates")
-    .first<{ ts: number | null }>();
-  return row?.ts ?? null;
 }
 
 /**
@@ -1237,6 +1251,11 @@ export async function getFundingPosition(
  *
  * `WHERE status = 'open'` so a position closed by the manual route between the
  * read and this write is not silently resurrected with new figures.
+ *
+ * Returns whether the row was actually updated, exactly as
+ * {@link closeFundingPosition} does. A no-op means the position was closed
+ * underneath this pass, and the caller must not report the funding it computed
+ * in memory: that USDT is held by no row anywhere.
  */
 export async function accrueFundingPosition(
   db: D1Database,
@@ -1244,14 +1263,15 @@ export async function accrueFundingPosition(
   accruedFundingUsdt: number,
   accrualCount: number,
   lastAccrualTs: number,
-): Promise<void> {
-  await db
+): Promise<boolean> {
+  const result = await db
     .prepare(
       "UPDATE funding_positions SET accrued_funding_usdt = ?2, accrual_count = ?3," +
         " last_accrual_ts = ?4 WHERE id = ?1 AND status = ?5",
     )
     .bind(id, accruedFundingUsdt, accrualCount, lastAccrualTs, CARRY_STATUS_OPEN)
     .run();
+  return (result.meta?.changes ?? 0) > 0;
 }
 
 /** The four figures a close writes. */
@@ -1406,6 +1426,10 @@ export async function resetAll(
       // them against scans that no longer exist. The interval cache is *not*
       // dropped: it is a property of the exchanges, not of this portfolio.
       db.prepare("DELETE FROM funding_rates"),
+      // …and so does the scan's poll marker: with the board gone, the next
+      // scan must refill it immediately rather than sit out the rest of an
+      // interval measured against rows that no longer exist.
+      db.prepare("DELETE FROM settings WHERE key = ?1").bind(FUNDING_POLL_TS_KEY),
       // Carry positions go with the rates they were opened on and accrued
       // from: keeping a position whose whole rate history has just been
       // deleted would leave it unable to accrue, unable to price a close, and

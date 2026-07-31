@@ -121,7 +121,7 @@ table are simply never read — no migration, destructive or otherwise.
 
 ```bash
 npm install
-npm test                                        # 382 tests: pure engine math +
+npm test                                        # 385 tests: pure engine math +
                                                 # workerd integration (in-memory D1,
                                                 # mocked network)
 npx wrangler d1 migrations apply crypto-arb --local
@@ -391,19 +391,27 @@ the board (a live Gate capture had `LA_USDT` at roughly -1548%/yr) was
 systematically the one row that could never be persisted.
 
 **Cadence and retention.** The board is polled at most every 5 minutes, gated on
-`MAX(ts)` in `funding_rates` — funding settles every 8 hours, so a minutely scan
-has nothing to learn by asking every minute. Rows are kept for **7 days**, and
+the scan's own `funding_last_poll_ts` settings row — funding settles every 8
+hours, so a minutely scan has nothing to learn by asking every minute. The gate
+is deliberately *not* `MAX(ts)` in `funding_rates`, which it used to be:
+`POST /api/funding/refresh` writes that table too, so a refresh hit more often
+than the interval kept the gate satisfied for ever and the scheduled poll — and
+with it the carry pass, which only runs behind a scan's own poll — never came
+due again. Only the scan writes the marker, and only after a poll has returned.
+Rows are kept for **7 days**, and
 the prune rides in the last `batch()` of the insert, after every row has landed.
 Inserts are chunked at 50 statements per batch (D1 caps statements per batch, and
 a four-venue board is ~144 rows), so a board is no longer written as one
 transaction: a reader polling mid-write can see a *partial* board — never a
 mixture of two polls, since every row of a poll shares one timestamp. A chunk
 that *fails* part-way is worse than that: the chunks already written carry the
-new `ts`, so the 5-minute poll gate declines to retry and `/api/funding` serves
-the truncated board for the rest of the interval. The scan reports the failure
-in `fundingError`; the board does not.
-`POST /api/funding/refresh` bypasses the gate and writes rows with
-`scan_id = NULL`.
+new `ts`, so `/api/funding` serves the truncated board until the next poll
+replaces it. That is the *next scan*, not the end of the interval — the marker
+is only written once a poll returns, so a poll that threw is retried
+immediately. The scan reports the failure in `fundingError`; the board does not.
+`POST /api/funding/refresh` bypasses the gate entirely, writes rows with
+`scan_id = NULL`, and does not touch the marker: it can refresh the board as
+often as you like without moving the scanner's cadence or the carry book.
 
 **Positions are held on paper since Phase 15** — see the section below. They are
 recorded in `funding_positions` (migration `0005`) and **never** booked against
@@ -464,10 +472,16 @@ and each step is that way round for a reason:
 1. **Accrue.** For every open position, every settlement boundary in
    `(last_accrual_ts, now]` is priced by the newest `funding_rates` row for its
    `(venue, symbol)` at or before that boundary and no more than 24h older. The
-   grid is anchored to the venue's published `next_funding_ts` when there is one
-   and to whole multiples of the interval since the epoch when there is not —
-   never to the position's own entry time, which would give every position a
-   private schedule. **A boundary with no observation is skipped, not
+   grid is anchored to the position's own `last_accrual_ts` once it has one, and
+   before that to the venue's published `next_funding_ts`, falling back to whole
+   multiples of the interval since the epoch. The position's own boundary comes
+   first because the anchor is re-read every pass: a venue that publishes
+   `nextFundingTime` on one poll and omits it on the next would otherwise shift
+   the grid's *phase* under a running position and double-count or drop a
+   settlement. It is never anchored to the position's *entry* time, which would
+   give every position a private schedule. The settlement interval is likewise
+   snapshotted at entry, so a mid-hold cadence change accrues on a stale grid
+   (documented in `src/engine/carry.ts`). **A boundary with no observation is skipped, not
    estimated**, and `last_accrual_ts` advances past it: an unobserved settlement
    is missing data, and inventing a payment for it is the one error that would
    flatter the result without leaving a trace. `accrual_count` is stored so the

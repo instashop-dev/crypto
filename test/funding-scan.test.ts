@@ -24,6 +24,7 @@ import {
   ensureSeeded,
   FUNDING_INSERT_CHUNK,
   FUNDING_INTERVALS_KEY,
+  FUNDING_POLL_TS_KEY,
   getFundingIntervals,
   getRawSetting,
   insertFundingRates,
@@ -36,8 +37,9 @@ import {
   updateSettings,
 } from "../src/db";
 import { setFundingFetcher } from "../src/funding";
+import { app } from "../src/index";
 import { runScan } from "../src/scan";
-import type { BookTickerEntry, FundingVenue } from "../src/types";
+import type { BookTickerEntry, Env, FundingVenue } from "../src/types";
 import type { FundingFetcher, VenueOutcome } from "../src/funding";
 import { fundingQuote, snapshotOf } from "./funding-stub";
 
@@ -315,6 +317,67 @@ describe("runScan - the poll gate", () => {
       fundingPollIntervalMs: DAY_MS,
     });
     expect(result.fundingCount).toBe(11);
+  });
+
+  it("is gated on the scan's own marker, not on whatever wrote funding_rates", async () => {
+    const first = await runScan(env, "manual", { now, fetchFunding: board() });
+    expect(first.fundingCount).toBe(11);
+    // The marker is the scan's clock, and it is the *only* thing the gate reads.
+    await expect(getRawSetting(env.DB, FUNDING_POLL_TS_KEY)).resolves.toBe(
+      String(clock),
+    );
+
+    // Two refreshes inside the interval, each writing a board at a newer `ts`
+    // than the scan's own poll. This is what starved the old `MAX(ts)` gate:
+    // `POST /api/funding/refresh` advanced it, so on a deployment where refresh
+    // is hit more often than every 5 minutes the scheduled poll — and the carry
+    // pass that only runs behind it — never came due again.
+    setFundingFetcher(board());
+    for (let i = 0; i < 2; i++) {
+      const refreshed = await app.request(
+        "/api/funding/refresh",
+        { method: "POST" },
+        env as unknown as Env,
+      );
+      expect(refreshed.status).toBe(200);
+    }
+    // Refresh wrote rows and left the marker exactly where the scan put it.
+    await expect(getRawSetting(env.DB, FUNDING_POLL_TS_KEY)).resolves.toBe(
+      String(clock),
+    );
+
+    clock += POLL_MS;
+    let calls = 0;
+    const counting: FundingFetcher = async (...args) => {
+      calls++;
+      return board()(...args);
+    };
+    const scheduled = await runScan(env, "manual", { now, fetchFunding: counting });
+
+    expect(calls).toBe(1);
+    expect(scheduled.fundingSkipped).toBeUndefined();
+    expect(scheduled.fundingCount).toBe(11);
+    await expect(getRawSetting(env.DB, FUNDING_POLL_TS_KEY)).resolves.toBe(
+      String(clock),
+    );
+  });
+
+  it("leaves the marker alone when the poll failed, so the next scan retries", async () => {
+    const dead = await runScan(env, "manual", {
+      now,
+      fetchFunding: async () => {
+        throw new Error("no funding-rate source available");
+      },
+    });
+    expect(dead.fundingError).toContain("no funding-rate source available");
+    await expect(getRawSetting(env.DB, FUNDING_POLL_TS_KEY)).resolves.toBeNull();
+
+    // A minute later — deep inside the 5-minute interval — because a poll that
+    // never returned a board is not a poll the gate should wait out.
+    clock += 60_000;
+    const retry = await runScan(env, "manual", { now, fetchFunding: board() });
+    expect(retry.fundingSkipped).toBeUndefined();
+    expect(retry.fundingCount).toBe(11);
   });
 
   it("honours an overridden poll interval", async () => {
