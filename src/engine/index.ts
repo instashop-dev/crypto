@@ -16,11 +16,13 @@ export { round8 } from "./pricing";
 export {
   crossVenueBook,
   evaluateSpread,
+  parseSpreadLabel,
   rankSpreads,
   spreadHops,
   spreadLabel,
   spreadQuoteTax,
   spreadTax,
+  type ParsedSpreadLabel,
   type RankSpreadsOptions,
   type SpreadMarket,
   type SpreadQuote,
@@ -46,6 +48,7 @@ export {
 export {
   annualizedPct,
   DEFAULT_FUNDING_INTERVAL_MINUTES,
+  evaluateVenueSpread,
   feeDragAnnualPct,
   FUNDING_PERP_LEGS,
   FUNDING_ROUND_TRIP_LEGS,
@@ -54,9 +57,15 @@ export {
   netAnnualPct,
   periodsPerYear,
   rankFundingOpportunities,
+  rankVenueSpreads,
   roundTripFeeFraction,
+  VENUE_SPREAD_PERP_LEGS,
+  venueSpreadDragAnnualPct,
   type FundingInput,
   type FundingOpportunity,
+  type VenueRateQuote,
+  type VenueSpread,
+  type VenueSpreadLeg,
 } from "./funding";
 export {
   computeChainTax,

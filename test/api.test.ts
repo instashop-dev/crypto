@@ -999,6 +999,28 @@ describe("GET /api/opportunities - the qualifies flag", () => {
     expect((await read()).opportunities.every((o) => o.qualifies)).toBe(true);
   });
 
+  it("carries the Phase 16 instrumentation, NULL until it is measured", async () => {
+    serveBothVenues();
+    await send("/api/scan", "POST");
+
+    const body = (await (await get("/api/opportunities")).json()) as {
+      opportunities: Array<{
+        skewMs: number | null;
+        persistNetPct: number | null;
+        persistCheckedTs: number | null;
+      }>;
+    };
+
+    expect(body.opportunities.length).toBeGreaterThan(0);
+    // Both venues answered, so the distance between their books is a number —
+    // possibly 0 on a stubbed pair of instant fetchers, but never absent.
+    expect(body.opportunities.every((o) => typeof o.skewMs === "number")).toBe(true);
+    // Survival is measured by the *next* scan; until then NULL says so, and it
+    // is not the same claim as "re-priced and found to be zero".
+    expect(body.opportunities.every((o) => o.persistNetPct === null)).toBe(true);
+    expect(body.opportunities.every((o) => o.persistCheckedTs === null)).toBe(true);
+  });
+
   it("nothing is ever marked executed, however good the spread looks", async () => {
     serveBothVenues();
     await send("/api/scan", "POST");
@@ -1082,6 +1104,26 @@ interface FundingRateBody {
   qualifies: boolean;
 }
 
+interface FundingSpreadLegBody {
+  venue: string;
+  instrument: string;
+  rate: number;
+  intervalMinutes: number;
+  intervalSource: string;
+  annualizedPct: number;
+}
+
+interface FundingSpreadBody {
+  symbol: string;
+  verifiedPair: boolean;
+  long: FundingSpreadLegBody;
+  short: FundingSpreadLegBody;
+  grossAnnualPct: number;
+  feeDragAnnualPct: number;
+  netAnnualPct: number;
+  qualifies: boolean;
+}
+
 interface FundingBody {
   ts: number | null;
   ageMs: number | null;
@@ -1095,6 +1137,8 @@ interface FundingBody {
   perpFeeRate: number;
   pollIntervalMs: number;
   rates: FundingRateBody[];
+  spreadCount: number;
+  spreads: FundingSpreadBody[];
 }
 
 /** One synthetic funding row at a controlled timestamp. */
@@ -1136,6 +1180,10 @@ describe("GET /api/funding", () => {
     expect(body.ts).toBeNull();
     expect(body.count).toBe(0);
     expect(body.rates).toEqual([]);
+    // The derived section is present and empty on the same terms: a board with
+    // no rows has no differentials, which is not an error either.
+    expect(body.spreadCount).toBe(0);
+    expect(body.spreads).toEqual([]);
     expect(body.venue).toBeNull();
     expect(body.venues).toEqual([]);
     expect(body.stale).toBe(false);
@@ -1261,6 +1309,161 @@ describe("GET /api/funding", () => {
     const body = await funding();
     expect(body.count).toBe(1);
     expect(body.rates[0].netAnnualPct).toBe(9);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-venue funding spreads (Phase 16)
+// ---------------------------------------------------------------------------
+
+/**
+ * A board row whose *rate and cadence* are the point — the spreads section
+ * re-derives the annualisation from those two, so the stored percentages here
+ * only have to be self-consistent.
+ */
+function spreadRow(venue: string, symbol: string, rate: number, intervalMinutes = 480) {
+  const annualizedPct = rate * (525_600 / intervalMinutes) * 100;
+  return {
+    venue,
+    symbol,
+    instrument: `${symbol}-${venue}`,
+    rate,
+    intervalMinutes,
+    intervalSource: "api",
+    annualizedPct,
+    netAnnualPct: annualizedPct - 3.65,
+    nextFundingTs: null,
+    markPrice: null,
+  };
+}
+
+describe("GET /api/funding - cross-venue spreads", () => {
+  /** BTC on two venues, ETH on one, and an unverifiable ticker on two. */
+  async function seedBoard(): Promise<void> {
+    await insertFundingRates(
+      env.DB,
+      null,
+      [
+        spreadRow("okx", "BTC", 0.0002),
+        spreadRow("gate", "BTC", 0.0001),
+        spreadRow("bybit", "ETH", 0.0003),
+        spreadRow("gate", "XYZ", 0.0009),
+        spreadRow("kucoin", "XYZ", 0.0001),
+      ],
+      Date.now(),
+    );
+  }
+
+  it("reports the widest pair per symbol, priced as an all-perp trade", async () => {
+    await seedBoard();
+
+    const body = await funding();
+    expect(body.count).toBe(5);
+    expect(body.spreadCount).toBe(2);
+    // Ranked by net differential, exactly as the board is by net carry.
+    expect(body.spreads.map((s) => s.symbol)).toEqual(["XYZ", "BTC"]);
+
+    const btc = body.spreads.find((s) => s.symbol === "BTC")!;
+    expect(btc.short.venue).toBe("okx");
+    expect(btc.short.annualizedPct).toBe(21.9);
+    expect(btc.short.instrument).toBe("BTC-okx");
+    expect(btc.long.venue).toBe("gate");
+    expect(btc.long.annualizedPct).toBe(10.95);
+    expect(btc.grossAnnualPct).toBe(10.95);
+    // 4 perp legs at 0.05% over a 30-day hold. No spot leg anywhere.
+    expect(btc.feeDragAnnualPct).toBe(2.43333333);
+    expect(btc.netAnnualPct).toBe(8.51666667);
+    expect(btc.qualifies).toBe(true);
+
+    // A symbol only one venue quotes has no second opinion, so no spread.
+    expect(body.spreads.some((s) => s.symbol === "ETH")).toBe(false);
+  });
+
+  it("flags a pair whose symbol is outside the majors", async () => {
+    await seedBoard();
+
+    const body = await funding();
+    const bySymbol = new Map(body.spreads.map((s) => [s.symbol, s]));
+    expect(bySymbol.get("BTC")!.verifiedPair).toBe(true);
+    // Same three letters on two venues can be two different projects, and the
+    // whole differential would then be between unrelated assets.
+    expect(bySymbol.get("XYZ")!.verifiedPair).toBe(false);
+  });
+
+  it("re-prices at read time when the fees or the hold period move", async () => {
+    await seedBoard();
+
+    const before = await funding();
+    const btc = () => before.spreads.find((s) => s.symbol === "BTC")!;
+    expect(btc().feeDragAnnualPct).toBe(2.43333333);
+
+    // Double the perp taker rate: the differential is unchanged and the drag is
+    // not, because the drag is a judgement made when the board is read.
+    await send("/api/settings", "PUT", { perp_fee_rate: 0.001 });
+    const dearer = await funding();
+    const after = dearer.spreads.find((s) => s.symbol === "BTC")!;
+    expect(after.grossAnnualPct).toBe(btc().grossAnnualPct);
+    expect(after.feeDragAnnualPct).toBe(4.86666667);
+    expect(after.netAnnualPct).toBe(6.08333333);
+
+    // A year-long hold amortises the same round trip to almost nothing.
+    await send("/api/settings", "PUT", { funding_hold_days: 365 });
+    const held = (await funding()).spreads.find((s) => s.symbol === "BTC")!;
+    expect(held.feeDragAnnualPct).toBe(0.4);
+  });
+
+  it("judges qualifies against the current threshold, as the board does", async () => {
+    await seedBoard();
+
+    await send("/api/settings", "PUT", { funding_min_annual_pct: 1000 });
+    expect((await funding()).spreads.every((s) => !s.qualifies)).toBe(true);
+
+    await send("/api/settings", "PUT", { funding_min_annual_pct: -1000 });
+    const generous = await funding();
+    expect(generous.spreads.every((s) => s.qualifies)).toBe(true);
+    // ...and the differentials themselves never moved.
+    expect(generous.spreads.find((s) => s.symbol === "BTC")!.netAnnualPct).toBe(
+      8.51666667,
+    );
+  });
+
+  it("annualises each venue on its own cadence before differencing", async () => {
+    await insertFundingRates(
+      env.DB,
+      null,
+      [
+        // Identical per-settlement rates, different clocks: 4h pays twice what
+        // 8h does, and differencing the raw rates would call this pair flat.
+        spreadRow("okx", "BTC", 0.0001, 480),
+        spreadRow("gate", "BTC", 0.0001, 240),
+      ],
+      Date.now(),
+    );
+
+    const [btc] = (await funding()).spreads;
+    expect(btc.short.venue).toBe("gate");
+    expect(btc.short.intervalMinutes).toBe(240);
+    expect(btc.grossAnnualPct).toBe(10.95);
+    expect(btc.netAnnualPct).toBe(8.51666667);
+  });
+
+  it("never joins a multiplier-prefixed contract to its namesake", async () => {
+    await insertFundingRates(
+      env.DB,
+      null,
+      [
+        spreadRow("gate", "1000PEPE", 0.0002),
+        spreadRow("kucoin", "PEPE", 0.0001),
+      ],
+      Date.now(),
+    );
+
+    const body = await funding();
+    expect(body.count).toBe(2);
+    // Two venues, one board, and still no differential: they are two different
+    // contracts, and the rate being scale-invariant does not make them one.
+    expect(body.spreadCount).toBe(0);
+    expect(body.spreads).toEqual([]);
   });
 });
 

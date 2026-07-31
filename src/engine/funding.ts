@@ -39,6 +39,15 @@
  * - **A year is 365 days**, and returns are **simple, not compounded** — funding
  *   is assumed withdrawn, not reinvested. Compounding would raise every figure
  *   below and would be the less conservative choice.
+ *
+ * ## A second strategy lives at the bottom of this file
+ *
+ * The **cross-venue funding spread** (Phase 16): long one venue's perp, short
+ * another venue's perp on the same asset, and collect the *difference* between
+ * the two funding streams. It shares this file because it shares the
+ * annualisation and the fee helpers above — and it must, or the two would drift.
+ * Its own caveats are on {@link rankVenueSpreads}; the boundaries listed above
+ * apply to it unchanged, except that it has no spot leg at all.
  */
 import { round8 } from "./pricing";
 
@@ -263,4 +272,245 @@ export function rankFundingOpportunities<T extends FundingInput>(
   }
 
   return ranked.sort((a, b) => b.netAnnualPct - a.netAnnualPct);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-venue funding spreads
+// ---------------------------------------------------------------------------
+
+/**
+ * Fee-charging legs in one cross-venue spread round trip: **four, all perp**.
+ *
+ * Long one venue's perp and short another's on entry, and close both on exit.
+ * There is no spot leg anywhere in this trade, which is why the drag is
+ * {@link feeDragAnnualPct} called with the *perp* rate in both positions rather
+ * than a formula of its own — see {@link venueSpreadDragAnnualPct}.
+ */
+export const VENUE_SPREAD_PERP_LEGS = FUNDING_SPOT_LEGS + FUNDING_PERP_LEGS;
+
+/**
+ * The all-perp round trip, annualised over `holdingDays`:
+ * `4 x perpFeeRate x (365 / holdingDays) x 100`.
+ *
+ * Deliberately **not** a second formula. It is {@link feeDragAnnualPct} with
+ * `perpFeeRate` substituted for the spot rate, because both of this trade's leg
+ * classes are perps — so a change to how a round trip is amortised lands on the
+ * carry and on the spread at once, and the two can never quietly disagree.
+ *
+ * At the shipped 0.05% perp taker rate: 0.2% of notional, which is 2.43%/yr over
+ * a 30-day hold. That is the bar a venue differential has to clear before it is
+ * worth anything.
+ */
+export function venueSpreadDragAnnualPct(
+  perpFeeRate: number,
+  holdingDays: number,
+): number | null {
+  return feeDragAnnualPct(perpFeeRate, perpFeeRate, holdingDays);
+}
+
+/** The minimum a row needs to take part in a spread. Callers pass richer rows. */
+export interface VenueRateQuote {
+  /** Venue name, e.g. `"okx"`. Compared and echoed; never parsed. */
+  venue: string;
+  /** Canonical asset symbol, e.g. `"BTC"`. See the join rules below. */
+  symbol: string;
+  /** Per-interval funding fraction; positive means the short is paid. */
+  rate: number;
+  intervalMinutes: number;
+}
+
+/** One side of a spread: the caller's row plus its own annualisation. */
+export interface VenueSpreadLeg<T extends VenueRateQuote = VenueRateQuote> {
+  venue: string;
+  rate: number;
+  intervalMinutes: number;
+  /** This venue's rate annualised on **its own** cadence. */
+  annualizedPct: number;
+  /** The input row, untouched — extra columns ride along to the caller. */
+  quote: T;
+}
+
+/** One symbol's differential between two venues, priced as an all-perp trade. */
+export interface VenueSpread<T extends VenueRateQuote = VenueRateQuote> {
+  symbol: string;
+  /** The perp **bought**: the venue paying less (or charging more) to be long. */
+  long: VenueSpreadLeg<T>;
+  /** The perp **sold**: the venue paying the short the most. */
+  short: VenueSpreadLeg<T>;
+  /** `short.annualizedPct - long.annualizedPct`. Never negative. */
+  grossAnnualPct: number;
+  /** {@link venueSpreadDragAnnualPct}; identical for every row on a board. */
+  feeDragAnnualPct: number;
+  /** What the pair keeps: gross less drag. Routinely negative. */
+  netAnnualPct: number;
+  /**
+   * Whether this symbol is one whose identity is known to mean the same asset
+   * on both venues. See {@link rankVenueSpreads} — a ticker outside the checked
+   * set can be two different projects, and the spread would then be fiction.
+   */
+  verifiedPair: boolean;
+}
+
+/** Reused for the common `verifiedSymbols` default; never mutated. */
+const NO_VERIFIED_SYMBOLS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Price one venue pair for one symbol. `null` when the pair cannot be priced.
+ *
+ * **Annualise first, then difference.** Each side is annualised on *its own*
+ * settlement cadence and only then subtracted, because the raw `rate` fields are
+ * per-settlement fractions and two venues do not have to settle on the same
+ * clock: 0.01% every 4 hours is twice the carry of 0.01% every 8, and
+ * differencing the raw numbers would call that pair flat. Getting this backwards
+ * is silent — it produces a plausible small number — which is why it has a test
+ * of its own asserting the wrong-order result is *not* what comes out.
+ *
+ * Rejected, all as `null` rather than as a zero:
+ *
+ * - the two rows are not the **same symbol**, compared as an exact string (see
+ *   {@link rankVenueSpreads} for why nothing cleverer is allowed);
+ * - the two rows are from the same venue (a venue against itself is not a
+ *   spread, and the label would claim a cross-venue trade that is not one);
+ * - either side's rate or interval is unusable ({@link annualizedPct});
+ * - the fee drag is unpriceable.
+ *
+ * The direction is derived, not supplied: the higher-annualised venue is always
+ * the one shorted, so `grossAnnualPct` is `>= 0` by construction. The mirror
+ * trade is the same number negated and is never emitted, exactly as
+ * `rankSpreads` drops the provably-losing direction of a spot spread.
+ */
+export function evaluateVenueSpread<T extends VenueRateQuote>(
+  a: T,
+  b: T,
+  perpFeeRate: number,
+  holdingDays: number,
+  verifiedSymbols: ReadonlySet<string> = NO_VERIFIED_SYMBOLS,
+): VenueSpread<T> | null {
+  if (!a || !b) return null;
+  if (typeof a.symbol !== "string" || a.symbol.length === 0) return null;
+  if (a.symbol !== b.symbol) return null;
+  if (!a.venue || !b.venue || a.venue === b.venue) return null;
+
+  const annualA = annualizedPct(a.rate, a.intervalMinutes);
+  const annualB = annualizedPct(b.rate, b.intervalMinutes);
+  if (annualA === null || annualB === null) return null;
+
+  const drag = venueSpreadDragAnnualPct(perpFeeRate, holdingDays);
+  if (drag === null) return null;
+
+  const aIsShort = annualA >= annualB;
+  const short: VenueSpreadLeg<T> = {
+    venue: aIsShort ? a.venue : b.venue,
+    rate: aIsShort ? a.rate : b.rate,
+    intervalMinutes: aIsShort ? a.intervalMinutes : b.intervalMinutes,
+    annualizedPct: aIsShort ? annualA : annualB,
+    quote: aIsShort ? a : b,
+  };
+  const long: VenueSpreadLeg<T> = {
+    venue: aIsShort ? b.venue : a.venue,
+    rate: aIsShort ? b.rate : a.rate,
+    intervalMinutes: aIsShort ? b.intervalMinutes : a.intervalMinutes,
+    annualizedPct: aIsShort ? annualB : annualA,
+    quote: aIsShort ? b : a,
+  };
+
+  const gross = round8(short.annualizedPct - long.annualizedPct);
+  return {
+    symbol: a.symbol,
+    long,
+    short,
+    grossAnnualPct: gross,
+    feeDragAnnualPct: drag,
+    netAnnualPct: round8(gross - drag),
+    verifiedPair: verifiedSymbols.has(a.symbol),
+  };
+}
+
+/**
+ * The best venue pair for every symbol quoted by two or more venues, best net
+ * differential first.
+ *
+ * **The join is exact string equality on `symbol`, and nothing else.** That is a
+ * rule, not an implementation detail:
+ *
+ * - **Multiplier-prefixed contracts are distinct symbols.** `1000PEPE` and
+ *   `PEPE` are never joined. A funding *rate* is scale-invariant, so the
+ *   arithmetic would survive the join — but the join *identity* would not: a
+ *   venue may list both, they are separate contracts with separate order books
+ *   and separate funding, and pairing them would report a differential between
+ *   two things that are not the same instrument. The prefixes are preserved by
+ *   the venue parsers (`src/funding.ts`) precisely so this comparison can be
+ *   trusted.
+ * - **A shared ticker is not a shared asset.** Outside a checked set, the same
+ *   three letters are routinely two different projects on two different venues.
+ *   Those rows are still emitted — suppressing them would hide the fat tail this
+ *   board exists to show — but carry `verifiedPair: false`, and the dashboard
+ *   marks them. `verifiedSymbols` is the caller's list of identities it has
+ *   actually checked (the shipped one is the 11-asset major set).
+ *
+ * Within a symbol, **the first row per venue wins**: a board carries one row per
+ * `(venue, symbol)` by construction, and where it does not the input order is
+ * the caller's ranking, so first-seen is that venue's best-paying row.
+ *
+ * The pair chosen is `(lowest annualised, highest annualised)`, which is the
+ * maximum differential available on that symbol — every other pair is a subset
+ * of that range. Ties keep input order, so two scans of one board rank
+ * identically.
+ *
+ * Unpriceable rows are dropped rather than zeroed, and a symbol left with fewer
+ * than two venues is skipped: "no second opinion" and "no differential" are
+ * different facts.
+ *
+ * **What this does not model.** The fee drag is the *only* cost here: both legs
+ * are perps, so both need margin, and margin on two venues at once is neither
+ * free nor modelled. Nor is the risk that only one leg gets liquidated, which is
+ * the way this trade actually goes wrong — a delta-neutral pair on paper is two
+ * separate margin accounts in practice.
+ */
+export function rankVenueSpreads<T extends VenueRateQuote>(
+  rows: Iterable<T>,
+  perpFeeRate: number,
+  holdingDays: number,
+  verifiedSymbols: Iterable<string> = [],
+): Array<VenueSpread<T>> {
+  const verified = new Set<string>();
+  for (const symbol of verifiedSymbols) {
+    if (typeof symbol === "string" && symbol.length > 0) verified.add(symbol);
+  }
+
+  // Insertion-ordered, so the output order is a pure function of the input's.
+  const bySymbol = new Map<string, Array<{ row: T; annual: number }>>();
+  for (const row of rows) {
+    if (!row || typeof row.symbol !== "string" || row.symbol.length === 0) continue;
+    if (typeof row.venue !== "string" || row.venue.length === 0) continue;
+
+    const annual = annualizedPct(row.rate, row.intervalMinutes);
+    if (annual === null) continue;
+
+    const group = bySymbol.get(row.symbol);
+    if (!group) {
+      bySymbol.set(row.symbol, [{ row, annual }]);
+      continue;
+    }
+    if (group.some((entry) => entry.row.venue === row.venue)) continue;
+    group.push({ row, annual });
+  }
+
+  const spreads: Array<VenueSpread<T>> = [];
+  for (const group of bySymbol.values()) {
+    if (group.length < 2) continue;
+    // Stable sort, so equal rates keep the board's own order and the two ends
+    // are still two different venues.
+    const sorted = [...group].sort((x, y) => x.annual - y.annual);
+    const spread = evaluateVenueSpread(
+      sorted[0].row,
+      sorted[sorted.length - 1].row,
+      perpFeeRate,
+      holdingDays,
+      verified,
+    );
+    if (spread) spreads.push(spread);
+  }
+
+  return spreads.sort((x, y) => y.netAnnualPct - x.netAnnualPct);
 }

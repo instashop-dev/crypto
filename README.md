@@ -79,10 +79,10 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/health` | Probe both market-data sources from the Worker |
 | `POST /api/scan` | Run a scan now (also runs via cron every minute) |
 | `GET /api/portfolio` | **Historical.** Balances, equity, P&L vs 10,000 USDT initial, frozen where the fill era left them |
-| `GET /api/opportunities?limit=50` | Ranked spreads per scan, with per-leg detail and a `qualifies` flag judged against the current `xchg_min_profit_pct`. `&strategy=cross_exchange\|triangular` filters (the latter reads history only); an unknown value is a 400 |
+| `GET /api/opportunities?limit=50` | Ranked spreads per scan, with per-leg detail, the `skewMs` / `persistNetPct` / `persistCheckedTs` instrumentation, and a `qualifies` flag judged against the current `xchg_min_profit_pct`. `&strategy=cross_exchange\|triangular` filters (the latter reads history only); an unknown value is a 400 |
 | `GET /api/trades?limit=50` | **Historical.** Fills booked before Phase 12. Same `&strategy=` filter |
 | `GET /api/scans?limit=20` | Scan log (trigger, source, duration, errors, spread counts) |
-| `GET /api/funding` | Newest funding board across every venue, best net carry first, with `qualifies` judged against the current threshold. `venues` reports each venue's share; `venue` names the source of the top row |
+| `GET /api/funding` | Newest funding board across every venue, best net carry first, with `qualifies` judged against the current threshold. `venues` reports each venue's share; `venue` names the source of the top row. `spreads` is the same board read as cross-venue differentials, derived at read time |
 | `GET /api/funding/history?symbol=BTC&limit=100` | One symbol's rate series, newest first (limit clamped to 500). `&venue=gate` narrows it to one venue — a symbol now has a row per venue per poll; an unknown venue is a 400 |
 | `POST /api/funding/refresh` | Poll every perp venue now, bypassing the 5-minute gate. 200 with `venueErrors` when some venues fail; 502 only when they all do |
 | `GET /api/funding/positions?limit=50` | The paper carry book: open positions, the newest closed ones, and the realised-vs-predicted summary |
@@ -266,6 +266,47 @@ kept, whatever `xchg_min_profit_pct` says about them.
 A missing second venue is recorded in `scans.xchg_error`, never in `scans.error`:
 a scan whose funding poll landed a full board did not fail because MEXC was slow.
 
+### Skew and survival — is any of this real?
+
+Phase 16. The skew above has been the stated dominant false positive since Phase
+9 and had never been measured. Two columns on `opportunities` now measure it, at
+**zero extra subrequests** — both ride on the snapshot the scan already fetched.
+
+**`skew_ms`** — the distance in time between the two books a row was priced
+from: the end of the Binance WebSocket collection window against the completion
+of the MEXC response, each stamped inside its own branch of the concurrent fetch
+(a `Date.now()` after the join would have made every skew `0` and "proved" the
+books simultaneous). It is a **lower bound**: quotes received early in a ~4s
+window are that much older again.
+
+**`persist_net_pct` / `persist_checked_ts`** — spread survival. Each scan, before
+it writes its own board, re-prices the *previous* scan's rows against the fresh
+snapshot: same market, same direction (parsed back out of the row's label), at
+the current `fee_rate`. What comes out is what that trade was still worth ~1
+minute later.
+
+```
+persist_checked_ts NULL                     not measured yet — the next scan takes it
+persist_checked_ts set, persist_net_pct set re-priced; this is what was left of the edge
+persist_checked_ts set, persist_net_pct NULL expired: no fresh snapshot reached it in time
+```
+
+Rows are re-priced only while younger than 2 minutes, are measured exactly once
+(the write is guarded on `persist_checked_ts IS NULL`), and are never re-priced
+by the scan that wrote them — a zero-second survival horizon is a tautology, not
+a measurement. Rows older than an hour are never selected at all, so the whole
+pre-Phase-16 history keeps the NULL that honestly says "not measured". A failure
+anywhere in the pass lands in `ScanResult.persistError` and costs the
+measurement only; the board it measures is still priced and persisted.
+
+**The decision rule this exists to settle.** A two-leg round trip at 0.1%/leg
+costs `1 - (1 - 0.001)² = 0.2002%` of notional. If the *surviving* nets — not the
+nets at the moment of the skew — never clear that bar, then the cross-exchange
+spread scanner is measuring an artefact and the strategy is **display-only**:
+the rows stay (they are the evidence), and no further effort goes into it. That
+verdict needs a soak, not a scan, which is precisely why the columns exist
+rather than an opinion.
+
 **India mode applies to spreads too**, and they fare slightly better: a spread
 is a **two-disposal** chain (USDT on the buy venue, then the asset on the sell
 venue) against the deleted triangle's three, so ~2% of notional is withheld
@@ -442,6 +483,72 @@ positions table and why `0005` adds one that touches nothing `0004` wrote.
 - **Simple returns, 365-day year.** Funding is assumed withdrawn, not
   reinvested; compounding would raise every figure above.
 
+## Cross-venue funding spreads
+
+Phase 16, and the second thing a multi-venue board is good for. Two venues
+rarely agree about what an asset's funding should be, and that *difference* is
+itself a delta-neutral trade: long the perp on the venue paying least, short the
+perp on the venue paying most, same asset, same size. Price risk cancels between
+the two perps, there is no spot leg at all, and a differential is frequently
+steadier than either rate it is built from — which is the whole appeal, since
+rate persistence is the dominant unknown of the carry above.
+
+Computed **at read time** in `GET /api/funding`, from the rows of one poll, with
+no schema and no write path. Retuning `perp_fee_rate` or `funding_hold_days`
+re-prices every differential on the next read, exactly as `qualifies` is
+re-judged.
+
+```
+annualHigh = rateHigh x (525600 / intervalHigh) x 100     each venue on ITS OWN cadence
+annualLow  = rateLow  x (525600 / intervalLow)  x 100
+gross      = annualHigh - annualLow                       >= 0 by construction
+drag       = 4 x perp_fee_rate x (365 / hold_days) x 100  4 perp legs, no spot leg
+net        = gross - drag
+```
+
+**Annualise first, then subtract.** Differencing the raw per-settlement rates is
+the one way to get this quietly wrong: 0.01% every 4 hours is twice the carry of
+0.01% every 8, and the naive subtraction calls that pair flat when the real
+differential is 10.95%/yr. `test/funding-math.test.ts` asserts the wrong-order
+figure is *not* what comes out.
+
+Worked example — BTC at 0.0002/8h on one venue and 0.0001/8h on another, at the
+0.05% perp taker rate over a 30-day hold:
+
+```
+short venue  0.0002 x 1095 x 100        = 21.90%
+long  venue  0.0001 x 1095 x 100        = 10.95%
+gross                                   = 10.95%
+drag         4 x 0.0005 x (365/30) x 100 =  2.43%
+net                                      =  8.52%
+```
+
+**The join is exact symbol equality, and that is a rule.**
+
+- **Multiplier contracts are distinct instruments.** `1000PEPE` is never matched
+  against `PEPE`. The funding *rate* is scale-invariant so the arithmetic would
+  survive, but the identity would not: they are separate contracts with separate
+  books. The venue parsers keep the prefix precisely so this comparison can be
+  trusted.
+- **A shared ticker is not a shared asset.** Outside the 11 majors the same
+  three letters are routinely two different projects on two different venues.
+  Those pairs are still reported — suppressing them would hide the fat tail the
+  multi-venue board exists to show — but carry `verifiedPair: false` and the
+  dashboard marks them `unverified`.
+
+**Nothing is ever traded on these**, and the paper carry book below stays
+single-venue on purpose: a venue-spread position is two perp legs on two venues,
+so its accrual is a *difference* of two rate series and its close rules would
+need both, which is a different lifecycle from the one `funding_positions`
+implements. Paper-trading these with a paired-venue label is future work, noted
+in `docs/profitability-recommendations.md` (R5) and deliberately not started
+here.
+
+**Caveats**, beyond everything the carry section already disclaims: the fee drag
+is the only cost modelled, so margin — which this trade needs on *two* venues at
+once — is free here and is not; and a one-sided liquidation, which is how a
+two-venue delta-neutral pair actually goes wrong, is not simulated at all.
+
 ## Paper carry positions (realised vs predicted)
 
 Phase 15. The board above says what a carry *would* pay if the next published
@@ -561,6 +668,12 @@ Everything the funding section disclaims still applies, plus:
   withdrawal fee, no latency between the two legs. See the section above.
 - Funding carry is scanned and recorded; its annualisation extrapolates a single
   published rate. See the section above.
+- Cross-venue funding spreads are derived at read time and never traded; margin
+  on two venues and one-sided liquidation are not modelled. See the section
+  above.
+- Spread `skew_ms` is a lower bound on non-simultaneity, and `persist_net_pct`
+  is one re-price ~1 minute later — not a fill, and not a distribution until a
+  soak has produced one. See the section above.
 - Paper carry positions accrue funding and nothing else: no basis, no
   mark-to-market, no margin, and no balance is ever moved. See the section above.
 - `balances`, `trades` and the `triangular` rows in `opportunities`/`scans` are

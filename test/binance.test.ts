@@ -377,6 +377,40 @@ describe("getDualSnapshot", () => {
     expect(dual.message).toMatch(/binance-ws:.*403.*mexc-rest:.*451/s);
   });
 
+  it("stamps each source's own completion time, and reports the skew", async () => {
+    const delayMs = 40;
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => full(),
+      fetchRest: async () => {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        return full();
+      },
+    });
+
+    // The two timestamps describe the two *sources*. A `Date.now()` read after
+    // the `allSettled` join would have made them equal and quietly "proved" the
+    // two books simultaneous — which is the exact false positive this measures.
+    expect(dual.mexc!.ts).toBeGreaterThan(dual.binance!.ts);
+    expect(dual.skewMs).toBe(Math.abs(dual.mexc!.ts - dual.binance!.ts));
+    // Lower-bounded rather than exact: the assertion is that a real delay shows
+    // up at all, not that the runtime schedules to the millisecond.
+    expect(dual.skewMs!).toBeGreaterThanOrEqual(delayMs / 2);
+  });
+
+  it("reports a null skew when only one venue answered", async () => {
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => full(),
+      fetchRest: async () => {
+        throw new Error("HTTP 451");
+      },
+    });
+
+    // "Unmeasured" is not "simultaneous", so a missing venue must not read as a
+    // skew of zero.
+    expect(dual.mexc).toBeNull();
+    expect(dual.skewMs).toBeNull();
+  });
+
   it("uses the module-level REST seam, and restores it", async () => {
     const stub: RestFetcher = async () => bookOf(["BTCUSDT", 99, 100]);
     setRestFetcher(stub);

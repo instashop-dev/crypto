@@ -22,6 +22,7 @@ import {
   ASSET_UNIVERSE,
   BASE_ASSET,
   FUNDING_POLL_INTERVAL_MS,
+  perpAssets,
   STRATEGIES,
   type Strategy,
 } from "./config";
@@ -49,7 +50,7 @@ import {
   type FundingRate,
   type Settings,
 } from "./db";
-import { round8 } from "./engine";
+import { rankVenueSpreads, round8, type VenueSpread } from "./engine";
 import { FUNDING_VENUES } from "./funding";
 import { closeCarryPosition, pollFundingRates, runScan } from "./scan";
 import type { Env, FundingVenue } from "./types";
@@ -267,6 +268,93 @@ function summariseVenues(rates: FundingRate[]): Array<{ venue: string; count: nu
     counts.set(rate.venue, (counts.get(rate.venue) ?? 0) + 1);
   }
   return [...counts.entries()].map(([venue, count]) => ({ venue, count }));
+}
+
+/**
+ * Symbols whose identity is treated as verified across venues: the 11 majors.
+ *
+ * The rest of a multi-venue board is the fat tail — small caps, meme
+ * contracts, tokens listed under a ticker somebody else also uses — and there
+ * `BTC`-style confidence does not hold: two venues quoting `XYZ` are not
+ * necessarily quoting the same project. A cross-venue *spread* is exactly the
+ * figure that identity assumption makes or breaks, so the rows are still
+ * reported and the assumption is labelled instead of being made silently.
+ */
+const VERIFIED_SPREAD_SYMBOLS: readonly string[] = perpAssets(
+  ASSET_UNIVERSE,
+  BASE_ASSET,
+);
+
+/** One side of a reported venue spread. */
+export interface FundingSpreadLegBody {
+  venue: string;
+  /** The venue's own contract name — what to paste into its UI. */
+  instrument: string;
+  rate: number;
+  intervalMinutes: number;
+  /** `'api'` or `'assumed'`; an assumed cadence scales this leg's annual %. */
+  intervalSource: string;
+  annualizedPct: number;
+}
+
+/** One symbol's best venue pair, as `GET /api/funding` reports it. */
+export interface FundingSpreadBody {
+  symbol: string;
+  /** See {@link VERIFIED_SPREAD_SYMBOLS}. */
+  verifiedPair: boolean;
+  /** The perp bought — the venue paying least. */
+  long: FundingSpreadLegBody;
+  /** The perp sold — the venue paying most. */
+  short: FundingSpreadLegBody;
+  grossAnnualPct: number;
+  feeDragAnnualPct: number;
+  netAnnualPct: number;
+  /** Judged at read time against `funding_min_annual_pct`, as `rates` are. */
+  qualifies: boolean;
+}
+
+function spreadLegBody(leg: VenueSpread<FundingRate>["long"]): FundingSpreadLegBody {
+  return {
+    venue: leg.venue,
+    instrument: leg.quote.instrument,
+    rate: leg.rate,
+    intervalMinutes: leg.intervalMinutes,
+    intervalSource: leg.quote.intervalSource,
+    annualizedPct: leg.annualizedPct,
+  };
+}
+
+/**
+ * Cross-venue funding differentials for one board, best net first.
+ *
+ * Computed **at read time from the rows already fetched** — no schema, no write
+ * path, no second query. A spread is a fact about one board, so deriving it when
+ * the board is served means retuning `perp_fee_rate` or `funding_hold_days`
+ * re-prices every differential immediately, exactly as `qualifies` is
+ * re-judged, rather than freezing a stale answer into a table.
+ *
+ * The rows all share one `ts` ({@link listLatestFundingRates} selects a single
+ * poll), which is what makes the comparison legitimate: two venues' rates from
+ * different minutes would be a differential in time as much as in venue.
+ */
+function summariseSpreads(
+  rates: FundingRate[],
+  perpFeeRate: number,
+  holdDays: number,
+  minAnnualPct: number,
+): FundingSpreadBody[] {
+  return rankVenueSpreads(rates, perpFeeRate, holdDays, VERIFIED_SPREAD_SYMBOLS).map(
+    (s) => ({
+      symbol: s.symbol,
+      verifiedPair: s.verifiedPair,
+      long: spreadLegBody(s.long),
+      short: spreadLegBody(s.short),
+      grossAnnualPct: s.grossAnnualPct,
+      feeDragAnnualPct: s.feeDragAnnualPct,
+      netAnnualPct: s.netAnnualPct,
+      qualifies: s.netAnnualPct >= minAnnualPct,
+    }),
+  );
 }
 
 /** Parse a JSON body, treating an absent or malformed body as `{}`. */
@@ -560,6 +648,14 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * spread got filled it had to be applied at write time and the rows below it
    * were the ones nobody could learn anything from; as a display flag it costs
    * nothing and throws nothing away.
+   *
+   * Since Phase 16 every row also carries `skewMs`, `persistNetPct` and
+   * `persistCheckedTs` — how far apart the two books were, and what the same
+   * trade was worth on the next scan's books. `null` throughout means **not
+   * measured**, and `persistCheckedTs` set with a null `persistNetPct` means
+   * the row expired before any fresh snapshot could price it. Those three are
+   * the whole of the evidence for whether this strategy is real; see the
+   * decision rule in the README.
    */
   app.get("/api/opportunities", async (c) => {
     try {
@@ -640,6 +736,12 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * and are stored, so retuning `fee_rate` or `perp_fee_rate` re-prices future
    * boards only and does not rewrite history.
    *
+   * `spreads` is the same board read a second way: per symbol quoted by two or
+   * more venues, the widest differential available, priced as an all-perp pair
+   * trade (long the venue paying least, short the one paying most). Derived
+   * here rather than stored, for the reason `qualifies` is — see
+   * {@link summariseSpreads}.
+   *
    * An empty table answers 200, not 404: "no board yet" is the state of every
    * deployment for its first few seconds.
    */
@@ -670,11 +772,19 @@ export function createApp(): Hono<{ Bindings: Env }> {
           count: 0,
           ...shared,
           rates: [],
+          spreadCount: 0,
+          spreads: [],
         });
       }
 
       const ts = rates[0].ts;
       const ageMs = Date.now() - ts;
+      const spreads = summariseSpreads(
+        rates,
+        settings.perp_fee_rate,
+        settings.funding_hold_days,
+        minAnnualPct,
+      );
       return c.json({
         ts,
         ageMs,
@@ -689,6 +799,12 @@ export function createApp(): Hono<{ Bindings: Env }> {
           ...r,
           qualifies: r.netAnnualPct >= minAnnualPct,
         })),
+        // A second, derived view of the same board: what the *differences*
+        // between venues are worth as an all-perp pair trade. Its own section
+        // rather than a column on `rates`, because a spread is a property of a
+        // pair of rows and belongs to neither of them.
+        spreadCount: spreads.length,
+        spreads,
       });
     } catch (err) {
       return c.json({ error: message(err) }, 500);

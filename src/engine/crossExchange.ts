@@ -189,6 +189,46 @@ export function spreadLabel(symbol: string, buyVenue: string, sellVenue: string)
   return `${symbol} ${buyVenue}>${sellVenue}`;
 }
 
+/** The three fields {@link spreadLabel} encodes. */
+export interface ParsedSpreadLabel {
+  symbol: string;
+  buyVenue: string;
+  sellVenue: string;
+}
+
+/**
+ * The exact inverse of {@link spreadLabel}. `null` for anything that is not one.
+ *
+ * It exists because a persisted spread row stores its direction *only* in the
+ * label — `opportunities.cycle` — and Phase 16 re-prices yesterday's rows against
+ * today's books to measure whether the edge survived. Re-pricing the wrong
+ * direction would report the mirror trade, which is provably a loss, as the
+ * survival of the one that was recorded.
+ *
+ * Strict on purpose: exactly one space, exactly one `>`, and all three fields
+ * non-empty. A row whose label does not round-trip is left unmeasured rather
+ * than guessed at, because a mis-parsed direction is worse than a missing one —
+ * see the survival notes in `src/scan.ts`.
+ */
+export function parseSpreadLabel(label: string): ParsedSpreadLabel | null {
+  if (typeof label !== "string") return null;
+
+  const space = label.indexOf(" ");
+  if (space <= 0) return null;
+  const symbol = label.slice(0, space);
+  const direction = label.slice(space + 1);
+  // A second space means this is not a label this module wrote.
+  if (direction.includes(" ")) return null;
+
+  const arrow = direction.indexOf(">");
+  if (arrow <= 0) return null;
+  const buyVenue = direction.slice(0, arrow);
+  const sellVenue = direction.slice(arrow + 1);
+  if (!buyVenue || !sellVenue || sellVenue.includes(">")) return null;
+
+  return { symbol, buyVenue, sellVenue };
+}
+
 /**
  * Price one direction of one market: buy on `buy`, sell on `sell`.
  *
