@@ -466,6 +466,29 @@ describe("GET|PUT /api/settings", () => {
     ).resolves.toBe(400);
   });
 
+  it("accepts a valid perp_fee_rate", async () => {
+    const res = await send("/api/settings", "PUT", { perp_fee_rate: 0.0002 });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ perp_fee_rate: 0.0002 });
+    await expect(getSettings(env.DB)).resolves.toMatchObject({
+      perp_fee_rate: 0.0002,
+    });
+  });
+
+  it("holds perp_fee_rate to the same 0-0.01 range as fee_rate", async () => {
+    // The two rates differ in what they typically cost, not in what counts as
+    // a fat finger.
+    for (const value of [0.5, -0.0005]) {
+      const res = await send("/api/settings", "PUT", { perp_fee_rate: value });
+      expect(res.status, String(value)).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("perp_fee_rate");
+    }
+    await expect(getSettings(env.DB)).resolves.toMatchObject({
+      perp_fee_rate: DEFAULTS.perp_fee_rate,
+    });
+  });
+
   it("rejects unknown keys with 400", async () => {
     const res = await send("/api/settings", "PUT", { xchg_min_profit: 1 });
     expect(res.status).toBe(400);
@@ -1075,6 +1098,7 @@ interface FundingBody {
   minAnnualPct: number;
   holdDays: number;
   feeRate: number;
+  perpFeeRate: number;
   pollIntervalMs: number;
   rates: FundingRateBody[];
 }
@@ -1088,7 +1112,8 @@ function fundingRow(symbol: string, netAnnualPct: number) {
     rate: 0.0001,
     intervalMinutes: 480,
     intervalSource: "api",
-    annualizedPct: netAnnualPct + 4.86666667,
+    // The 30-day drag at the default fees: 2 x 0.1% spot + 2 x 0.05% perp.
+    annualizedPct: netAnnualPct + 3.65,
     netAnnualPct,
     nextFundingTs: null,
     markPrice: null,
@@ -1123,7 +1148,10 @@ describe("GET /api/funding", () => {
     // header before any row exists.
     expect(body.minAnnualPct).toBe(DEFAULTS.funding_min_annual_pct);
     expect(body.holdDays).toBe(DEFAULTS.funding_hold_days);
+    // Both taker rates are echoed: the panel explains a drag the operator
+    // cannot check without knowing what each pair of legs was charged.
     expect(body.feeRate).toBe(DEFAULTS.fee_rate);
+    expect(body.perpFeeRate).toBe(DEFAULTS.perp_fee_rate);
   });
 
   it("returns the newest board, best net carry first", async () => {
@@ -1137,7 +1165,7 @@ describe("GET /api/funding", () => {
     expect(body.rates[0].symbol).toBe("BTC");
     expect(body.rates[0].instrument).toBe("BTCUSDT");
     expect(body.rates[0].annualizedPct).toBeCloseTo(21.9, 6);
-    expect(body.rates[0].netAnnualPct).toBeCloseTo(17.03333333, 6);
+    expect(body.rates[0].netAnnualPct).toBeCloseTo(18.25, 6);
 
     for (let i = 1; i < body.rates.length; i++) {
       expect(body.rates[i].netAnnualPct).toBeLessThanOrEqual(
@@ -1378,7 +1406,7 @@ describe("POST /api/scan - funding block", () => {
     expect(body.error).toBeUndefined();
     expect(body.fundingVenue).toBe("bybit");
     expect(body.fundingCount).toBe(11);
-    expect(body.bestFundingNetAnnualPct).toBeCloseTo(17.03333333, 6);
+    expect(body.bestFundingNetAnnualPct).toBeCloseTo(18.25, 6);
     expect(body.fundingError).toBeUndefined();
     expect(body.fundingSkipped).toBeUndefined();
   });

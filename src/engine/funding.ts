@@ -9,7 +9,7 @@
  *
  * Pure functions, exactly like `./profit.ts`: no I/O, no clock, no Workers or
  * Hono imports, no dependency on `src/types.ts`. Everything is deterministic
- * given `(rate, intervalMinutes, feeRate, holdingDays)`.
+ * given `(rate, intervalMinutes, spotFeeRate, perpFeeRate, holdingDays)`.
  *
  * ## Modelling boundaries (read these before believing a number)
  *
@@ -30,6 +30,12 @@
  * - **Slippage, depth, margin and liquidation are ignored.** The short perp leg
  *   needs collateral, that collateral earns nothing here, and an adverse move
  *   large enough to liquidate it is not simulated at all.
+ * - **Fees are taker fees, one rate per venue class.** The two spot legs are
+ *   charged `spotFeeRate` and the two perp legs `perpFeeRate`, because the perp
+ *   taker rate is roughly half the spot one (~0.05% vs ~0.1% on the venues this
+ *   scanner quotes) and charging the spot rate on all four legs overstated the
+ *   drag by a third. Maker rebates, fee tiers and per-symbol schedules are not
+ *   modelled: taker on every leg is the conservative assumption.
  * - **A year is 365 days**, and returns are **simple, not compounded** — funding
  *   is assumed withdrawn, not reinvested. Compounding would raise every figure
  *   below and would be the less conservative choice.
@@ -52,11 +58,27 @@ export const MINUTES_PER_YEAR = 525_600;
 export const DEFAULT_FUNDING_INTERVAL_MINUTES = 480;
 
 /**
- * Fee-charging legs in one round trip: buy spot, sell perp, sell spot, buy
- * perp back. Both venues charge on entry *and* on exit, and a carry trade that
- * only counted the entry would look twice as good as it is.
+ * Spot legs in one round trip: buy the asset on entry, sell it on exit. Charged
+ * at the spot taker rate (`fee_rate`).
  */
-export const FUNDING_ROUND_TRIP_LEGS = 4;
+export const FUNDING_SPOT_LEGS = 2;
+
+/**
+ * Perp legs in one round trip: sell the perp on entry, buy it back on exit.
+ * Charged at the perp taker rate (`perp_fee_rate`), which is roughly half the
+ * spot one.
+ */
+export const FUNDING_PERP_LEGS = 2;
+
+/**
+ * Fee-charging legs in one round trip: buy spot, sell perp, sell spot, buy
+ * perp back — 2 spot + 2 perp. Both venues charge on entry *and* on exit, and a
+ * carry trade that only counted the entry would look twice as good as it is.
+ *
+ * The total the README and the dashboard copy quote; the math below never uses
+ * it, because the two halves are charged at different rates.
+ */
+export const FUNDING_ROUND_TRIP_LEGS = FUNDING_SPOT_LEGS + FUNDING_PERP_LEGS;
 
 /**
  * Longest settlement cadence treated as real: one day.
@@ -105,36 +127,44 @@ function isValidFee(feeRate: number): boolean {
 }
 
 /**
- * Total fee paid to open and close the pair, as a fraction of notional.
+ * Total fee paid to open and close the pair, as a fraction of notional:
+ * `2 x spotFeeRate + 2 x perpFeeRate`.
  *
- * Approximated as `legs x feeRate` rather than `1 - (1 - feeRate)^legs`: at
- * realistic taker fees the two differ in the sixth decimal, and the linear form
- * is the one a desk actually quotes. Being marginally the *larger* of the two
- * also keeps the estimate on the conservative side.
+ * The two rates are separate because the two venues charge differently — perp
+ * taker is ~0.05% where spot taker is ~0.1%, so a single rate applied to all
+ * four legs overstates the cost by a third.
+ *
+ * Approximated as `legs x rate` rather than `1 - (1 - rate)^legs`: at realistic
+ * taker fees the two differ in the sixth decimal, and the linear form is the one
+ * a desk actually quotes. Being marginally the *larger* of the two also keeps
+ * the estimate on the conservative side.
+ *
+ * `null` if either rate is unusable — a missing perp rate must not silently
+ * price as a free perp leg.
  */
 export function roundTripFeeFraction(
-  feeRate: number,
-  legs: number = FUNDING_ROUND_TRIP_LEGS,
+  spotFeeRate: number,
+  perpFeeRate: number,
 ): number | null {
-  if (!isValidFee(feeRate)) return null;
-  if (!Number.isFinite(legs) || legs <= 0) return null;
-  return round8(feeRate * legs);
+  if (!isValidFee(spotFeeRate) || !isValidFee(perpFeeRate)) return null;
+  return round8(spotFeeRate * FUNDING_SPOT_LEGS + perpFeeRate * FUNDING_PERP_LEGS);
 }
 
 /**
  * The round-trip fee, spread over a `holdingDays` position and annualised.
  *
  * This is why holding period matters to a carry trade at all: the funding
- * stream accrues per day, the fee is paid once. Held for a day, a 0.4%
- * round trip costs 146% a year; held for a year, 0.4%.
+ * stream accrues per day, the fee is paid once. At 0.1% spot / 0.05% perp the
+ * round trip is 0.3% of notional: held for a day it costs 109.5% a year, held
+ * for a year, 0.3%.
  */
 export function feeDragAnnualPct(
-  feeRate: number,
+  spotFeeRate: number,
+  perpFeeRate: number,
   holdingDays: number,
-  legs: number = FUNDING_ROUND_TRIP_LEGS,
 ): number | null {
   if (!Number.isFinite(holdingDays) || holdingDays <= 0) return null;
-  const fraction = roundTripFeeFraction(feeRate, legs);
+  const fraction = roundTripFeeFraction(spotFeeRate, perpFeeRate);
   if (fraction === null) return null;
   return round8(fraction * (365 / holdingDays) * 100);
 }
@@ -142,14 +172,15 @@ export function feeDragAnnualPct(
 /**
  * What the position keeps: the annualised funding less the annualised fee drag.
  *
- * Worked example — rate `0.0001` per 8h, fee `0.001`/leg, held 30 days:
+ * Worked example — rate `0.0001` per 8h, spot fee `0.001`/leg, perp fee
+ * `0.0005`/leg, held 30 days:
  *
  * ```
  * periods    525600 / 480                  = 1095
  * annual     0.0001 x 1095 x 100           = 10.95%
- * fees       0.001 x 4                     =  0.004 (0.4% of notional)
- * drag       0.004 x (365 / 30) x 100      =  4.86666667%
- * net        10.95 - 4.86666667            =  6.08333333%
+ * fees       0.001 x 2 + 0.0005 x 2        =  0.003 (0.3% of notional)
+ * drag       0.003 x (365 / 30) x 100      =  3.65%
+ * net        10.95 - 3.65                  =  7.30%
  * ```
  *
  * `null` if either half is unpriceable, so an unusable input can never surface
@@ -158,13 +189,13 @@ export function feeDragAnnualPct(
 export function netAnnualPct(
   rate: number,
   intervalMinutes: number,
-  feeRate: number,
+  spotFeeRate: number,
+  perpFeeRate: number,
   holdingDays: number,
-  legs: number = FUNDING_ROUND_TRIP_LEGS,
 ): number | null {
   const annual = annualizedPct(rate, intervalMinutes);
   if (annual === null) return null;
-  const drag = feeDragAnnualPct(feeRate, holdingDays, legs);
+  const drag = feeDragAnnualPct(spotFeeRate, perpFeeRate, holdingDays);
   if (drag === null) return null;
   return round8(annual - drag);
 }
@@ -199,17 +230,17 @@ export interface FundingOpportunity<T extends FundingInput = FundingInput> {
  * - **Ties keep input order** (`Array.prototype.sort` is stable), so two scans
  *   of the same board rank identically.
  *
- * The fee drag is a function of `(feeRate, holdingDays)` alone, so it is the
- * same for every row and ranking by `netAnnualPct` is equivalent to ranking by
- * `annualizedPct`. It is still computed per row: the two only coincide while
- * every symbol is charged the same fee, and the stored figure should be the one
- * that was actually used.
+ * The fee drag is a function of `(spotFeeRate, perpFeeRate, holdingDays)` alone,
+ * so it is the same for every row and ranking by `netAnnualPct` is equivalent to
+ * ranking by `annualizedPct`. It is still computed per row: the two only
+ * coincide while every symbol is charged the same fees, and the stored figure
+ * should be the one that was actually used.
  */
 export function rankFundingOpportunities<T extends FundingInput>(
   quotes: Iterable<T>,
-  feeRate: number,
+  spotFeeRate: number,
+  perpFeeRate: number,
   holdingDays: number,
-  legs: number = FUNDING_ROUND_TRIP_LEGS,
 ): Array<FundingOpportunity<T>> {
   const ranked: Array<FundingOpportunity<T>> = [];
 
@@ -219,7 +250,7 @@ export function rankFundingOpportunities<T extends FundingInput>(
     }
     const annual = annualizedPct(quote.rate, quote.intervalMinutes);
     if (annual === null) continue;
-    const drag = feeDragAnnualPct(feeRate, holdingDays, legs);
+    const drag = feeDragAnnualPct(spotFeeRate, perpFeeRate, holdingDays);
     if (drag === null) continue;
 
     ranked.push({

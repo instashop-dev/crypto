@@ -125,7 +125,28 @@
                 data-setting="fee_rate"
                 autocomplete="off"
               />
-              <span class="field-hint">Taker fee per leg (0.001 = 0.1%).</span>
+              <span class="field-hint">
+                Spot taker fee per leg (0.001 = 0.1%). Spread legs, and the two
+                spot legs of a carry.
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">perp_fee_rate</span>
+              <input
+                type="number"
+                step="0.0001"
+                min="0"
+                max="0.01"
+                class="input num"
+                id="set-perp-fee-rate"
+                data-setting="perp_fee_rate"
+                autocomplete="off"
+              />
+              <span class="field-hint">
+                Perp taker fee per leg (0.0005 = 0.05%). The two perp legs of a
+                carry.
+              </span>
             </label>
 
             <label class="field field-check">
@@ -214,7 +235,8 @@
                 autocomplete="off"
               />
               <span class="field-hint">
-                Days a carry is assumed held, to amortise 4 legs of fees.
+                Days a carry is assumed held, to amortise 4 legs of fees
+                (2 spot + 2 perp).
               </span>
             </label>
 
@@ -331,8 +353,11 @@
         <p class="hint">
           <strong>Cash-and-carry, observed only.</strong> Long spot, short the perp,
           collect funding &mdash; price risk cancels between the legs. No position is ever
-          opened. The annualised figure assumes the <em>next</em> published rate repeats all
-          year, which it will not; basis, margin and liquidation are not modelled.
+          opened. Net annual % is the annualised rate less the round trip of fees
+          &mdash; 2 spot legs at <code>fee_rate</code> plus 2 perp legs at
+          <code>perp_fee_rate</code>, spread over <code>funding_hold_days</code>. The
+          annualised figure assumes the <em>next</em> published rate repeats all year,
+          which it will not; basis, margin and liquidation are not modelled.
         </p>
       </section>
 

@@ -39,8 +39,22 @@ export const BASE_ASSET = "USDT";
  * release keeps working and its stale rows are inert.
  */
 export const DEFAULTS = {
-  /** Taker fee charged per leg, as a fraction (0.001 = 0.1%). */
+  /**
+   * Spot taker fee charged per leg, as a fraction (0.001 = 0.1%). Used by the
+   * cross-exchange spread math (both of whose legs are spot) and by the two
+   * spot legs of a funding carry.
+   */
   fee_rate: 0.001,
+  /**
+   * Perp taker fee charged per leg, as a fraction (0.0005 = 0.05%).
+   *
+   * Its own setting because a perp desk charges roughly half what a spot desk
+   * does — 0.05% is OKX's and Bybit's standard linear-perp taker rate against
+   * 0.1% spot. Charging the spot rate on the carry's two perp legs, as every
+   * phase before this one did, overstated the round trip by a third (0.4% of
+   * notional against 0.3%) and understated a 30-day carry by ~1.2%/yr.
+   */
+  perp_fee_rate: 0.0005,
   /** Starting paper balance, in USDT: the denominator of every P&L figure. */
   initial_usdt: 10000,
   /**
@@ -94,10 +108,11 @@ export const DEFAULTS = {
   /**
    * Assumed holding period, in days, used to amortise the round-trip fee.
    *
-   * The funding stream accrues per interval while the 4 legs of fees are paid
-   * once, so the net figure is meaningless without saying how long the position
-   * is held. 30 days is a month of carry — long enough that fees are a minor
-   * drag, short enough to be a decision someone would actually make.
+   * The funding stream accrues per interval while the 4 legs of fees (2 spot
+   * at `fee_rate`, 2 perp at `perp_fee_rate`) are paid once, so the net figure
+   * is meaningless without saying how long the position is held. 30 days is a
+   * month of carry — long enough that fees are a minor drag, short enough to be
+   * a decision someone would actually make.
    */
   funding_hold_days: 30,
 } as const;

@@ -238,6 +238,7 @@ export async function pollFundingRates(
   const ranked = rankFundingOpportunities(
     snapshot.quotes.values(),
     settings.fee_rate,
+    settings.perp_fee_rate,
     settings.funding_hold_days,
   );
 

@@ -82,14 +82,15 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 
 | Key | Default | Range | Meaning |
 |---|---|---|---|
-| `fee_rate` | `0.001` | `0`–`0.01` | Taker fee per leg, used by the spread net math and the funding fee drag. |
+| `fee_rate` | `0.001` | `0`–`0.01` | Spot taker fee per leg: both legs of a spread, and the two spot legs of a funding carry. |
+| `perp_fee_rate` | `0.0005` | `0`–`0.01` | Perp taker fee per leg: the two perp legs of a funding carry. Roughly half the spot rate on OKX and Bybit. |
 | `india_mode` | `0` | `0` or `1` | Annotate spreads with the Indian VDA tax overlay (see below). |
 | `tds_rate` | `0.01` | `0`–`0.05` | Section 194S withholding per VDA transfer. |
 | `tax_rate` | `0.3` | `0`–`0.5` | Section 115BBH rate on gains. Use `0.312` to include the 4% cess. |
 | `xchg_min_profit_pct` | `0.05` | any | Net % a spread must clear to be flagged `qualifies`. **Display only** — every priced row is persisted regardless. |
 | `xchg_enabled` | `1` | `0` or `1` | Scan cross-exchange spreads. `0` leaves the scan polling funding alone: no snapshot is fetched at all. |
 | `funding_min_annual_pct` | `5` | any | Net annualised % a carry must clear to be flagged `qualifies`. **Display only**, same as above. |
-| `funding_hold_days` | `30` | `0 < d ≤ 3650` | Days a carry is assumed held, used to amortise the 4 legs of fees. Changing it re-prices future rows only. |
+| `funding_hold_days` | `30` | `0 < d ≤ 3650` | Days a carry is assumed held, used to amortise the 4 legs of fees (2 spot + 2 perp). Changing it re-prices future rows only. |
 
 `initial_usdt` is immutable — it is the denominator of every P&L figure ever
 reported, so moving it would rewrite history rather than change behaviour.
@@ -271,29 +272,41 @@ in and out.
 ```
 periods    525600 / intervalMinutes                (8h -> 1095 a year)
 annual     rate x periods x 100                     [%, simple, not compounded]
-fees       feeRate x 4                              buy spot, sell perp,
+fees       spotFee x 2 + perpFee x 2                buy spot, sell perp,
                                                     sell spot, buy perp back
 drag       fees x (365 / holdingDays) x 100        [%, the round trip annualised]
 net        annual - drag
 ```
 
-Worked example — rate `0.0001` per 8h, `fee_rate` 0.1%, held 30 days:
+The four legs are **not** charged the same rate: the two spot legs pay
+`fee_rate` (~0.1%) and the two perp legs pay `perp_fee_rate` (~0.05%, the
+standard linear-perp taker rate on OKX and Bybit). Charging the spot rate on all
+four — as every phase before Phase 13 did — overstated the round trip by a third.
+
+Worked example — rate `0.0001` per 8h, `fee_rate` 0.1%, `perp_fee_rate` 0.05%,
+held 30 days:
 
 ```
 periods    525600 / 480                  = 1095
 annual     0.0001 x 1095 x 100           = 10.95%
-fees       0.001 x 4                     =  0.004      (0.4% of notional)
-drag       0.004 x (365 / 30) x 100      =  4.86666667%
-net        10.95 - 4.86666667            =  6.08333333%
+fees       0.001 x 2 + 0.0005 x 2        =  0.003      (0.3% of notional)
+drag       0.003 x (365 / 30) x 100      =  3.65%
+net        10.95 - 3.65                  =  7.30%
 
 sanity     over the 30 days actually held:
-           10.95 x 30/365 - 0.4          =  0.5% earned
-           0.5 x 365/30                  =  6.08333333%   ✓
+           10.95 x 30/365 - 0.3          =  0.6% earned
+           0.6 x 365/30                  =  7.30%        ✓
 ```
 
-Held for a year the same rate nets **10.55%**; held for a *day* it nets
-**−135.05%**, because the 0.4% round trip is then paid 365 times over. Holding
-period is not a detail of this trade, it is most of it.
+Held for a year the same rate nets **10.65%**; held for a *day* it nets
+**−98.55%**, because the 0.3% round trip is then paid 365 times over. Holding
+period is not a detail of this trade, it is most of it: break-even here is
+exactly 10 days.
+
+The split is a **re-pricing, not a migration.** Rows already on disk keep the
+`net_annual_pct` they were written with — the figure that was actually used at
+poll time — so a board recorded before Phase 13 reads ~1.22%/yr lower at a
+30-day hold than the same board would today.
 
 **Venue chain**, both unauthenticated and both reached with a User-Agent and
 nothing else — the header builder in `src/funding.ts` takes no `Env`, so a

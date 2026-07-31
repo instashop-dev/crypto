@@ -684,6 +684,7 @@
 
   const SETTING_INPUTS = {
     fee_rate: "set-fee-rate",
+    perp_fee_rate: "set-perp-fee-rate",
     india_mode: "set-india-mode",
     tds_rate: "set-tds-rate",
     tax_rate: "set-tax-rate",
@@ -709,6 +710,8 @@
     $("settings-summary").textContent =
       "fee " +
       s.fee_rate +
+      "/" +
+      s.perp_fee_rate +
       (s.xchg_enabled ? " · x-chg min " + s.xchg_min_profit_pct + "%" : " · x-chg off") +
       " · carry min " +
       s.funding_min_annual_pct +
