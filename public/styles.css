@@ -254,6 +254,23 @@ code {
   border-color: rgba(255, 95, 109, 0.6);
 }
 
+/*
+ * A quiet button for a panel head, where the topbar's filled variants would
+ * compete with the heading beside them. Used by the 7-day report, which is the
+ * one panel refreshed by hand rather than by the 5s poll.
+ */
+.btn-ghost {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8125rem;
+  background: transparent;
+  color: var(--fg-muted);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+
 /* ── Layout ──────────────────────────────────────────────────────────── */
 
 main {

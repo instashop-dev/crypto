@@ -9,6 +9,7 @@
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { setBasisFetcher } from "../src/basis";
 import {
   MEXC_BASE,
   setRestFetcher,
@@ -26,6 +27,7 @@ import {
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { fundingQuote, snapshotOf } from "./funding-stub";
+import { serveMinimalBasisBoard } from "./basis-stub";
 import { app } from "../src/index";
 import type { BookTickerEntry, Env } from "../src/types";
 
@@ -40,6 +42,7 @@ afterEach(() => {
   setWsCollector(null);
   setRestFetcher(null);
   setFundingFetcher(null);
+  setBasisFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -145,6 +148,7 @@ beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
   setFundingFetcher(serveFundingBoard);
+  setBasisFetcher(serveMinimalBasisBoard());
 });
 
 /** India-mode figures a historical row may carry. All zero means "untaxed". */

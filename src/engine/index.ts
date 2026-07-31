@@ -30,6 +30,17 @@ export {
   type VenueBook,
 } from "./crossExchange";
 export {
+  annualizedBasisPct,
+  basisDragAnnualPct,
+  basisPct,
+  daysToExpiry,
+  evaluateBasis,
+  MIN_DAYS_TO_EXPIRY,
+  rankBasisOpportunities,
+  type BasisInput,
+  type BasisOpportunity,
+} from "./basis";
+export {
   accrueAmount,
   CARRY_STALE_CLOSE_MS,
   DAYS_PER_YEAR,

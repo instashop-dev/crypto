@@ -1,11 +1,16 @@
 /**
  * Dashboard controller.
  *
- * One `refresh()` fans out to the five read endpoints with `Promise.allSettled`,
+ * One `refresh()` fans out to the seven read endpoints with `Promise.allSettled`,
  * so a single failing route degrades exactly one section to an "unavailable"
  * state instead of stopping the poll loop. Polling pauses while the tab is
  * hidden — the cron scanner keeps working regardless, and a backgrounded tab
  * hammering D1 every 5s buys nothing.
+ *
+ * `/api/report` is the one read endpoint deliberately left *out* of that loop:
+ * it is a dozen windowed aggregates over the two largest tables in the database,
+ * so it is fetched once on load and thereafter only on demand. See
+ * `loadReport()`.
  *
  * No bundler, no framework, no external assets: this file is loaded directly by
  * `index.html` and must stay valid in the browser as written.
@@ -31,6 +36,15 @@
   /** Closed carry positions requested. Sparse by construction — a handful of
    *  slots each held for days — so 30 is already months of book. */
   const CARRY_LIMIT = 30;
+  /**
+   * Basis contracts rendered.
+   *
+   * A display budget applied after the server has ranked, exactly as
+   * `FUNDING_LIMIT` is. OKX's whole linear dated board is a couple of dozen
+   * contracts, so this rarely bites — it exists so the day OKX lists a hundred
+   * expiries the panel degrades to "the best 40" rather than to a wall.
+   */
+  const BASIS_LIMIT = 40;
   const TOAST_MS = 6000;
 
   // -- tiny helpers ---------------------------------------------------------
@@ -93,6 +107,20 @@
     const abs = Math.abs(n);
     if (abs !== 0 && abs < 1) return String(Number(n.toPrecision(8)));
     return n.toLocaleString("en-US", { maximumFractionDigits: 8 });
+  }
+
+  /**
+   * Calendar date of a timestamp, `2026-09-25`.
+   *
+   * A settlement is a date, not a time of day — every OKX dated future settles
+   * at 08:00 UTC, so showing the clock would print the same four characters on
+   * every row of the basis board.
+   */
+  function fmtDate(ts) {
+    if (!isNum(ts)) return "—";
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toISOString().slice(0, 10);
   }
 
   /** Wall-clock time of a timestamp, for the leftmost column of every table. */
@@ -214,14 +242,17 @@
   const VENUE_SPREAD_COLS = 6;
   const CARRY_OPEN_COLS = 8;
   const CARRY_CLOSED_COLS = 9;
+  const BASIS_COLS = 9;
+  const REPORT_COLS = 5;
 
   /**
-   * Two-leg break-even at the **default** 0.1%/leg taker fee: ~0.2% of notional,
-   * the figure the README's decision rule quotes. Used only when
-   * `/api/opportunities` reports no `feeRate` — an older Worker against a newer
-   * dashboard — so the marker degrades to the default bar rather than vanishing.
+   * Two-leg break-even at the **default** 0.1%/leg taker fee: 0.2003% of
+   * notional, the figure the README's decision rule and `GET /api/report` both
+   * quote. Used only when `/api/opportunities` reports no `feeRate` — an older
+   * Worker against a newer dashboard — so the marker degrades to the default bar
+   * rather than vanishing.
    */
-  const SPREAD_BREAK_EVEN_FALLBACK_PCT = 0.2002;
+  const SPREAD_BREAK_EVEN_FALLBACK_PCT = 0.2003004;
 
   /**
    * The bar surviving nets are marked against, in percent: the round-trip cost
@@ -868,6 +899,317 @@
     note.classList.remove("bad");
   }
 
+  /**
+   * The dated-futures basis panel.
+   *
+   * Sorted by net annual, which the server has already done, and that order is
+   * worth reading twice: unlike every other board on this page, the fee drag
+   * here differs per row — it is amortised over each contract's own remaining
+   * life — so a contract with the larger raw basis routinely ranks below one
+   * with a smaller one. The "Days" column is what explains any such inversion.
+   */
+  function renderBasis(data) {
+    const body = $("basis-body");
+    const note = $("basis-note");
+    const rates = Array.isArray(data.rates) ? data.rates : [];
+    const summary = data.summary || {};
+    const now = Date.now();
+
+    if (rates.length === 0) {
+      placeholder(
+        body,
+        BASIS_COLS,
+        "No basis board yet — run a scan. (An empty board is also what OKX" +
+          " listing no linear dated futures looks like.)",
+      );
+      note.textContent = "—";
+      note.classList.remove("bad");
+      return;
+    }
+
+    const shown = rates.slice(0, BASIS_LIMIT);
+    body.innerHTML = shown
+      .map((r) => {
+        const days = isNum(r.daysToExpiry)
+          ? (r.daysToExpiry >= 10
+              ? Math.round(r.daysToExpiry)
+              : Number(r.daysToExpiry.toFixed(1))) + "d"
+          : "—";
+
+        // A row marked off a last trade rather than a two-sided book gets the
+        // same `*` treatment the funding board gives an assumed settlement
+        // interval, and for the same reason: it is a figure derived from a
+        // guess, and a stale mark is precisely what floats a fake basis to the
+        // top of a board sorted by net.
+        const stale = r.priceSource && r.priceSource !== "mid";
+
+        return (
+          '<tr class="data-row">' +
+          '<td class="mono"><span title="' +
+          esc(r.instrument) +
+          (stale
+            ? " — at least one leg was marked off the last trade, not a" +
+              " two-sided book. A stale mark inflates the basis."
+            : "") +
+          '">' +
+          esc(r.instrument) +
+          (stale ? ' <span class="ago">*</span>' : "") +
+          "</span></td>" +
+          '<td class="right num nowrap">' +
+          esc(fmtDate(r.expiryTs)) +
+          "</td>" +
+          '<td class="right num nowrap">' +
+          esc(days) +
+          "</td>" +
+          '<td class="right num">' +
+          fmtPrice(r.spotPrice) +
+          "</td>" +
+          '<td class="right num">' +
+          fmtPrice(r.futurePrice) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(r.basisPct) +
+          '">' +
+          fmtPct(r.basisPct, 3) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(r.annualizedPct) +
+          '">' +
+          fmtPct(r.annualizedPct, 2) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(r.netAnnualPct) +
+          '">' +
+          fmtPct(r.netAnnualPct, 2) +
+          "</td>" +
+          "<td>" +
+          (r.qualifies
+            ? '<span class="tag tag-exec">qualifies</span>'
+            : '<span class="tag tag-skip">—</span>') +
+          "</td>" +
+          "</tr>"
+        );
+      })
+      .join("");
+
+    // Contango vs backwardation leads the summary because it is the state of
+    // the world this strategy depends on: a curve entirely in backwardation
+    // means the cash-and-carry has no side to be on at all.
+    const shape =
+      isNum(summary.contango) && isNum(summary.backwardation)
+        ? summary.contango + " contango / " + summary.backwardation + " backwardated"
+        : "—";
+    note.textContent =
+      esc(data.venue || "okx") +
+      " · " +
+      (shown.length < rates.length ? "top " + shown.length + " of " : "") +
+      rates.length +
+      " contract" +
+      (rates.length === 1 ? "" : "s") +
+      " · " +
+      shape +
+      (isNum(summary.lastMarked) && summary.lastMarked > 0
+        ? " · " + summary.lastMarked + " stale-marked *"
+        : "") +
+      " · min " +
+      (isNum(data.minAnnualPct) ? data.minAnnualPct : "—") +
+      "% · updated " +
+      (isNum(data.ts) ? fmtRelative(data.ts, now) : "—") +
+      (data.stale ? " (stale)" : "");
+    note.classList.toggle("bad", Boolean(data.stale));
+  }
+
+  /**
+   * The 7-day report panel.
+   *
+   * Fed by `/api/report`, which is **not** on the poll loop: it is a dozen
+   * windowed aggregates over the two largest tables in the database, so it is
+   * fetched once on load and then only on demand. See {@link loadReport}.
+   *
+   * Every `—` here is "not measured", never zero. The `null`s the endpoint
+   * returns for an empty window are the whole reason those two are different.
+   */
+  function renderReport(data) {
+    const note = $("report-note");
+    const answers = (data.answers && data.answers.anyStrategyClearedBreakEven) || {};
+    const meta = data.meta || {};
+    const funding = data.funding || {};
+    const carry = data.carry || {};
+    const xchg = data.xchg || {};
+    const vspread = data.venueSpreads || {};
+    const basis = data.basis || {};
+
+    /** A yes/no cell: the answer as a word, its evidence underneath. */
+    function answer(id, cleared, detail) {
+      const value = $("report-ans-" + id);
+      const unit = $("report-ans-" + id + "-unit");
+      value.textContent = cleared === true ? "yes" : cleared === false ? "no" : "—";
+      value.className = "stat-value num " + (cleared === true ? "up" : cleared === false ? "down" : "flat");
+      unit.textContent = detail;
+    }
+
+    answer(
+      "funding",
+      answers.funding,
+      isNum(funding.bestNetAnnualPct)
+        ? "best " + fmtPct(funding.bestNetAnnualPct, 2) + "/yr"
+        : "no board in window",
+    );
+    answer(
+      "carry",
+      answers.carry,
+      carry.closedCount > 0
+        ? fmtSigned(carry.realizedPnlUsdt, 2) + " USDT over " + carry.closedCount + " closed"
+        : "nothing closed in window",
+    );
+    answer(
+      "xchg",
+      answers.xchg,
+      xchg.measured > 0
+        ? xchg.clearedBreakEven + " of " + xchg.measured + " cleared"
+        : "nothing re-priced yet",
+    );
+    answer(
+      "vspread",
+      answers.venueSpreads,
+      isNum(vspread.maxNetAnnualPct)
+        ? "best " + fmtPct(vspread.maxNetAnnualPct, 2) + "/yr"
+        : "no two-venue symbol",
+    );
+    answer(
+      "basis",
+      answers.basis,
+      isNum(basis.maxBestNetAnnualPct)
+        ? "best " + fmtPct(basis.maxBestNetAnnualPct, 2) + "/yr"
+        : "no board in window",
+    );
+
+    const error = data.answers ? data.answers.realizedVsPredictedCarryErrorPct : null;
+    $("report-carry-error").textContent = isNum(error) ? fmtSigned(error, 2) + "%" : "—";
+    $("report-carry-error").className =
+      "stat-value num " + (isNum(error) ? signClass(error) : "flat");
+    $("report-carry-error-unit").textContent =
+      carry.closedCount > 0 ? carry.closedCount + " closed positions" : "nothing closed yet";
+
+    const survival = data.answers ? data.answers.spreadSurvivalRate : null;
+    $("report-survival").textContent = isNum(survival)
+      ? fmtNum(survival * 100, 1) + "%"
+      : "—";
+    $("report-survival-unit").textContent =
+      xchg.measured > 0 ? "of " + xchg.measured + " re-priced" : "nothing re-priced yet";
+
+    $("report-verdict").textContent = xchg.verdict || "—";
+
+    // Per-strategy detail. One row each, in the order the README introduces
+    // them, so the table reads as the same story the page tells top to bottom.
+    const rows = [
+      {
+        name: "Cross-exchange spreads",
+        observations: xchg.rows,
+        best: isNum(xchg.maxPersistNetPct) ? fmtPct(xchg.maxPersistNetPct, 4) : "—",
+        avg: isNum(xchg.medianPersistNetPct)
+          ? fmtPct(xchg.medianPersistNetPct, 4) + " (median)"
+          : "—",
+        detail:
+          (xchg.measured || 0) +
+          " measured, " +
+          (xchg.expiredUnmeasured || 0) +
+          " expired · skew avg " +
+          (isNum(xchg.avgSkewMs) ? fmtNum(xchg.avgSkewMs, 0) + "ms" : "—") +
+          ", max " +
+          (isNum(xchg.maxSkewMs) ? fmtNum(xchg.maxSkewMs, 0) + "ms" : "—"),
+      },
+      {
+        name: "Funding carry",
+        observations: funding.observations,
+        best: isNum(funding.bestNetAnnualPct) ? fmtPct(funding.bestNetAnnualPct, 2) : "—",
+        avg: "—",
+        detail:
+          (Array.isArray(funding.venues) ? funding.venues.length : 0) +
+          " venue(s) · " +
+          (funding.qualifyingPolls || 0) +
+          " polls cleared " +
+          (isNum(meta.settings && meta.settings.minAnnualPct)
+            ? meta.settings.minAnnualPct + "%"
+            : "the bar") +
+          " · drag " +
+          (isNum(funding.feeDragAnnualPct) ? fmtNum(funding.feeDragAnnualPct, 2) + "%" : "—"),
+      },
+      {
+        name: "Cross-venue spreads",
+        observations: vspread.polls,
+        best: isNum(vspread.maxNetAnnualPct) ? fmtPct(vspread.maxNetAnnualPct, 2) : "—",
+        avg: isNum(vspread.avgNetAnnualPct) ? fmtPct(vspread.avgNetAnnualPct, 2) : "—",
+        detail:
+          (vspread.qualifyingPolls || 0) +
+          " of " +
+          (vspread.polls || 0) +
+          " polls qualified · majors only",
+      },
+      {
+        name: "Dated-futures basis",
+        observations: basis.observations,
+        best: isNum(basis.maxBestNetAnnualPct)
+          ? fmtPct(basis.maxBestNetAnnualPct, 2)
+          : "—",
+        avg: isNum(basis.avgBestNetAnnualPct)
+          ? fmtPct(basis.avgBestNetAnnualPct, 2)
+          : "—",
+        detail:
+          (basis.qualifyingPolls || 0) + " of " + (basis.polls || 0) + " polls qualified",
+      },
+      {
+        name: "Paper carry positions",
+        observations: (carry.openCount || 0) + (carry.closedCount || 0),
+        best: carry.best ? fmtPct(carry.best.realizedAnnualPct, 2) : "—",
+        avg: isNum(carry.avgRealizedAnnualPct)
+          ? fmtPct(carry.avgRealizedAnnualPct, 2)
+          : "—",
+        detail:
+          (carry.openCount || 0) +
+          " open (" +
+          fmtNum(carry.openNotionalUsdt, 0) +
+          " USDT), " +
+          (carry.closedCount || 0) +
+          " closed for " +
+          fmtSigned(carry.realizedPnlUsdt, 2) +
+          " USDT",
+      },
+    ];
+
+    $("report-body").innerHTML = rows
+      .map(
+        (r) =>
+          '<tr class="data-row"><td>' +
+          esc(r.name) +
+          '</td><td class="right num">' +
+          (isNum(r.observations) ? fmtNum(r.observations, 0) : "—") +
+          '</td><td class="right num">' +
+          esc(r.best) +
+          '</td><td class="right num">' +
+          esc(r.avg) +
+          '</td><td class="ago">' +
+          esc(r.detail) +
+          "</td></tr>",
+      )
+      .join("");
+
+    note.textContent =
+      (isNum(meta.days) ? meta.days + "d window" : "—") +
+      // Rendered as a duration rather than as a decimal number of days: a
+      // deployment an hour old covers "0.0d", which reads as a bug rather than
+      // as the honest "this window is nearly empty" it actually is.
+      (isNum(meta.servedDays)
+        ? " · " + fmtDuration(meta.servedDays * 86400000) + " covered"
+        : " · no data") +
+      (isNum(meta.requestedDays) && meta.requestedDays !== meta.days
+        ? " · clamped from " + meta.requestedDays + "d"
+        : "") +
+      " · fetched " +
+      fmtClock(Date.now());
+    note.classList.remove("bad");
+  }
+
   /** Close reasons, shortened for the table. Unknown values render verbatim. */
   const CLOSE_REASONS = {
     max_hold: "max hold",
@@ -1299,6 +1641,35 @@
     }
   }
 
+  // -- the 7-day report -----------------------------------------------------
+
+  /**
+   * Fetch and render the report.
+   *
+   * Deliberately **not** part of {@link refresh}. `/api/report` is a dozen
+   * windowed aggregates over `funding_rates` and `opportunities` — the two
+   * largest tables here — and putting it on a 5-second loop would cost more D1
+   * reads than the scanner itself. Once on load, then on demand.
+   */
+  let reportInFlight = false;
+
+  async function loadReport() {
+    if (reportInFlight) return;
+    reportInFlight = true;
+    const btn = $("report-btn");
+    btn.disabled = true;
+    try {
+      renderReport((await getJson("/api/report")) || {});
+    } catch (err) {
+      placeholder($("report-body"), REPORT_COLS, "unavailable — " + err.message, false);
+      $("report-note").textContent = "unavailable";
+      $("report-note").classList.add("bad");
+    } finally {
+      reportInFlight = false;
+      btn.disabled = false;
+    }
+  }
+
   // -- poll loop ------------------------------------------------------------
 
   let timer = null;
@@ -1308,14 +1679,16 @@
     if (inFlight) return;
     inFlight = true;
     try {
-      const [portfolio, opps, funding, carry, trades, scans] = await Promise.allSettled([
-        getJson("/api/portfolio"),
-        getJson("/api/opportunities?limit=" + OPPS_LIMIT),
-        getJson("/api/funding"),
-        getJson("/api/funding/positions?limit=" + CARRY_LIMIT),
-        getJson("/api/trades?limit=" + TRADES_LIMIT),
-        getJson("/api/scans?limit=" + SCANS_LIMIT),
-      ]);
+      const [portfolio, opps, funding, basis, carry, trades, scans] =
+        await Promise.allSettled([
+          getJson("/api/portfolio"),
+          getJson("/api/opportunities?limit=" + OPPS_LIMIT),
+          getJson("/api/funding"),
+          getJson("/api/basis"),
+          getJson("/api/funding/positions?limit=" + CARRY_LIMIT),
+          getJson("/api/trades?limit=" + TRADES_LIMIT),
+          getJson("/api/scans?limit=" + SCANS_LIMIT),
+        ]);
 
       if (portfolio.status === "fulfilled") renderPortfolio(portfolio.value);
       else portfolioUnavailable(portfolio.reason.message);
@@ -1359,6 +1732,22 @@
         );
         $("vspread-note").textContent = "unavailable";
         $("vspread-note").classList.add("bad");
+      }
+
+      // Its own upstream and its own table, so it degrades on its own: the
+      // basis board fails independently of the funding board even though both
+      // are quoted by OKX.
+      if (basis.status === "fulfilled") {
+        renderBasis(basis.value || {});
+      } else {
+        placeholder(
+          $("basis-body"),
+          BASIS_COLS,
+          "unavailable — " + basis.reason.message,
+          false,
+        );
+        $("basis-note").textContent = "unavailable";
+        $("basis-note").classList.add("bad");
       }
 
       if (carry.status === "fulfilled") {
@@ -1416,6 +1805,7 @@
   function init() {
     $("scan-btn").addEventListener("click", doScan);
     $("reset-btn").addEventListener("click", doReset);
+    $("report-btn").addEventListener("click", loadReport);
 
     // Delegated: table bodies are replaced wholesale on every render, so
     // per-row listeners would leak with them.
@@ -1453,6 +1843,9 @@
 
     loadSettings();
     refresh();
+    // Once, alongside the first poll, and never again unless asked — see
+    // {@link loadReport}.
+    loadReport();
     startPolling();
   }
 

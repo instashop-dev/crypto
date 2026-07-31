@@ -23,6 +23,7 @@
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { setBasisFetcher } from "../src/basis";
 import {
   setRestFetcher,
   setWsCollector,
@@ -39,6 +40,7 @@ import {
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { serveFlatBoard } from "./funding-stub";
+import { serveMinimalBasisBoard } from "./basis-stub";
 import { runScan, SPREAD_PERSIST_MIN_AGE_MS } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
@@ -57,6 +59,7 @@ afterEach(() => {
   setWsCollector(null);
   setRestFetcher(null);
   setFundingFetcher(null);
+  setBasisFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -148,6 +151,7 @@ beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
   setFundingFetcher(serveFundingBoard);
+  setBasisFetcher(serveMinimalBasisBoard());
 });
 
 describe("runScan - spread observation", () => {

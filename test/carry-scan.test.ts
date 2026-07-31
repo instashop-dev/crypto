@@ -17,6 +17,7 @@
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { setBasisFetcher } from "../src/basis";
 import { setRestFetcher, setWsCollector } from "../src/binance";
 import { ASSET_UNIVERSE, BASE_ASSET, DEFAULTS, perpAssets } from "../src/config";
 import {
@@ -36,6 +37,7 @@ import { app } from "../src/index";
 import { runScan } from "../src/scan";
 import type { BookTickerEntry, Env, FundingVenue } from "../src/types";
 import { fundingQuote, snapshotOf } from "./funding-stub";
+import { serveMinimalBasisBoard } from "./basis-stub";
 
 const ASSETS = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
 
@@ -110,12 +112,14 @@ beforeEach(async () => {
   await replacePairs(env.DB, PAIRS, "test");
   setWsCollector(serve(BINANCE));
   setRestFetcher(serve(MEXC));
+  setBasisFetcher(serveMinimalBasisBoard());
 });
 
 afterEach(() => {
   setWsCollector(null);
   setRestFetcher(null);
   setFundingFetcher(null);
+  setBasisFetcher(null);
 });
 
 /** The full major board on Bybit, rates descending so BTC always ranks first. */

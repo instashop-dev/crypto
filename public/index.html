@@ -400,7 +400,7 @@
           the next scan’s books; “—” means not measured (too old to re-price, or waiting
           for the next scan). A spread that was real is still there a minute later; one
           the skew invented is not. If surviving nets never clear the
-          <strong>0.2002%</strong> two-leg fee break-even, this strategy is display-only.
+          <strong>0.2003%</strong> two-leg fee break-even, this strategy is display-only.
         </p>
       </section>
 
@@ -494,6 +494,71 @@
         </p>
       </section>
 
+      <!-- ── Dated-futures basis ───────────────────────────────────────── -->
+      <section class="panel" aria-labelledby="basis-heading">
+        <div class="panel-head">
+          <h2 id="basis-heading">Dated-futures basis (OKX)</h2>
+          <span class="panel-note" id="basis-note">&mdash;</span>
+        </div>
+        <div class="table-wrap">
+          <table class="grid" id="basis-table">
+            <thead>
+              <tr>
+                <th scope="col">Contract</th>
+                <th scope="col" class="right">Settles</th>
+                <th scope="col" class="right">Days</th>
+                <th scope="col" class="right">Spot</th>
+                <th scope="col" class="right">Future</th>
+                <th scope="col" class="right">Basis %</th>
+                <th scope="col" class="right">Annual %</th>
+                <th
+                  scope="col"
+                  class="right"
+                  title="Annualised basis less the four-leg round trip, amortised over THIS contract's remaining life — not over funding_hold_days."
+                >
+                  Net annual %
+                </th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody id="basis-body">
+              <tr class="placeholder-row">
+                <td colspan="9">Loading&hellip;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">
+          <strong>Cash and carry to settlement.</strong> Buy the asset spot, sell a dated
+          future on it, hold both to expiry. The future converges to spot at settlement by
+          construction, so the return is <em>locked in at entry</em> &mdash; which is the
+          one thing perp funding never offers. The funding board above annualises a rate
+          that has to repeat about 1095 times to be worth what it says; a basis has no
+          such assumption in it.
+        </p>
+        <p class="hint">
+          <strong>Net annual % is amortised per contract.</strong> The four legs (2 spot at
+          <code>fee_rate</code>, 2 futures at <code>perp_fee_rate</code>) are spread over
+          each contract&rsquo;s own remaining life rather than over
+          <code>funding_hold_days</code>, because this trade ends when the contract does.
+          A fat near-dated basis therefore routinely ranks <em>below</em> a thin far-dated
+          one, and the table is sorted by net for exactly that reason.
+        </p>
+        <p class="hint">
+          <strong>What is not modelled.</strong> Margin and liquidation, above all: the
+          short future needs collateral for months, it earns nothing here, and a rally big
+          enough to liquidate it before expiry turns a locked-in return into a realised
+          loss. Both legs are marked at the <em>mid</em> of the book, so no bid/ask spread
+          is charged; a contract marked <strong>*</strong> had at least one leg priced off
+          its last trade instead, because a side of its book was empty &mdash; and a stale
+          mark is exactly what floats a fake basis to the top of a table sorted by net.
+          The futures leg is charged the perp taker rate, which is an approximation. Inverse (coin-margined) and <code>XPERP</code> contracts are
+          excluded &mdash; the first is not delta-neutral against a USDT spot leg, the
+          second is a perp wearing an expiry. Observation only: no paper position is ever
+          opened on a basis.
+        </p>
+      </section>
+
       <!-- ── Carry positions ───────────────────────────────────────────── -->
       <section class="panel" aria-labelledby="carry-heading">
         <div class="panel-head">
@@ -583,6 +648,111 @@
         </p>
       </section>
 
+      <!-- ── 7-day profitability report ────────────────────────────────── -->
+      <section class="panel" aria-labelledby="report-heading">
+        <div class="panel-head">
+          <h2 id="report-heading">7-day report</h2>
+          <span class="panel-note" id="report-note">&mdash;</span>
+          <button type="button" class="btn btn-ghost" id="report-btn">Refresh</button>
+        </div>
+
+        <p class="subhead">Did anything clear its break-even?</p>
+        <div class="stats" id="report-answers">
+          <div class="stat">
+            <span class="stat-label">Funding carry</span>
+            <span class="stat-value num" id="report-ans-funding">&mdash;</span>
+            <span class="stat-unit" id="report-ans-funding-unit">best net annual</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Paper carry</span>
+            <span class="stat-value num" id="report-ans-carry">&mdash;</span>
+            <span class="stat-unit" id="report-ans-carry-unit">realised P&amp;L</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Cross-exchange</span>
+            <span class="stat-value num" id="report-ans-xchg">&mdash;</span>
+            <span class="stat-unit" id="report-ans-xchg-unit">cleared break-even</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Venue spreads</span>
+            <span class="stat-value num" id="report-ans-vspread">&mdash;</span>
+            <span class="stat-unit" id="report-ans-vspread-unit">best net annual</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Dated basis</span>
+            <span class="stat-value num" id="report-ans-basis">&mdash;</span>
+            <span class="stat-unit" id="report-ans-basis-unit">best net annual</span>
+          </div>
+        </div>
+
+        <p class="subhead">The two measured error terms</p>
+        <div class="stats">
+          <div class="stat">
+            <span
+              class="stat-label"
+              title="Mean of realised annual % minus the net annual % predicted at entry, over the positions closed in the window. Negative means entry over-promised."
+              >Carry prediction error</span
+            >
+            <span class="stat-value num" id="report-carry-error">&mdash;</span>
+            <span class="stat-unit" id="report-carry-error-unit">%/yr, closed</span>
+          </div>
+          <div class="stat">
+            <span
+              class="stat-label"
+              title="Fraction of re-priced cross-exchange spreads that were still positive on a later snapshot."
+              >Spread survival</span
+            >
+            <span class="stat-value num" id="report-survival">&mdash;</span>
+            <span class="stat-unit" id="report-survival-unit">of measured</span>
+          </div>
+        </div>
+
+        <p class="hint" id="report-verdict">&mdash;</p>
+
+        <p class="subhead">Per strategy</p>
+        <div class="table-wrap">
+          <table class="grid" id="report-table">
+            <thead>
+              <tr>
+                <th scope="col">Strategy</th>
+                <th scope="col" class="right">Observations</th>
+                <th scope="col" class="right">Best</th>
+                <th scope="col" class="right">Average</th>
+                <th scope="col">Detail</th>
+              </tr>
+            </thead>
+            <tbody id="report-body">
+              <tr class="placeholder-row">
+                <td colspan="5">Not loaded yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="hint">
+          <strong>The acceptance test, not a live panel.</strong> This is a dozen windowed
+          aggregates over the two largest tables in the database, so it is fetched once on
+          load and then only when you press Refresh &mdash; never on the 5-second poll the
+          rest of this page runs on.
+        </p>
+        <p class="hint">
+          <strong>One fee basis across the whole window.</strong> The funding and
+          cross-exchange figures are recomputed from each row&rsquo;s stored <em>gross</em>
+          percentage against today&rsquo;s <code>fee_rate</code> and
+          <code>perp_fee_rate</code>, not read from the net column the row was written
+          with. Rows recorded before the per-leg fee split charged the spot rate on all
+          four legs, and averaging across that boundary would describe a fee schedule that
+          never existed.
+        </p>
+        <p class="hint">
+          <strong>&ldquo;—&rdquo; means not measured, and never zero.</strong> An average
+          of no closed positions is not 0%/yr, and a survival rate over no re-priced
+          spreads is not 0%. Break-even here is a net figure above zero &mdash; the fee
+          drag has already been subtracted &mdash; rather than the
+          <code>funding_min_annual_pct</code> display bar.
+        </p>
+      </section>
+
       <!-- ── Trades (historical) ───────────────────────────────────────── -->
       <details class="panel collapsible" id="trades-panel">
         <summary>
@@ -653,7 +823,7 @@
       Nothing is traded. Carry positions are paper only and never move a balance.
       Data: Binance WS + MEXC REST (spot, cross-exchange spreads) · Bybit v5, OKX v5,
       Gate v4 and KuCoin futures (perpetual funding rates, every venue polled every
-      board).
+      board) · OKX v5 futures + spot tickers (dated-futures basis).
     </footer>
 
     <div class="toasts" id="toasts" role="status" aria-live="polite"></div>

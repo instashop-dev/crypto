@@ -10,6 +10,7 @@
  * the dashboard has exactly one failure shape to render.
  */
 import { Hono } from "hono";
+import { BASIS_VENUE } from "./basis";
 import {
   discoverPairs,
   getSnapshot,
@@ -37,6 +38,7 @@ import {
   getTaxTotals,
   listClosedFundingPositions,
   listFundingRatesForSymbol,
+  listLatestBasisRates,
   listLatestFundingRates,
   listOpenFundingPositions,
   listOpportunities,
@@ -46,12 +48,14 @@ import {
   replacePairs,
   resetAll,
   updateSettings,
+  type BasisRate,
   type CarryTotals,
   type FundingRate,
   type Settings,
 } from "./db";
 import { rankVenueSpreads, round8, type VenueSpread } from "./engine";
 import { FUNDING_VENUES } from "./funding";
+import { buildReport, parseReportDays, REPORT_MAX_DAYS } from "./report";
 import { closeCarryPosition, pollFundingRates, runScan } from "./scan";
 import type { Env, FundingVenue } from "./types";
 
@@ -355,6 +359,97 @@ function summariseSpreads(
       qualifies: s.netAnnualPct >= minAnnualPct,
     }),
   );
+}
+
+/** The best contract on a basis board, reduced to what a summary line needs. */
+export interface BasisBestBody {
+  symbol: string;
+  /** The venue's own contract name — what to paste into OKX's UI. */
+  instrument: string;
+  expiryTs: number;
+  daysToExpiry: number;
+  basisPct: number;
+  annualizedPct: number;
+  netAnnualPct: number;
+  qualifies: boolean;
+}
+
+/** One basis board, summarised. */
+export interface BasisSummaryBody {
+  /** The row the board is sorted to the top; `null` for an empty board. */
+  best: BasisBestBody | null;
+  /** Rows clearing `funding_min_annual_pct`. */
+  qualifying: number;
+  /** Contracts trading above spot — the direction the carry harvests. */
+  contango: number;
+  /** Contracts trading below spot. A valid observation, never clamped away. */
+  backwardation: number;
+  /** Distinct underlyings on the board; one symbol has a whole curve. */
+  symbols: number;
+  /**
+   * Rows where at least one leg was marked off a *last trade* rather than a
+   * two-sided book.
+   *
+   * Reported at the summary level, not just per row, because it is the board's
+   * single best staleness signal: a thin far-dated contract with an empty book
+   * side marks off an old print, and a stale mark is exactly what produces a
+   * spuriously fat basis that then sorts to the top.
+   */
+  lastMarked: number;
+  /** Nearest and furthest settlement on the board, in days. */
+  nearestDays: number | null;
+  furthestDays: number | null;
+}
+
+/** The shape an empty board reports, so both branches answer the same keys. */
+const EMPTY_BASIS_SUMMARY: BasisSummaryBody = {
+  best: null,
+  qualifying: 0,
+  contango: 0,
+  backwardation: 0,
+  symbols: 0,
+  lastMarked: 0,
+  nearestDays: null,
+  furthestDays: null,
+};
+
+/**
+ * Summarise one basis board.
+ *
+ * The contango/backwardation split is the headline of this panel rather than a
+ * curiosity: a curve entirely in backwardation means the cash-and-carry has no
+ * side to be on at all, and a board where the counts are near-even is a market
+ * with no consistent term structure to harvest. Counting them is cheaper than
+ * making a reader scan a sign column.
+ *
+ * Assumes the board arrives sorted best-net-first, which is what
+ * {@link listLatestBasisRates} returns — so `best` is the first row rather than
+ * a second scan.
+ */
+function summariseBasis(rates: BasisRate[], minAnnualPct: number): BasisSummaryBody {
+  if (rates.length === 0) return EMPTY_BASIS_SUMMARY;
+
+  const top = rates[0];
+  const days = rates.map((r) => r.daysToExpiry).filter((d) => Number.isFinite(d));
+  return {
+    best: {
+      symbol: top.symbol,
+      instrument: top.instrument,
+      expiryTs: top.expiryTs,
+      daysToExpiry: top.daysToExpiry,
+      basisPct: top.basisPct,
+      annualizedPct: top.annualizedPct,
+      netAnnualPct: top.netAnnualPct,
+      qualifies: top.netAnnualPct >= minAnnualPct,
+    },
+    qualifying: rates.filter((r) => r.netAnnualPct >= minAnnualPct).length,
+    contango: rates.filter((r) => r.basisPct > 0).length,
+    backwardation: rates.filter((r) => r.basisPct < 0).length,
+    symbols: new Set(rates.map((r) => r.symbol)).size,
+    lastMarked: rates.filter((r) => r.priceSource !== "mid").length,
+    nearestDays: days.length > 0 ? Math.min(...days) : null,
+    furthestDays: days.length > 0 ? Math.max(...days) : null,
+  };
 }
 
 /** Parse a JSON body, treating an absent or malformed body as `{}`. */
@@ -970,6 +1065,106 @@ export function createApp(): Hono<{ Bindings: Env }> {
         return c.json({ error: `position ${id} is already closed` }, 409);
       }
       return c.json({ ok: true, position: await getFundingPosition(c.env.DB, id) });
+    } catch (err) {
+      return c.json({ error: message(err) }, 500);
+    }
+  });
+
+  // -- dated-futures basis --------------------------------------------------
+
+  /**
+   * The newest OKX dated-futures basis board, best net annual first.
+   *
+   * `qualifies` is computed **here**, against the current
+   * `funding_min_annual_pct`, for exactly the reason `/api/funding` computes its
+   * own that way: it is a judgement about a measurement, not part of it. The
+   * threshold is shared with the perp board deliberately — both are
+   * delta-neutral carries quoted as a net annual percentage, and giving the two
+   * separate bars would invite tuning one strategy to look better than the other
+   * rather than comparing them.
+   *
+   * The two stored percentages are the opposite case: they were computed from
+   * the fee rates in force at poll time *and* from the contract's remaining life
+   * at that moment, so they are stored and never re-derived. A basis row's drag
+   * is not a constant across the board — it is amortised over each contract's own
+   * `daysToExpiry` — which is why a near-dated contract with a fat basis can rank
+   * below a far-dated one with a thin one.
+   *
+   * An empty table answers 200, not 404: "no board yet" is the state of every
+   * deployment for its first few seconds, and "OKX lists no linear dated
+   * futures" is a real state of the world besides.
+   */
+  app.get("/api/basis", async (c) => {
+    try {
+      await ensureSeeded(c.env.DB);
+      const [rates, settings] = await Promise.all([
+        listLatestBasisRates(c.env.DB),
+        getSettings(c.env.DB),
+      ]);
+
+      const minAnnualPct = settings.funding_min_annual_pct;
+      const shared = {
+        venue: BASIS_VENUE,
+        minAnnualPct,
+        feeRate: settings.fee_rate,
+        perpFeeRate: settings.perp_fee_rate,
+        pollIntervalMs: FUNDING_POLL_INTERVAL_MS,
+      };
+
+      if (rates.length === 0) {
+        return c.json({
+          ts: null,
+          ageMs: null,
+          stale: false,
+          count: 0,
+          ...shared,
+          summary: EMPTY_BASIS_SUMMARY,
+          rates: [],
+        });
+      }
+
+      const ts = rates[0].ts;
+      const ageMs = Date.now() - ts;
+      return c.json({
+        ts,
+        ageMs,
+        stale: ageMs > FUNDING_STALE_MS,
+        count: rates.length,
+        ...shared,
+        summary: summariseBasis(rates, minAnnualPct),
+        rates: rates.map((r: BasisRate) => ({
+          ...r,
+          qualifies: r.netAnnualPct >= minAnnualPct,
+        })),
+      });
+    } catch (err) {
+      return c.json({ error: message(err) }, 500);
+    }
+  });
+
+  // -- profitability report -------------------------------------------------
+
+  /**
+   * The acceptance test, as an endpoint. See `src/report.ts` for what each
+   * section answers and why the figures are recomputed rather than read from the
+   * stored net columns.
+   *
+   * `?days=` is **clamped** to `[1, 7]` rather than rejected — 7 is the rate
+   * tables' retention window, so a longer request could only be answered by
+   * mixing a 7-day view of the rate tables with a 30-day view of the
+   * never-pruned position and spread tables. `meta.requestedDays` reports what
+   * was asked for beside `meta.days`, so the clamp is visible.
+   *
+   * Not on the dashboard's 5-second poll, and the dashboard is written not to
+   * put it there: this is a dozen windowed aggregates over the two largest
+   * tables in the database, and running it every five seconds would cost more
+   * D1 reads than the scanner itself.
+   */
+  app.get("/api/report", async (c) => {
+    try {
+      await ensureSeeded(c.env.DB);
+      const window = parseReportDays(c.req.query("days"));
+      return c.json({ maxDays: REPORT_MAX_DAYS, ...(await buildReport(c.env.DB, window)) });
     } catch (err) {
       return c.json({ error: message(err) }, 500);
     }

@@ -1,12 +1,17 @@
 # crypto-arb — Cross-Exchange & Funding-Rate Observatory on Cloudflare
 
-A fully serverless scanner that measures two things every minute and writes down
-what it saw: **cross-exchange spot spreads** (the same market on Binance and
-MEXC) and **perpetual funding rates** (Bybit, OKX, Gate and KuCoin, all four
-polled on every board). Since Phase 15 it also **holds paper carry positions**,
-so the one edge it measures as positive has a realised P&L to check its own
-prediction against. **Nothing is traded** — no orders, no paper fills since
-Phase 12, and a carry position never moves a balance.
+A fully serverless scanner that measures three things every minute and writes
+down what it saw: **cross-exchange spot spreads** (the same market on Binance
+and MEXC), **perpetual funding rates** (Bybit, OKX, Gate and KuCoin, all four
+polled on every board) and, since Phase 17, the **dated-futures basis** (OKX's
+quarterly curve against its own spot). Since Phase 15 it also **holds paper
+carry positions**, so the one edge it measures as positive has a realised P&L to
+check its own prediction against. **Nothing is traded** — no orders, no paper
+fills since Phase 12, and a carry position never moves a balance.
+
+`GET /api/report` is the acceptance test for all of it: one read-only endpoint
+that answers "would any of these strategies have made money over the last N
+days" from the rows actually on disk.
 
 Phase 12 deleted the triangular-arbitrage strategy and every paper-execution
 path in the repo. Recorded production data showed the triangular edge was
@@ -87,6 +92,8 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `POST /api/funding/refresh` | Poll every perp venue now, bypassing the 5-minute gate. 200 with `venueErrors` when some venues fail; 502 only when they all do |
 | `GET /api/funding/positions?limit=50` | The paper carry book: open positions, the newest closed ones, and the realised-vs-predicted summary |
 | `POST /api/funding/positions/:id/close` | Close one position by hand (`close_reason = 'manual'`). 404 unknown, **409** already closed |
+| `GET /api/basis` | Newest OKX dated-futures basis board, best net annual first, with `qualifies` judged against the current `funding_min_annual_pct`. `summary` carries the best contract and the contango/backwardation split |
+| `GET /api/report?days=7` | The 7-day profitability report. `days` is **clamped** to `1..7` (the rate tables' retention) and `meta.requestedDays` says what was asked for |
 | `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
@@ -305,9 +312,15 @@ anywhere in the pass lands in `ScanResult.persistError` and costs the
 measurement only; the board it measures is still priced and persisted.
 
 **The decision rule this exists to settle.** A two-leg round trip at 0.1%/leg
-costs `1 - (1 - 0.001)² = 0.2002%` of notional. If the *surviving* nets — not the
-nets at the moment of the skew — never clear that bar, then the cross-exchange
-spread scanner is measuring an artefact and the strategy is **display-only**:
+needs `1/(1 - 0.001)² - 1 = 0.2003%` of gross edge to break even — the gross
+figure at which `evaluateSpread` nets exactly zero, asserted against the engine
+itself in `test/crossExchange.test.ts` and computed by both the dashboard's
+marker and `GET /api/report`. (Earlier revisions of this paragraph quoted
+0.2002% from a differently-derived expression; the three implementations always
+agreed with each other, and now the prose does too.) If the *surviving* nets —
+not the nets at the moment of the skew — never clear that bar, then the
+cross-exchange spread scanner is measuring an artefact and the strategy is
+**display-only**:
 the rows stay (they are the evidence), and no further effort goes into it. That
 verdict needs a soak, not a scan, which is precisely why the columns exist
 rather than an opinion.
@@ -661,6 +674,157 @@ Everything the funding section disclaims still applies, plus:
   not (`docs/profitability-recommendations.md`), but the arithmetic is not
   wired into these rows.
 
+## Dated-futures basis (OKX)
+
+Phase 17, and the strategy with the one property the perp carry above can never
+have: **the return is locked in at entry.**
+
+A perpetual has no expiry, so what it pays depends on funding continuing to
+behave — and `src/engine/funding.ts` opens by naming that as its dominant error
+source, because the venue publishes the rate for the *next* settlement and
+annualising it assumes ~1095 repetitions that mean reversion will not deliver.
+A **dated** future does expire. Buy the asset spot, sell the dated future, hold
+both to settlement, and the future converges to spot by contract. The profit is
+the gap the two were trading at when you opened, and nothing about the market
+between now and then changes it.
+
+```
+days       (expiryTs - nowTs) / 86400000        the hold is not a setting:
+                                                the trade ends when the
+                                                contract does
+basis      (future / spot - 1) x 100           [%, raw premium over spot]
+annual     basis x (365 / days)                [%, simple, not compounded]
+drag       (spotFee x 2 + perpFee x 2)
+             x (365 / days) x 100              [%, the round trip annualised]
+net        annual - drag
+```
+
+Worked example — BTC 90 days out at a 2% premium, `fee_rate` 0.1%,
+`perp_fee_rate` 0.05%:
+
+```
+basis      61200 / 60000 - 1             =  2%
+annual     2 x (365 / 90)                =  8.11111111%
+drag       0.003 x (365 / 90) x 100      =  1.21666667%
+net        8.11111111 - 1.21666667       =  6.89444444%
+```
+
+**The drag is per row, not per board** — the one structural difference from the
+funding table. There the four legs are amortised over `funding_hold_days`, the
+same figure for every row, so ranking by net and ranking by gross give the same
+order. Here they are amortised over *each contract's own remaining life*, so a
+fat near-dated basis routinely ranks below a thin far-dated one. A live OKX
+board makes the point better than any example: on 2026-07-31 the March-2027
+contract's 2.69% premium was worth **+3.67%/yr net** while the one-week
+contract's −0.10% was **−21.62%/yr**, mostly drag.
+
+**What the board contains, and what it does not.** Two subrequests per poll —
+`/api/v5/market/tickers?instType=FUTURES` and the same for `SPOT` — joined on
+the base asset. OKX names a linear dated future `<BASE>-<QUOTE>-<YYMMDD>` and
+settles it at 08:00 UTC on that date. Three shapes ride along on that endpoint
+and only one is kept:
+
+| instId | What it is | Kept |
+|---|---|---|
+| `BTC-USD_UM-260925`, `BTC-USDT-260925` | linear, quoted in the USD unit | **yes** |
+| `BTC-USD-260925` | *inverse*, coin-margined (settles in BTC) | no — its P&L is non-linear in the price, so it is not delta-neutral against a USDT spot leg |
+| `BTC-USD_UM_XPERP-310404` | perpetual-style, nominal 5-year expiry | no — a perp wearing a date; the funding board already prices that trade |
+
+Both linear spellings are accepted because the live board uses `USD_UM` and the
+planning notes for this phase assumed `USDT`: filtering on the assumed one
+returned **zero** contracts. `test/fixtures/okx-futures-tickers.json` is a
+captured live response, not a hand-written stub, which is the only reason that
+was caught before it shipped.
+
+**Honest-model caveats**, on top of everything the carry section disclaims:
+
+- **Margin and liquidation are the big omission**, and bigger here than for a
+  perp carry: the short future needs collateral for *months*, that collateral
+  earns nothing in this model, and a rally large enough to liquidate it before
+  expiry turns a locked-in return into a realised loss. The basis is locked in;
+  being there at settlement is not.
+- **Both legs are marked at the mid** of the book, so no bid/ask spread is
+  charged on entry. The executable basis is worse. Mid on both legs rather than
+  ask-on-spot / bid-on-future because this trade's exit is a settlement at a
+  converged price, not a second round trip — half a spread charged
+  asymmetrically is a worse model than none. When a side of a book is empty the
+  leg falls back to the last trade and the row is stamped
+  `price_source = 'last'` (`*` on the dashboard): a thin far-dated contract can
+  print stale for minutes, and a stale mark is exactly what floats a fake basis
+  to the top of a board sorted by net.
+- **The futures leg is charged `perp_fee_rate`.** OKX quotes one taker schedule
+  for its whole derivatives book, so this is the right order of magnitude, but
+  it is an approximation — made deliberately so this strategy and the perp carry
+  share one fee helper and cannot drift apart.
+- **The USD unit is assumed to be worth one USDT.** A linear OKX future quoted
+  in `USD` is joined to the `<BASE>-USDT` spot market. At any stablecoin peg
+  worth trading that is true to a few basis points; if the peg breaks, every
+  figure on this board is wrong by the size of the break.
+- **No paper positions.** Observation only, exactly as funding was in Phase 10 —
+  the series comes first, and positions on it are future work.
+
+## The 7-day profitability report
+
+`GET /api/report?days=7`. Phase 17, and the acceptance test
+[docs/profitability-recommendations.md](docs/profitability-recommendations.md)
+§6 asks for: after a soak, can this repo say whether *any* of what it measures
+would have made money?
+
+Five sections — `funding`, `carry`, `xchg`, `venueSpreads`, `basis` — plus
+`meta` and an `answers` block that states the three §6 criteria literally:
+
+```jsonc
+"answers": {
+  "realizedVsPredictedCarryErrorPct": -13.0,   // (a) mean realised - predicted
+  "spreadSurvivalRate": 0.6,                   // (b) fraction still positive later
+  "anyStrategyClearedBreakEven": {             // (c) the whole effort's yes/no
+    "funding": true, "carry": true, "xchg": false,
+    "venueSpreads": true, "basis": true
+  }
+}
+```
+
+**Break-even here is a net figure above zero**, not `funding_min_annual_pct`.
+The fee drag has already been subtracted from every one of those percentages, so
+zero *is* the arithmetic; the threshold is a display preference, and each
+section reports its `qualifyingPolls` count separately for whoever wants that
+question instead. The one exception is `xchg`, whose bar is the *gross* two-leg
+fee break-even `(1/(1 − fee)² − 1) × 100` — 0.2003% at 0.1%/leg — because
+`persist_net_pct` re-prices the same round trip and is already net of it.
+
+**Three rules the endpoint keeps.**
+
+1. **Everything is aggregated in SQL.** A week is ~150k funding rows and ~100k
+   spread rows; the reductions are `GROUP BY` queries in `src/db.ts` and what
+   crosses into `src/report.ts` is a handful of already-grouped rows. Nothing
+   loops over a table. The cross-venue section is the interesting case: it
+   recomputes `MAX(annualized_pct) − MIN(annualized_pct)` per `(ts, symbol)`,
+   which is exactly what `rankVenueSpreads` computes for one board — the two are
+   pinned against each other in `test/report.test.ts` rather than left to a
+   comment.
+2. **One fee basis across the whole window.** The funding and cross-exchange
+   figures are recomputed from each row's stored *gross* percentage against
+   today's settings, **not** read from the stored `net_annual_pct`. Rows written
+   before Phase 13 charged the spot taker rate on all four legs — a 4.87% drag
+   against today's 3.65% — and averaging across that boundary would produce a
+   number describing a fee schedule that never existed. `meta.settings` states
+   the basis that was used.
+3. **`null` is "not measured", never zero.** An average of no closed positions
+   is not 0%/yr and a survival rate over no re-priced spreads is not 0%. The
+   `xchg.verdict` string says `not measured` for an empty window rather than
+   `display-only`, because "no evidence yet" and "evidence of nothing" are
+   different claims.
+
+`?days=` is **clamped** to `1..7` rather than rejected: 7 is the retention
+window of `funding_rates` and `basis_rates`, so a longer request could only be
+answered by mixing a 7-day view of those with a 30-day view of the never-pruned
+`opportunities` and `funding_positions`. `meta.requestedDays` reports what was
+asked for beside `meta.days`, so the clamp is visible rather than silent.
+
+It is **not** on the dashboard's 5-second poll — a dozen windowed aggregates
+over the two largest tables would cost more D1 reads than the scanner itself.
+The panel fetches once on load and then only when you press Refresh.
+
 ## Simplifications
 
 - Prices at snapshot best bid/ask; order-book depth, lot-size/notional filters,
@@ -681,6 +845,9 @@ Everything the funding section disclaims still applies, plus:
   soak has produced one. See the section above.
 - Paper carry positions accrue funding and nothing else: no basis, no
   mark-to-market, no margin, and no balance is ever moved. See the section above.
+- Dated-futures basis is observation only: both legs marked at the mid, the
+  futures leg charged the perp taker rate, and margin — which a months-long short
+  future genuinely needs — not modelled at all. See the section above.
 - `balances`, `trades` and the `triangular` rows in `opportunities`/`scans` are
   a **frozen historical record** of the fill era. They are served unchanged and
   never added to.

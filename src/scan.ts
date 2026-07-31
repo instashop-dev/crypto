@@ -25,6 +25,7 @@
  * and writes only to columns that were NULL. See
  * {@link measureSpreadPersistence}.
  */
+import { getBasisFetcher, type BasisFetcher } from "./basis";
 import { getDualSnapshot, discoverPairs, type DualSnapshot } from "./binance";
 import {
   ASSET_UNIVERSE,
@@ -38,6 +39,7 @@ import {
 } from "./config";
 import {
   accrueFundingPosition,
+  BASIS_POLL_TS_KEY,
   closeFundingPosition,
   ensureSeeded,
   finalizeScan,
@@ -48,6 +50,7 @@ import {
   getPairs,
   getRawSetting,
   getSettings,
+  insertBasisRates,
   insertFundingPosition,
   insertFundingRates,
   insertOpportunities,
@@ -62,6 +65,7 @@ import {
   setRawSetting,
   deleteRawSetting,
   toTaxPolicy,
+  type BasisRateInput,
   type FundingPosition,
   type FundingRate,
   type FundingRateInput,
@@ -75,6 +79,7 @@ import {
   CARRY_STALE_CLOSE_MS,
   evaluateSpread,
   parseSpreadLabel,
+  rankBasisOpportunities,
   rankFundingOpportunities,
   rankSpreads,
   realizedFigures,
@@ -230,6 +235,20 @@ export interface ScanResult {
    * whoever reads it to the wrong upstream.
    */
   carryError?: string;
+  /** Dated-futures basis rows persisted this scan; `0` when the poll was
+   *  skipped or the board was empty. */
+  basisCount: number;
+  bestBasisNetAnnualPct: number | null;
+  /**
+   * Why the basis poll produced nothing. Its own field for the same reason
+   * every other strategy has one: a dead OKX futures endpoint is not a failed
+   * scan, a failed funding poll, or a failed carry pass, and reporting it as
+   * any of those would send whoever reads it to the wrong upstream.
+   */
+  basisError?: string;
+  /** Set when the basis poll gate declined: the board is younger than the
+   *  interval. */
+  basisSkipped?: boolean;
 }
 
 /** Injection seams. Production passes nothing; tests override the clock. */
@@ -249,6 +268,11 @@ export interface ScanDeps {
   fundingPollIntervalMs?: number;
   /** Override the funding-interval cache TTL. */
   fundingIntervalTtlMs?: number;
+  /** Basis-board seam; defaults to the module-level fetcher in `./basis`. */
+  fetchBasis?: BasisFetcher;
+  /** Override the basis poll gate. Its own knob, not a reuse of the funding
+   *  one, so a test can hold one poll's cadence still while moving the other's. */
+  basisPollIntervalMs?: number;
 }
 
 function errorMessage(err: unknown): string {
@@ -531,6 +555,89 @@ export async function pollFundingRates(
     ts: snapshot.ts,
     count: rows.length,
     bestNetAnnualPct: kept.length > 0 ? kept[0].netAnnualPct : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dated-futures basis
+// ---------------------------------------------------------------------------
+
+/** What one basis poll produced. */
+export interface BasisPollResult {
+  ts: number;
+  /** Rows persisted. `0` for a board OKX served with nothing priceable on it. */
+  count: number;
+  /** Contracts the venue quoted, before pricing dropped any of them. */
+  quoted: number;
+  bestNetAnnualPct: number | null;
+}
+
+/**
+ * Poll the dated-futures basis board once and persist it. **Unconditional** —
+ * the caller owns the "is it time yet" decision, exactly as
+ * {@link pollFundingRates} does.
+ *
+ * Throws when the venue could not be reached or answered an error envelope, so
+ * the scan can record it in `basisError` and a route can answer 502. An *empty*
+ * board is not a throw: OKX listing no linear dated futures at all is a real
+ * state of the world (see the instId table in `src/basis.ts`), and it has to be
+ * distinguishable from an outage.
+ *
+ * Every priced contract is stored, including backwardation and rows below
+ * `funding_min_annual_pct`: the threshold is a display judgement made at read
+ * time, and the whole point of an observation-only board is the series.
+ *
+ * **No holding-period setting is consulted.** A basis position ends when its
+ * contract settles, so the fee drag is amortised over each row's own
+ * `daysToExpiry` — see `src/engine/basis.ts`. `funding_hold_days` is a perp-carry
+ * assumption and would be a wrong answer here.
+ *
+ * Takes no clock parameter, unlike {@link pollFundingRates}: everything here is
+ * timed off the snapshot's own `ts`, and there is no cache with a TTL for the
+ * scan's clock to be compared against.
+ */
+export async function pollBasisRates(
+  env: Env,
+  scanId: number | null,
+  deps: ScanDeps = {},
+): Promise<BasisPollResult> {
+  const db = env.DB;
+  const settings = await getSettings(db);
+
+  const snapshot = await (deps.fetchBasis ?? getBasisFetcher())(env);
+  const ranked = rankBasisOpportunities(
+    snapshot.quotes,
+    settings.fee_rate,
+    settings.perp_fee_rate,
+    // The snapshot's own clock, not the scan's: `daysToExpiry` is measured from
+    // the moment the prices were taken, so the row's divisor and its numerator
+    // sit on one timeline.
+    snapshot.ts,
+  );
+
+  const rows: BasisRateInput[] = ranked.map((r) => ({
+    venue: r.quote.venue,
+    symbol: r.symbol,
+    instrument: r.instrument,
+    expiryTs: r.expiryTs,
+    daysToExpiry: r.daysToExpiry,
+    spotPrice: r.spotPrice,
+    futurePrice: r.futurePrice,
+    // Carried from the venue quote, not derived: whether either leg fell back
+    // to a last trade is a fact about the observation and cannot be recovered
+    // from the prices once the board is gone.
+    priceSource: r.quote.priceSource,
+    basisPct: r.basisPct,
+    annualizedPct: r.annualizedPct,
+    netAnnualPct: r.netAnnualPct,
+  }));
+  await insertBasisRates(db, scanId, rows, snapshot.ts);
+
+  return {
+    ts: snapshot.ts,
+    count: rows.length,
+    quoted: snapshot.quotes.length,
+    bestNetAnnualPct: ranked.length > 0 ? ranked[0].netAnnualPct : null,
   };
 }
 
@@ -920,6 +1027,8 @@ export async function runScan(
       positionsOpened: 0,
       positionsClosed: 0,
       carryAccruedUsdt: 0,
+      basisCount: 0,
+      bestBasisNetAnnualPct: null,
     };
   }
 
@@ -944,6 +1053,10 @@ export async function runScan(
   let positionsClosed = 0;
   let carryAccruedUsdt = 0;
   let carryError: string | null = null;
+  let basisCount = 0;
+  let bestBasisNetAnnualPct: number | null = null;
+  let basisError: string | null = null;
+  let basisSkipped = false;
 
   try {
     const settings = await getSettings(db);
@@ -1152,6 +1265,51 @@ export async function runScan(
     console.warn(`funding poll failed: ${fundingError}`);
   }
 
+  // -- dated-futures basis --------------------------------------------------
+  //
+  // A fourth strategy in a fourth `catch`, on exactly the terms the three above
+  // it have. It sits *outside* the funding try/catch, not at the end of it,
+  // because it shares nothing with the funding poll but a venue: it needs no
+  // funding board, no cadence cache and no pairs, so a scan whose funding poll
+  // died can still record a perfectly good basis board — and a basis outage
+  // cannot cost the funding board, the carry pass or the spread half a single
+  // row. Nothing here can ever reach `scans.error`; migration 0007 gives the
+  // `scans` row no column for it, deliberately.
+  try {
+    const pollMs = deps.basisPollIntervalMs ?? FUNDING_POLL_INTERVAL_MS;
+    // Its own marker, read exactly as the funding gate reads its own, and for
+    // the same reasons: a missing or unparseable value forces the poll (a cold
+    // database must fill the board immediately rather than wait out an interval
+    // it has no baseline for), and the marker is written only *after* the poll
+    // returns, so a poll that threw is retried by the next scan instead of
+    // holding the gate shut for a full interval.
+    //
+    // Separate from `funding_last_poll_ts` because the two polls fail
+    // independently: sharing one marker would mean a failed funding poll
+    // silently re-polling the basis board a minute later, or the reverse.
+    const marker = await getRawSetting(db, BASIS_POLL_TS_KEY);
+    const parsed = marker === null ? Number.NaN : Number(marker);
+    const lastPollTs = Number.isFinite(parsed) ? parsed : null;
+    if (lastPollTs !== null && startedAt - lastPollTs < pollMs) {
+      basisSkipped = true;
+    } else {
+      const poll = await pollBasisRates(env, scanId, deps);
+      await setRawSetting(db, BASIS_POLL_TS_KEY, String(startedAt));
+      basisCount = poll.count;
+      bestBasisNetAnnualPct = poll.bestNetAnnualPct;
+      // A board the venue served with nothing on it is not an error, and it is
+      // not silence either: it is the state of the world the day OKX lists no
+      // linear dated futures. Logged so it is visible in `wrangler tail`
+      // without having to notice a zero in a JSON body.
+      if (poll.quoted === 0) {
+        console.warn("basis: okx quoted no priceable linear dated futures");
+      }
+    }
+  } catch (err) {
+    basisError = errorMessage(err);
+    console.warn(`basis poll failed: ${basisError}`);
+  }
+
   // Best-effort cleanup: a failed unlock must not mask the scan's own error,
   // and the TTL is the backstop if it does fail.
   try {
@@ -1197,5 +1355,9 @@ export async function runScan(
     positionsClosed,
     carryAccruedUsdt,
     ...(carryError != null ? { carryError } : {}),
+    basisCount,
+    bestBasisNetAnnualPct,
+    ...(basisError != null ? { basisError } : {}),
+    ...(basisSkipped ? { basisSkipped } : {}),
   };
 }
