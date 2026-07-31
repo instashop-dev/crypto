@@ -3,9 +3,10 @@
 A fully serverless scanner that measures two things every minute and writes down
 what it saw: **cross-exchange spot spreads** (the same market on Binance and
 MEXC) and **perpetual funding rates** (Bybit, OKX, Gate and KuCoin, all four
-polled on every board). **Nothing is traded, and
-nothing is simulated as traded** — no orders, and since Phase 12 no paper fills
-either.
+polled on every board). Since Phase 15 it also **holds paper carry positions**,
+so the one edge it measures as positive has a realised P&L to check its own
+prediction against. **Nothing is traded** — no orders, no paper fills since
+Phase 12, and a carry position never moves a balance.
 
 Phase 12 deleted the triangular-arbitrage strategy and every paper-execution
 path in the repo. Recorded production data showed the triangular edge was
@@ -40,17 +41,25 @@ POST /api/scan ──────────►    │
                       of 4 legs of fees over the assumed holding period → rank →
                       persist the majors + each venue's best 20 and worst 5
                               │
+        [carry]       accrue every open paper position from the rows just
+                      written → close on hold/exit/staleness → open up to
+                      funding_max_positions from the fresh board (zero extra
+                      subrequests; never touches balances)
+                              │
                               ▼
-        D1 (SQLite): pairs · scans · opportunities · funding_rates · settings
+        D1 (SQLite): pairs · scans · opportunities · funding_rates ·
+                     funding_positions · settings
                      (+ balances · trades — historical, read-only)
                               │
                               ▼
         Dashboard (vanilla JS, Workers Assets) — 5s polling
 ```
 
-Both thresholds (`xchg_min_profit_pct`, `funding_min_annual_pct`) are **display
-flags**, applied at read time. Every priced row is persisted whatever they say,
-because a threshold applied at write time throws away the measurement.
+Neither threshold (`xchg_min_profit_pct`, `funding_min_annual_pct`) is a
+**write-time gate**: every priced row is persisted whatever they say, because a
+threshold applied at write time throws away the measurement. Both are applied at
+read time — and since Phase 15 `funding_min_annual_pct` additionally selects
+which board rows a paper carry position may be opened on.
 
 ### Why WebSocket?
 
@@ -76,6 +85,8 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/funding` | Newest funding board across every venue, best net carry first, with `qualifies` judged against the current threshold. `venues` reports each venue's share; `venue` names the source of the top row |
 | `GET /api/funding/history?symbol=BTC&limit=100` | One symbol's rate series, newest first (limit clamped to 500). `&venue=gate` narrows it to one venue — a symbol now has a row per venue per poll; an unknown venue is a 400 |
 | `POST /api/funding/refresh` | Poll every perp venue now, bypassing the 5-minute gate. 200 with `venueErrors` when some venues fail; 502 only when they all do |
+| `GET /api/funding/positions?limit=50` | The paper carry book: open positions, the newest closed ones, and the realised-vs-predicted summary |
+| `POST /api/funding/positions/:id/close` | Close one position by hand (`close_reason = 'manual'`). 404 unknown, **409** already closed |
 | `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
@@ -91,8 +102,12 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `tax_rate` | `0.3` | `0`–`0.5` | Section 115BBH rate on gains. Use `0.312` to include the 4% cess. |
 | `xchg_min_profit_pct` | `0.05` | any | Net % a spread must clear to be flagged `qualifies`. **Display only** — every priced row is persisted regardless. |
 | `xchg_enabled` | `1` | `0` or `1` | Scan cross-exchange spreads. `0` leaves the scan polling funding alone: no snapshot is fetched at all. |
-| `funding_min_annual_pct` | `5` | any | Net annualised % a carry must clear to be flagged `qualifies`. **Display only**, same as above. |
-| `funding_hold_days` | `30` | `0 < d ≤ 3650` | Days a carry is assumed held, used to amortise the 4 legs of fees (2 spot + 2 perp). Changing it re-prices future rows only. |
+| `funding_min_annual_pct` | `5` | any | Net annualised % a carry must clear to be flagged `qualifies` **and to have a paper position opened on it**. Never a write-time gate: every priced row is persisted regardless. |
+| `funding_hold_days` | `30` | `0 < d ≤ 3650` | Days a carry is assumed held, used to amortise the 4 legs of fees (2 spot + 2 perp). Changing it re-prices future rows only, and is also the `max_hold` close rule. |
+| `funding_positions_enabled` | `1` | `0` or `1` | Open new paper carry positions. `0` still accrues and closes the ones already open — see below. |
+| `funding_position_size_usdt` | `1000` | `> 0` | Notional of each leg of a paper carry. Never drawn from `balances`. |
+| `funding_max_positions` | `3` | `1`–`20`, whole | How many carry positions may be open at once. |
+| `funding_exit_annual_pct` | `0` | any | Net annualised % below which an open carry is closed. Deliberately lower than `funding_min_annual_pct`. |
 
 `initial_usdt` is immutable — it is the denominator of every P&L figure ever
 reported, so moving it would rewrite history rather than change behaviour.
@@ -106,7 +121,7 @@ table are simply never read — no migration, destructive or otherwise.
 
 ```bash
 npm install
-npm test                                        # 271 tests: pure engine math +
+npm test                                        # 385 tests: pure engine math +
                                                 # workerd integration (in-memory D1,
                                                 # mocked network)
 npx wrangler d1 migrations apply crypto-arb --local
@@ -376,27 +391,35 @@ the board (a live Gate capture had `LA_USDT` at roughly -1548%/yr) was
 systematically the one row that could never be persisted.
 
 **Cadence and retention.** The board is polled at most every 5 minutes, gated on
-`MAX(ts)` in `funding_rates` — funding settles every 8 hours, so a minutely scan
-has nothing to learn by asking every minute. Rows are kept for **7 days**, and
+the scan's own `funding_last_poll_ts` settings row — funding settles every 8
+hours, so a minutely scan has nothing to learn by asking every minute. The gate
+is deliberately *not* `MAX(ts)` in `funding_rates`, which it used to be:
+`POST /api/funding/refresh` writes that table too, so a refresh hit more often
+than the interval kept the gate satisfied for ever and the scheduled poll — and
+with it the carry pass, which only runs behind a scan's own poll — never came
+due again. Only the scan writes the marker, and only after a poll has returned.
+Rows are kept for **7 days**, and
 the prune rides in the last `batch()` of the insert, after every row has landed.
 Inserts are chunked at 50 statements per batch (D1 caps statements per batch, and
 a four-venue board is ~144 rows), so a board is no longer written as one
 transaction: a reader polling mid-write can see a *partial* board — never a
 mixture of two polls, since every row of a poll shares one timestamp. A chunk
 that *fails* part-way is worse than that: the chunks already written carry the
-new `ts`, so the 5-minute poll gate declines to retry and `/api/funding` serves
-the truncated board for the rest of the interval. The scan reports the failure
-in `fundingError`; the board does not.
-`POST /api/funding/refresh` bypasses the gate and writes rows with
-`scan_id = NULL`.
+new `ts`, so `/api/funding` serves the truncated board until the next poll
+replaces it. That is the *next scan*, not the end of the interval — the marker
+is only written once a poll returns, so a poll that threw is retried
+immediately. The scan reports the failure in `fundingError`; the board does not.
+`POST /api/funding/refresh` bypasses the gate entirely, writes rows with
+`scan_id = NULL`, and does not touch the marker: it can refresh the board as
+often as you like without moving the scanner's cadence or the carry book.
 
-**No positions are opened**, on purpose. A carry is held for days, and the
-paper-execution model this repo used to have was atomic — a round trip opened
-and closed inside one snapshot, against one `balances` row. Booking a carry
-against that would have reported a P&L nobody could reconcile, so migration
-`0004` deliberately adds no positions table. That model is gone now (Phase 12),
-and a later phase will add paper carry positions with a P&L of their own; the
-schema is shaped so that needs no rewrite of these rows.
+**Positions are held on paper since Phase 15** — see the section below. They are
+recorded in `funding_positions` (migration `0005`) and **never** booked against
+`balances`: a carry is held for days, and the paper-execution model this repo
+used to have was atomic — a round trip opened and closed inside one snapshot,
+against one `balances` row. Booking a carry against that would have reported a
+P&L nobody could reconcile, which is why migration `0004` deliberately added no
+positions table and why `0005` adds one that touches nothing `0004` wrote.
 
 **Disclaimers**, all documented in `src/engine/funding.ts`:
 
@@ -419,6 +442,113 @@ schema is shaped so that needs no rewrite of these rows.
 - **Simple returns, 365-day year.** Funding is assumed withdrawn, not
   reinvested; compounding would raise every figure above.
 
+## Paper carry positions (realised vs predicted)
+
+Phase 15. The board above says what a carry *would* pay if the next published
+rate repeated ~1095 times a year. This section holds positions so the repo can
+say what one *did* pay — the same claim, measured. The pair to read is
+`predicted_net_annual_pct` (what the entry quote promised) against
+`realized_annual_pct` (what the position actually earned, net of one round trip,
+annualised over the days it was really held). Their difference is the
+extrapolation error `src/engine/funding.ts` names as its dominant unknown.
+
+**Nothing is traded and nothing moves a balance.** `funding_positions` is a
+ledger beside the portfolio, not inside it: `GET /api/portfolio` reports a
+`carry` block of its own and the spot `equityUsdt` keeps the exact meaning it
+has had since the fill era ended. Add them at your own risk; the repo does not.
+
+### Lifecycle
+
+One pass runs on every **scan's** funding poll, inside the funding `try` and in a
+`catch` of its own, **after** the board has been persisted — so a bug in the
+accrual costs the carry pass and never the board rows, and it lands in
+`ScanResult.carryError` rather than in `fundingError` or `scans.error`. It costs
+zero subrequests: it reads only rows the poll just wrote.
+`POST /api/funding/refresh` deliberately does **not** advance the book — it is a
+data refresh, and a lifecycle anyone could drive by POSTing repeatedly would let
+a caller open and close positions at will. The order is accrue → close → open,
+and each step is that way round for a reason:
+
+1. **Accrue.** For every open position, every settlement boundary in
+   `(last_accrual_ts, now]` is priced by the newest `funding_rates` row for its
+   `(venue, symbol)` at or before that boundary and no more than 24h older. The
+   grid is anchored to the position's own `last_accrual_ts` once it has one, and
+   before that to the venue's published `next_funding_ts`, falling back to whole
+   multiples of the interval since the epoch. The position's own boundary comes
+   first because the anchor is re-read every pass: a venue that publishes
+   `nextFundingTime` on one poll and omits it on the next would otherwise shift
+   the grid's *phase* under a running position and double-count or drop a
+   settlement. It is never anchored to the position's *entry* time, which would
+   give every position a private schedule. The settlement interval is likewise
+   snapshotted at entry, so a mid-hold cadence change accrues on a stale grid
+   (documented in `src/engine/carry.ts`). **A boundary with no observation is skipped, not
+   estimated**, and `last_accrual_ts` advances past it: an unobserved settlement
+   is missing data, and inventing a payment for it is the one error that would
+   flatter the result without leaving a trace. `accrual_count` is stored so the
+   hole stays visible.
+2. **Close.** In precedence order: `max_hold` (`funding_hold_days` elapsed — the
+   horizon the fee drag was amortised over), `stale_data` (nothing fresh for that
+   contract in 24h), `rate_below_exit` (current net annual below
+   `funding_exit_annual_pct`). Staleness outranks the threshold on purpose: a
+   percentage carried by a two-day-old row is not a current judgement, and
+   letting it fire `rate_below_exit` would label a data outage as a rate
+   collapse. Accrual runs *first* so an exit never forfeits settlements the
+   scanner did observe.
+3. **Open.** Up to `funding_max_positions`, best net carry first, from the board
+   just written: the row must clear `funding_min_annual_pct`, must not duplicate
+   an open `(venue, symbol)`, and **must carry `interval_source = 'api'`.**
+   Nothing is ever opened on an assumed cadence — the annualised figure scales
+   linearly with the interval, so a contract that really settles hourly is
+   under-reported 8x, which is tolerable for a board that is only read and not
+   tolerable as a position's accrual grid.
+
+`funding_positions_enabled = 0` gates **opening only**. Turning it off must not
+strand an open book with a P&L frozen mid-flight, so existing positions go on
+accruing and go on being closed.
+
+Every entry figure is snapshotted — notional, both taker rates, the interval, the
+rate and both percentages — so retuning a setting can never re-price a position
+that is already running. Closing is idempotent at the database (`WHERE status =
+'open'`), which is what makes a second `POST …/close` a 409 rather than a
+silently rewritten realised P&L.
+
+```
+accrued    Σ over observed boundaries of  rate_at_boundary x notional
+fees       notional x (2 x spot_fee_rate + 2 x perp_fee_rate)   [entry snapshot]
+realised   accrued - fees                                        [USDT, signed]
+realised%  (realised / notional) x (365 / actual_hold_days) x 100
+```
+
+Worked example — 1000 USDT a leg, 0.0001 per 8h collected for 30 days (90
+settlements), 0.1% spot / 0.05% perp: `accrued 9.00 − fees 3.00 = 6.00 USDT`,
+annualised `7.30%` — the same 7.30% the board predicts for that quote, arrived at
+from the other end. `test/carry-math.test.ts` asserts both.
+
+### Honest-model caveats
+
+Everything the funding section disclaims still applies, plus:
+
+- **Basis and mark-to-market are not modelled at all.** Entry and exit are
+  assumed at the same spot price *and* the same perp price, so the legs cancel
+  exactly and the whole P&L is the funding stream less fees. In reality basis
+  convergence is where a carry makes or loses most of its non-funding P&L. **A
+  realised figure here is the funding result, not the trade's.**
+- **No margin, no collateral yield, no liquidation, no slippage.** The short perp
+  leg needs collateral it never posts, and an adverse move large enough to
+  liquidate it is not simulated.
+- **Accrual is only as complete as the data.** A boundary crossed while the
+  scanner was down pays nothing at all rather than an estimate, so a realised
+  figure from a week with an outage is biased *low* — `accrual_count` against
+  elapsed time is how you tell.
+- **`realized_annual_pct` is not a forecast either.** A position closed after
+  three days annualises a three-day result by a factor of 122; it says what
+  happened over those days, scaled, not what a year would look like.
+- **No taxes are applied to carry.** The India-mode overlay prices spread legs
+  only. Four legs amortised over a multi-week hold is precisely the shape that
+  survives a turnover-based withholding where the minute-scale strategies did
+  not (`docs/profitability-recommendations.md`), but the arithmetic is not
+  wired into these rows.
+
 ## Simplifications
 
 - Prices at snapshot best bid/ask; order-book depth, lot-size/notional filters,
@@ -431,6 +561,8 @@ schema is shaped so that needs no rewrite of these rows.
   withdrawal fee, no latency between the two legs. See the section above.
 - Funding carry is scanned and recorded; its annualisation extrapolates a single
   published rate. See the section above.
+- Paper carry positions accrue funding and nothing else: no basis, no
+  mark-to-market, no margin, and no balance is ever moved. See the section above.
 - `balances`, `trades` and the `triangular` rows in `opportunities`/`scans` are
   a **frozen historical record** of the fill era. They are served unchanged and
   never added to.

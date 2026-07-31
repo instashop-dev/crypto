@@ -4,12 +4,19 @@
  * so manual and scheduled scans can never drift apart.
  *
  * **Nothing here executes.** Phase 12 removed the paper-fill machinery along
- * with the triangular strategy: a scan now ranks cross-exchange spreads, polls
- * the funding board, and writes both down. No balance moves, no trade row is
+ * with the triangular strategy: a scan ranks cross-exchange spreads, polls the
+ * funding board, and writes both down. No balance moves, no trade row is
  * inserted, and `scans.executed_count` keeps whatever the schema default gives
  * it. The reasoning is recorded in `docs/profitability-recommendations.md` —
  * the measured edges never survived fees, and in india mode never survived the
  * withholding either.
+ *
+ * Phase 15 adds a fourth step, and it does not change that sentence. The carry
+ * pass at the end of the funding block opens, accrues and closes *paper*
+ * positions in `funding_positions`; it places no order, moves no balance and
+ * writes no trade. It is a ledger of what the funding board would have paid,
+ * kept so the extrapolation the board reports can be checked against an
+ * outcome. See {@link runCarryCycle}.
  */
 import { getDualSnapshot, discoverPairs, type DualSnapshot } from "./binance";
 import {
@@ -23,30 +30,47 @@ import {
   STRATEGY_CROSS_EXCHANGE,
 } from "./config";
 import {
+  accrueFundingPosition,
+  closeFundingPosition,
   ensureSeeded,
   finalizeScan,
   getFundingIntervals,
-  getLatestFundingTs,
+  FUNDING_POLL_TS_KEY,
+  getFundingRateAt,
+  getLatestFundingRateFor,
   getPairs,
   getRawSetting,
   getSettings,
+  insertFundingPosition,
   insertFundingRates,
   insertOpportunities,
   insertScan,
+  listLatestFundingRates,
+  listOpenFundingPositions,
   replacePairs,
   SCAN_LOCK_KEY,
   setFundingIntervals,
   setRawSetting,
   deleteRawSetting,
   toTaxPolicy,
+  type FundingPosition,
+  type FundingRate,
   type FundingRateInput,
   type OpportunityInput,
   type PairRow,
+  type Settings,
 } from "./db";
 import {
+  accrueAmount,
+  CARRY_STALE_CLOSE_MS,
   rankFundingOpportunities,
   rankSpreads,
+  realizedFigures,
+  round8,
+  settlementBoundaries,
+  shouldClose,
   spreadQuoteTax,
+  type CarryCloseReason,
   type VenueBook,
 } from "./engine";
 import {
@@ -116,6 +140,19 @@ export interface ScanResult {
   fundingError?: string;
   /** Set when the poll gate declined: the board is younger than the interval. */
   fundingSkipped?: boolean;
+  /** Paper carry positions opened this scan; `0` when the strategy is off. */
+  positionsOpened: number;
+  /** Paper carry positions closed this scan, for any reason. */
+  positionsClosed: number;
+  /** Funding accrued to open positions this scan, in USDT. Signed. */
+  carryAccruedUsdt: number;
+  /**
+   * Why the carry pass produced nothing. Its own field, never {@link error} and
+   * never {@link fundingError}: the board had already landed by the time carry
+   * ran, and reporting a bug in the accrual as a dead perp venue would send
+   * whoever reads it to the wrong upstream.
+   */
+  carryError?: string;
 }
 
 /** Injection seams. Production passes nothing; tests override the clock. */
@@ -331,6 +368,355 @@ export async function pollFundingRates(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Paper carry positions
+// ---------------------------------------------------------------------------
+
+/** What one carry pass did. Every field is additive on {@link ScanResult}. */
+export interface CarryCycleResult {
+  positionsOpened: number;
+  positionsClosed: number;
+  /** Funding accrued to open positions this pass, in USDT. Signed. */
+  accruedUsdt: number;
+  /**
+   * Settlement boundaries that crossed without being paid, for any reason —
+   * the sum of the two counts below, kept because "how complete is this
+   * position's accrual" is one question.
+   */
+  skippedSettlements: number;
+  /**
+   * Boundaries with **no rate row at all** within
+   * {@link CARRY_STALE_CLOSE_MS} before them: the scanner was down, the venue
+   * was unreachable, or the contract fell off a capped board. A coverage gap.
+   */
+  skippedNoRate: number;
+  /**
+   * Boundaries that *had* a row which could not price a payment — a rate whose
+   * magnitude is 1 or more, i.e. a mis-decoded field (see {@link accrueAmount}).
+   * Counted apart from the gap above because it is a different failure: the
+   * observation exists and is wrong, which is a parser bug to chase rather than
+   * an outage to wait out.
+   */
+  skippedUnusableRate: number;
+}
+
+/**
+ * Close one position and write its realised figures.
+ *
+ * Shared by the scanner's close rules and by
+ * `POST /api/funding/positions/:id/close`, so a manual close and an automatic
+ * one produce the same arithmetic and differ only in `close_reason`.
+ *
+ * Returns `false` when the position was already closed — the `WHERE status =
+ * 'open'` guard in {@link closeFundingPosition} — so the route can answer 409
+ * instead of overwriting a realised P&L.
+ *
+ * A position whose figures cannot be computed at all (an unusable stored fee
+ * rate, a zero notional) is still **closed**, with NULL realised columns: the
+ * alternative is a position that can never be closed by any means, and NULL
+ * here already means "no realised figure", which is the truth.
+ */
+export async function closeCarryPosition(
+  db: D1Database,
+  position: FundingPosition,
+  reason: CarryCloseReason,
+  closeTs: number,
+): Promise<boolean> {
+  const figures = realizedFigures(
+    {
+      entryTs: position.entryTs,
+      notionalUsdt: position.notionalUsdt,
+      accruedFundingUsdt: position.accruedFundingUsdt,
+      spotFeeRate: position.spotFeeRate,
+      perpFeeRate: position.perpFeeRate,
+    },
+    closeTs,
+  );
+
+  return closeFundingPosition(db, position.id, {
+    closeTs,
+    closeReason: reason,
+    realizedPnlUsdt: figures?.realizedPnlUsdt ?? null,
+    realizedAnnualPct: figures?.realizedAnnualPct ?? null,
+  });
+}
+
+/**
+ * Accrue one position from the rate rows already on disk.
+ *
+ * Every settlement boundary in `(lastAccrual, now]` is priced by the newest
+ * persisted row for the position's `(venue, symbol)` at or before it, and no
+ * older than {@link CARRY_STALE_CLOSE_MS}. A boundary with no such row is
+ * **skipped**, not estimated: an unobserved settlement is missing data, and the
+ * hole stays visible as the gap between `accrual_count` and elapsed time.
+ *
+ * `last_accrual_ts` advances to the newest boundary crossed even when some of
+ * them were skipped, so a hole is never re-walked on the next poll — the rows
+ * that would have priced it are exactly the rows that do not exist.
+ *
+ * **The grid's anchor is the position's own `last_accrual_ts` once it has one**,
+ * and only falls back to the venue's published `next_funding_ts` (and then to
+ * the epoch) for a position that has never accrued. That order matters because
+ * the anchor is re-read on every pass: a venue that publishes `nextFundingTime`
+ * on one poll, omits it on the next and publishes a shifted one after that would
+ * otherwise move the grid's *phase* under a running position, which double-counts
+ * a settlement or drops one — the boundary the last pass stopped at is no longer
+ * on the grid the next pass computes. `last_accrual_ts` is itself always a grid
+ * point once set, so anchoring to it reproduces whichever grid the position has
+ * been accruing on and the phase can no longer drift. A first pass still adopts
+ * the venue's published schedule, which is the one thing that anchor is for.
+ *
+ * Zero D1 writes and zero network calls when nothing crossed, which is the
+ * common case: boundaries are 8 hours apart and this runs every 5 minutes.
+ */
+async function accruePosition(
+  db: D1Database,
+  position: FundingPosition,
+  latest: { ts: number; nextFundingTs: number | null } | null,
+  nowTs: number,
+): Promise<{
+  position: FundingPosition;
+  accrued: number;
+  skippedNoRate: number;
+  skippedUnusableRate: number;
+  /**
+   * Whether the accrual was actually written. `false` means the guarded
+   * `UPDATE … WHERE status = 'open'` matched nothing — the position was closed
+   * between the read at the top of the pass and this write — so nothing was
+   * booked and nothing may be counted.
+   */
+  applied: boolean;
+}> {
+  const idle = {
+    position,
+    accrued: 0,
+    skippedNoRate: 0,
+    skippedUnusableRate: 0,
+    applied: true,
+  };
+
+  const from = position.lastAccrualTs ?? position.entryTs;
+  const boundaries = settlementBoundaries(
+    from,
+    nowTs,
+    position.intervalMinutes,
+    position.lastAccrualTs ?? latest?.nextFundingTs ?? null,
+  );
+  if (boundaries.length === 0) return idle;
+
+  let accrued = 0;
+  let counted = 0;
+  let skippedNoRate = 0;
+  let skippedUnusableRate = 0;
+
+  for (const boundary of boundaries) {
+    const row = await getFundingRateAt(
+      db,
+      position.venue,
+      position.symbol,
+      boundary,
+      boundary - CARRY_STALE_CLOSE_MS,
+    );
+    if (row === null) {
+      skippedNoRate++;
+      continue;
+    }
+    const amount = accrueAmount(row.rate, position.notionalUsdt, 1);
+    if (amount === null) {
+      // A row exists and cannot price a payment: a rate of 100% or more per
+      // settlement is a mis-decoded field, not a market. Counted apart from the
+      // no-row case so the warn line can say which of the two happened.
+      skippedUnusableRate++;
+      continue;
+    }
+    accrued += amount;
+    counted++;
+  }
+
+  const lastBoundary = boundaries[boundaries.length - 1];
+  const updated: FundingPosition = {
+    ...position,
+    accruedFundingUsdt: round8(position.accruedFundingUsdt + accrued),
+    accrualCount: position.accrualCount + counted,
+    lastAccrualTs: lastBoundary,
+  };
+  const applied = await accrueFundingPosition(
+    db,
+    updated.id,
+    updated.accruedFundingUsdt,
+    updated.accrualCount,
+    lastBoundary,
+  );
+  // The write is guarded on `status = 'open'`, so a position closed by the
+  // manual route mid-pass books nothing at all. Reporting the in-memory sum
+  // anyway would put USDT in `carryAccruedUsdt` that no row anywhere holds.
+  if (!applied) return { ...idle, applied: false };
+
+  return {
+    position: updated,
+    accrued: round8(accrued),
+    skippedNoRate,
+    skippedUnusableRate,
+    applied: true,
+  };
+}
+
+/**
+ * Decide which board rows are worth opening a position on.
+ *
+ * Three filters, and the third is the one worth reading twice:
+ *
+ * - the net annual carry clears `funding_min_annual_pct` (the same threshold the
+ *   dashboard flags rows with — a position is opened on exactly what the board
+ *   said qualified);
+ * - no position is already open on that `(venue, symbol)`, so the book measures
+ *   several contracts rather than one contract several times;
+ * - **the settlement cadence was published, not assumed.** A row tagged
+ *   `interval_source = 'assumed'` has an annualised figure derived from a
+ *   guessed 8 hours, and a contract that really settles hourly is under-reported
+ *   by 8x — the guess is tolerable for a board that is only ever *read*, and not
+ *   tolerable as the basis for a position whose accrual grid is that same
+ *   interval. Nothing is ever opened on a guess.
+ */
+function carryCandidates(
+  board: FundingRate[],
+  openPositions: FundingPosition[],
+  minAnnualPct: number,
+): FundingRate[] {
+  const held = new Set(openPositions.map((p) => `${p.venue}\u0000${p.symbol}`));
+  return board.filter(
+    (row) =>
+      row.intervalSource === "api" &&
+      Number.isFinite(row.netAnnualPct) &&
+      row.netAnnualPct >= minAnnualPct &&
+      !held.has(`${row.venue}\u0000${row.symbol}`),
+  );
+}
+
+/**
+ * One carry pass: accrue, then close, then open. In that order, and the order is
+ * load-bearing.
+ *
+ * - **Accrue first** so a position that is about to be closed is paid for the
+ *   settlements it actually saw. Closing first would silently forfeit up to a
+ *   whole interval of funding on every exit and bias every realised figure
+ *   downwards.
+ * - **Close before opening** so a slot freed this poll can be refilled this
+ *   poll, rather than leaving the book a position short until the next one.
+ * - **Open last** so the board rows a position is opened on are the ones just
+ *   persisted, and so a position opened now cannot be accrued or closed in the
+ *   same pass it was created in.
+ *
+ * Reads only what the funding poll has already written — no new subrequests and
+ * no upstream call of any kind, which is why it takes a `D1Database` rather than
+ * the `Env` every other orchestration function here does: there is nothing else
+ * in the environment it could reach for.
+ */
+export async function runCarryCycle(
+  db: D1Database,
+  scanId: number | null,
+  settings: Settings,
+  nowTs: number,
+): Promise<CarryCycleResult> {
+  let positionsOpened = 0;
+  let positionsClosed = 0;
+  let accruedUsdt = 0;
+  let skippedNoRate = 0;
+  let skippedUnusableRate = 0;
+
+  const open = await listOpenFundingPositions(db);
+  const survivors: FundingPosition[] = [];
+
+  for (const position of open) {
+    const latest = await getLatestFundingRateFor(db, position.venue, position.symbol);
+
+    const accrual = await accruePosition(db, position, latest, nowTs);
+    // A position closed by the manual route between the read above and the
+    // accrual write is gone: nothing was booked, it is not a survivor holding a
+    // slot, and there is no close left to evaluate.
+    if (!accrual.applied) continue;
+    accruedUsdt = round8(accruedUsdt + accrual.accrued);
+    skippedNoRate += accrual.skippedNoRate;
+    skippedUnusableRate += accrual.skippedUnusableRate;
+
+    const reason = shouldClose(
+      { entryTs: position.entryTs, lastRateTs: latest?.ts ?? null },
+      latest?.netAnnualPct ?? null,
+      {
+        holdDays: settings.funding_hold_days,
+        exitAnnualPct: settings.funding_exit_annual_pct,
+      },
+      nowTs,
+    );
+    if (reason === null) {
+      survivors.push(accrual.position);
+      continue;
+    }
+
+    // Closed from the *accrued* copy, not the one read at the top of the loop:
+    // the realised P&L is the funding this pass just booked less the fees, and
+    // closing off the stale copy would forfeit the final settlement.
+    if (await closeCarryPosition(db, accrual.position, reason, nowTs)) {
+      positionsClosed++;
+    }
+  }
+
+  // The switch gates *opening* only. An operator turning the strategy off wants
+  // no new positions, not an open book that silently stops accruing and stops
+  // being closed — that would strand positions with a P&L frozen mid-flight.
+  if (settings.funding_positions_enabled !== 0) {
+    const slots = Math.max(
+      0,
+      Math.trunc(settings.funding_max_positions) - survivors.length,
+    );
+    if (slots > 0) {
+      // One board, i.e. one `ts`, and {@link carryCandidates} dedupes only
+      // against positions that are *already* open — so it relies on the board
+      // carrying at most **one row per `(venue, symbol)`**, or two rows for one
+      // contract could both be opened in this single pass. That invariant is
+      // held by the poll, not by the schema: a venue quotes each asset once, so
+      // `pollFundingRates` writes one row per `(venue, symbol)` per timestamp.
+      // `funding_rates` has no unique index saying so.
+      const board = await listLatestFundingRates(db);
+      const candidates = carryCandidates(
+        board,
+        survivors,
+        settings.funding_min_annual_pct,
+      );
+
+      // The board arrives sorted by net carry, so `slice` is "the best ones".
+      for (const row of candidates.slice(0, slots)) {
+        await insertFundingPosition(db, scanId, {
+          venue: row.venue,
+          symbol: row.symbol,
+          instrument: row.instrument,
+          notionalUsdt: settings.funding_position_size_usdt,
+          // The board's timestamp, not the scan's: the position is entered on
+          // the quote it was opened from, so its accrual grid and its first
+          // settlement line up with the data rather than with the clock.
+          entryTs: row.ts,
+          entryRate: row.rate,
+          entryAnnualizedPct: row.annualizedPct,
+          intervalMinutes: row.intervalMinutes,
+          spotFeeRate: settings.fee_rate,
+          perpFeeRate: settings.perp_fee_rate,
+          predictedNetAnnualPct: row.netAnnualPct,
+        });
+        positionsOpened++;
+      }
+    }
+  }
+
+  return {
+    positionsOpened,
+    positionsClosed,
+    accruedUsdt,
+    skippedSettlements: skippedNoRate + skippedUnusableRate,
+    skippedNoRate,
+    skippedUnusableRate,
+  };
+}
+
 /**
  * One full scan: snapshot -> rank -> persist. Nothing is filled.
  *
@@ -364,6 +750,9 @@ export async function runScan(
       fundingVenues: [],
       fundingCount: 0,
       bestFundingNetAnnualPct: null,
+      positionsOpened: 0,
+      positionsClosed: 0,
+      carryAccruedUsdt: 0,
     };
   }
 
@@ -382,6 +771,10 @@ export async function runScan(
   let bestFundingNetAnnualPct: number | null = null;
   let fundingError: string | null = null;
   let fundingSkipped = false;
+  let positionsOpened = 0;
+  let positionsClosed = 0;
+  let carryAccruedUsdt = 0;
+  let carryError: string | null = null;
 
   try {
     const settings = await getSettings(db);
@@ -479,15 +872,32 @@ export async function runScan(
   // even referenced by the `scans` row.
   try {
     const pollMs = deps.fundingPollIntervalMs ?? FUNDING_POLL_INTERVAL_MS;
-    const lastTs = await getLatestFundingTs(db);
     // Funding settles every 8 hours, so a minutely scan has nothing to learn by
-    // asking every minute. `lastTs === null` forces the first poll: a cold
-    // database must fill the board immediately rather than wait out an interval
-    // it has no baseline for.
-    if (lastTs !== null && startedAt - lastTs < pollMs) {
+    // asking every minute.
+    //
+    // Gated on the scan's **own** marker rather than on `MAX(ts)` in
+    // `funding_rates`: that table is also written by
+    // `POST /api/funding/refresh`, so a refresh hit more often than `pollMs`
+    // kept the gate permanently satisfied and the scheduled poll never came due
+    // — starving the carry pass, which runs only behind a scan's poll, for as
+    // long as someone kept refreshing. Refresh still writes boards; it no longer
+    // has a say in when the scanner polls. See {@link FUNDING_POLL_TS_KEY}.
+    //
+    // A missing or unparseable marker forces the poll: a cold database must fill
+    // the board immediately rather than wait out an interval it has no baseline
+    // for.
+    const marker = await getRawSetting(db, FUNDING_POLL_TS_KEY);
+    // `Number(null)` is `0`, which is a perfectly finite timestamp, so the
+    // absent case is separated before the parse rather than after it.
+    const parsed = marker === null ? Number.NaN : Number(marker);
+    const lastPollTs = Number.isFinite(parsed) ? parsed : null;
+    if (lastPollTs !== null && startedAt - lastPollTs < pollMs) {
       fundingSkipped = true;
     } else {
       const poll = await pollFundingRates(env, scanId, deps, startedAt);
+      // Written only once the poll has returned, so a poll that threw is retried
+      // by the next scan instead of holding the gate shut for a full interval.
+      await setRawSetting(db, FUNDING_POLL_TS_KEY, String(startedAt));
       fundingVenue = poll.venue;
       // Names only: the scan toast lists sources, and the per-venue counts the
       // poll returns are what `/api/funding` is for.
@@ -500,6 +910,42 @@ export async function runScan(
       // for a week is visible before someone wonders where its rows went.
       if (fundingVenueErrors.length > 0) {
         console.warn(`funding venues degraded: ${fundingVenueErrors.join("; ")}`);
+      }
+
+      // -- paper carry positions ------------------------------------------
+      //
+      // After the board has landed, and in a `catch` of its own *inside* the
+      // funding one. The nesting is the whole contract: whatever happens here,
+      // the rows `pollFundingRates` just wrote are already committed and
+      // reported, so a bug in the accrual costs the carry pass and nothing
+      // else. It reads only what that poll persisted, so it costs zero
+      // subrequests.
+      try {
+        const carry = await runCarryCycle(
+          db,
+          scanId,
+          await getSettings(db),
+          // The board's own timestamp, so a position's entry, its accrual grid
+          // and the rows behind them all sit on one clock.
+          poll.ts,
+        );
+        positionsOpened = carry.positionsOpened;
+        positionsClosed = carry.positionsClosed;
+        carryAccruedUsdt = carry.accruedUsdt;
+        if (carry.skippedSettlements > 0) {
+          // The two reasons are named apart because they call for different
+          // reactions: a missing row is a coverage gap (the scanner or the
+          // venue was down), an unusable one is a row that exists and cannot be
+          // priced, which is a decoding bug worth chasing.
+          console.warn(
+            `carry: ${carry.skippedSettlements} settlement(s) not accrued` +
+              ` (${carry.skippedNoRate} with no rate row,` +
+              ` ${carry.skippedUnusableRate} with an unusable rate)`,
+          );
+        }
+      } catch (err) {
+        carryError = errorMessage(err);
+        console.warn(`carry cycle failed: ${carryError}`);
       }
     }
   } catch (err) {
@@ -548,5 +994,9 @@ export async function runScan(
     bestFundingNetAnnualPct,
     ...(fundingError != null ? { fundingError } : {}),
     ...(fundingSkipped ? { fundingSkipped } : {}),
+    positionsOpened,
+    positionsClosed,
+    carryAccruedUsdt,
+    ...(carryError != null ? { carryError } : {}),
   };
 }

@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light" />
     <meta
       name="description"
-      content="Cross-exchange spread and perpetual funding-rate observatory. Nothing is ever traded."
+      content="Cross-exchange spread and perpetual funding-rate observatory with paper carry positions. Nothing is ever traded."
     />
     <title>crypto-arb · market observatory</title>
     <!-- Inline data-URI so the page fetches nothing off-origin and the browser
@@ -218,7 +218,8 @@
                 autocomplete="off"
               />
               <span class="field-hint">
-                Net annual % a carry must clear to be flagged. Display only.
+                Net annual % a carry must clear to be flagged &mdash; and to have a
+                paper position opened on it.
               </span>
             </label>
 
@@ -236,7 +237,73 @@
               />
               <span class="field-hint">
                 Days a carry is assumed held, to amortise 4 legs of fees
-                (2 spot + 2 perp).
+                (2 spot + 2 perp). Also the max_hold close rule.
+              </span>
+            </label>
+
+            <label class="field field-check">
+              <span class="field-label">funding_positions_enabled</span>
+              <span class="check-row">
+                <input
+                  type="checkbox"
+                  class="input-check"
+                  id="set-positions-enabled"
+                  data-setting="funding_positions_enabled"
+                />
+                <span class="field-hint">
+                  Open new paper carry positions. Off still accrues and closes
+                  the ones already open.
+                </span>
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">funding_position_size_usdt</span>
+              <input
+                type="number"
+                step="100"
+                min="1"
+                class="input num"
+                id="set-position-size"
+                data-setting="funding_position_size_usdt"
+                autocomplete="off"
+              />
+              <span class="field-hint">
+                Notional of each leg of a paper carry. Never drawn from the
+                balance above.
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">funding_max_positions</span>
+              <input
+                type="number"
+                step="1"
+                min="1"
+                max="20"
+                class="input num"
+                id="set-max-positions"
+                data-setting="funding_max_positions"
+                autocomplete="off"
+              />
+              <span class="field-hint">
+                How many carry positions may be open at once.
+              </span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">funding_exit_annual_pct</span>
+              <input
+                type="number"
+                step="0.5"
+                class="input num"
+                id="set-exit-annual"
+                data-setting="funding_exit_annual_pct"
+                autocomplete="off"
+              />
+              <span class="field-hint">
+                Net annual % below which an open carry is closed. Lower than the
+                opening bar on purpose.
               </span>
             </label>
 
@@ -259,12 +326,14 @@
           </div>
 
           <p class="hint">
-            <strong>Nothing here places or simulates a trade.</strong> Both thresholds
-            (<code>xchg_min_profit_pct</code>, <code>funding_min_annual_pct</code>) are
-            display flags: every priced row is persisted whatever they say, and raising one
-            re-labels the rows already on disk rather than discarding anything.
-            <code>initial_usdt</code> is immutable — it is the denominator of the historical
-            P&amp;L above.
+            <strong>Nothing here places an order.</strong> Neither threshold
+            (<code>xchg_min_profit_pct</code>, <code>funding_min_annual_pct</code>) is a
+            write-time gate: every priced row is persisted whatever they say, and raising
+            one re-labels the rows already on disk rather than discarding anything.
+            <code>funding_min_annual_pct</code> does one thing more since Phase 15 — it is
+            also the bar a board row must clear before a <em>paper</em> carry position is
+            opened on it. <code>initial_usdt</code> is immutable, and no carry position
+            ever moves it: it is the denominator of the historical P&amp;L above.
           </p>
 
           <p class="hint">
@@ -351,9 +420,11 @@
           </table>
         </div>
         <p class="hint">
-          <strong>Cash-and-carry, observed only.</strong> Long spot, short the perp,
-          collect funding &mdash; price risk cancels between the legs. No position is ever
-          opened. Net annual % is the annualised rate less the round trip of fees
+          <strong>Cash-and-carry.</strong> Long spot, short the perp, collect funding
+          &mdash; price risk cancels between the legs. This board is the
+          <em>observation</em>; the paper positions opened from it are in the panel
+          below, and nothing is traded either way. Net annual % is the annualised
+          rate less the round trip of fees
           &mdash; 2 spot legs at <code>fee_rate</code> plus 2 perp legs at
           <code>perp_fee_rate</code>, spread over <code>funding_hold_days</code>. The
           annualised figure assumes the <em>next</em> published rate repeats all year,
@@ -362,6 +433,95 @@
           once and the two full-board venues each contribute the 11 majors plus
           their own best 20 and worst 5 contracts &mdash; a deeply negative rate
           is a result, not noise.
+        </p>
+      </section>
+
+      <!-- ── Carry positions ───────────────────────────────────────────── -->
+      <section class="panel" aria-labelledby="carry-heading">
+        <div class="panel-head">
+          <h2 id="carry-heading">Carry positions</h2>
+          <span class="panel-note" id="carry-note">&mdash;</span>
+        </div>
+
+        <p class="subhead">Open</p>
+        <div class="table-wrap">
+          <table class="grid" id="carry-open-table">
+            <thead>
+              <tr>
+                <th scope="col">Symbol</th>
+                <th scope="col">Venue</th>
+                <th scope="col" class="right">Notional</th>
+                <th scope="col" class="right">Entry net %</th>
+                <th scope="col" class="right">Accrued</th>
+                <th scope="col" class="right">Settled</th>
+                <th scope="col" class="right">Age</th>
+                <th scope="col"><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody id="carry-open-body">
+              <tr class="placeholder-row">
+                <td colspan="8">Loading&hellip;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="subhead">Closed &mdash; realised vs predicted</p>
+        <div class="table-wrap">
+          <table class="grid" id="carry-closed-table">
+            <thead>
+              <tr>
+                <th scope="col">Closed</th>
+                <th scope="col">Symbol</th>
+                <th scope="col">Venue</th>
+                <th scope="col">Reason</th>
+                <th scope="col" class="right">Held</th>
+                <th scope="col" class="right">Realised</th>
+                <th scope="col" class="right">Predicted %</th>
+                <th
+                  scope="col"
+                  class="right"
+                  title="Annualised over the ACTUAL hold, so a short hold scales hard: a 3-day result is multiplied by ~122. It says what happened over those days, scaled — not what a year would pay."
+                >
+                  Realised %
+                </th>
+                <th scope="col" class="right">Error</th>
+              </tr>
+            </thead>
+            <tbody id="carry-closed-body">
+              <tr class="placeholder-row">
+                <td colspan="9">Loading&hellip;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="hint">
+          <strong>Paper positions, and still nothing is traded.</strong> Long spot, short
+          the perp, at <code>funding_position_size_usdt</code> a leg &mdash; recorded here
+          and <em>never</em> booked against the balance above, because a position held for
+          days cannot be reconciled against a P&amp;L whose whole history is atomic round
+          trips. Funding accrues only for settlements the scanner actually observed; a
+          boundary with no rate row inside 24h is skipped rather than estimated, which is
+          why &ldquo;settled&rdquo; can lag the position&rsquo;s age. Nothing is ever opened
+          on an assumed settlement interval.
+        </p>
+        <p class="hint">
+          <strong>Predicted % vs realised % is the point.</strong> The first is what the
+          rate observed at entry said a year of it would pay; the second is what the
+          position actually paid, net of one round trip of fees, annualised over the days
+          it was really held. Their difference is the &ldquo;this rate repeats ~1095
+          times&rdquo; extrapolation error &mdash; measured here rather than asserted.
+          Basis and mark-to-market are not modelled at all, so a realised figure is the
+          <em>funding</em> result, not the trade&rsquo;s.
+        </p>
+        <p class="hint">
+          <strong>Realised % annualises a short hold aggressively.</strong> It scales the
+          days actually held up to a year &mdash; a position closed after three days is
+          multiplied by about 122, so a few cents of funding either way becomes a
+          double-digit percentage. Read it against &ldquo;Held&rdquo; and against
+          &ldquo;Realised&rdquo; in USDT, which is the figure that does not move when the
+          hold is short.
         </p>
       </section>
 
@@ -432,9 +592,10 @@
     </main>
 
     <footer class="footer">
-      Observation only — nothing is traded or simulated. Data: Binance WS + MEXC REST
-      (spot, cross-exchange spreads) · Bybit v5, OKX v5, Gate v4 and KuCoin futures
-      (perpetual funding rates, every venue polled every board).
+      Nothing is traded. Carry positions are paper only and never move a balance.
+      Data: Binance WS + MEXC REST (spot, cross-exchange spreads) · Bybit v5, OKX v5,
+      Gate v4 and KuCoin futures (perpetual funding rates, every venue polled every
+      board).
     </footer>
 
     <div class="toasts" id="toasts" role="status" aria-live="polite"></div>

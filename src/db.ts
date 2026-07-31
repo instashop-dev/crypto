@@ -40,6 +40,10 @@ export interface Settings {
   xchg_enabled: number;
   funding_min_annual_pct: number;
   funding_hold_days: number;
+  funding_positions_enabled: number;
+  funding_position_size_usdt: number;
+  funding_max_positions: number;
+  funding_exit_annual_pct: number;
 }
 
 export type SettingKey = keyof Settings;
@@ -64,6 +68,10 @@ export const SETTING_KEYS: readonly SettingKey[] = [
   "funding_min_annual_pct",
   "funding_hold_days",
   "perp_fee_rate",
+  "funding_positions_enabled",
+  "funding_position_size_usdt",
+  "funding_max_positions",
+  "funding_exit_annual_pct",
 ] as const;
 
 /**
@@ -174,6 +182,26 @@ export async function deleteRawSetting(db: D1Database, key: string): Promise<voi
  * keys, so a JSON value here can never leak into a numeric tunable.
  */
 export const FUNDING_INTERVALS_KEY = "funding_intervals";
+
+/**
+ * Key of the scan's own funding-poll marker: the clock of the last funding poll
+ * **the scan performed**, as a decimal string.
+ *
+ * A settings row for the same reason {@link SCAN_LOCK_KEY} is one — a single
+ * mutable scalar with no history worth keeping — and it exists because the
+ * obvious alternative is wrong. The gate used to read `MAX(ts)` from
+ * `funding_rates`, but `POST /api/funding/refresh` writes that table too, so a
+ * refresh hit more often than `FUNDING_POLL_INTERVAL_MS` moved the gate forward
+ * for ever and the scheduled poll never came due again — and with it the carry
+ * pass, which only runs behind a scan's own poll, starved indefinitely. A
+ * marker only the scan writes cannot be pushed around by an unauthenticated
+ * POST: refresh goes on writing boards, and the scan's cadence is its own.
+ *
+ * Written **after** a poll succeeds, so a poll that threw part-way (a board
+ * chunk that failed, a venue outage) is retried by the next scan rather than
+ * waiting out an interval it never completed.
+ */
+export const FUNDING_POLL_TS_KEY = "funding_last_poll_ts";
 
 /** The cached map plus the moment it was written, for TTL comparison. */
 export interface FundingIntervalCache {
@@ -861,19 +889,21 @@ export const FUNDING_INSERT_CHUNK = 50;
  * newest `ts`, never a mixture of two polls, since every row of a poll shares
  * one timestamp.
  *
- * **A chunk that fails part-way leaves that truncated board in place for a full
- * poll interval, not for the length of the write.** The chunks that already
- * landed carry the new `ts`, so `getLatestFundingTs` returns it, and the poll
- * gate in `runScan` then declines to poll again for the whole
- * `FUNDING_POLL_INTERVAL_MS` (5 minutes) — during which `/api/funding` serves
- * the truncated board as if it were complete, and the venues whose rows were in
- * the lost chunks look like venues that quoted nothing. The throw does reach
- * `ScanResult.fundingError`, so the failure is visible in the scan toast and in
- * `wrangler tail`; the board itself carries no mark of being short.
+ * **A chunk that fails part-way leaves that truncated board in place until the
+ * next scan.** The chunks that already landed carry the new `ts`, so
+ * `/api/funding` serves the truncated board as if it were complete and the
+ * venues whose rows were in the lost chunks look like venues that quoted
+ * nothing. The throw does reach `ScanResult.fundingError`, so the failure is
+ * visible in the scan toast and in `wrangler tail`; the board itself carries no
+ * mark of being short.
+ *
+ * The window is one scan rather than one poll interval because the gate reads
+ * {@link FUNDING_POLL_TS_KEY}, which is written only *after* a poll returns: a
+ * poll that threw here never advanced it, so the next scan polls again
+ * immediately instead of waiting out `FUNDING_POLL_INTERVAL_MS`.
  *
  * That is the accepted cost of the alternative — exceeding D1's statement limit
- * and writing no board at all — but it is a five-minute stale-and-wrong window,
- * not a sub-second cosmetic one.
+ * and writing no board at all.
  */
 export async function insertFundingRates(
   db: D1Database,
@@ -923,14 +953,6 @@ export async function insertFundingRates(
     await db.batch(chunk);
   }
   return rows.length;
-}
-
-/** Timestamp of the newest funding row; `null` when the table is empty. */
-export async function getLatestFundingTs(db: D1Database): Promise<number | null> {
-  const row = await db
-    .prepare("SELECT MAX(ts) AS ts FROM funding_rates")
-    .first<{ ts: number | null }>();
-  return row?.ts ?? null;
 }
 
 /**
@@ -989,6 +1011,379 @@ export async function listFundingRatesForSymbol(
   return (results ?? []).map(toFundingRate);
 }
 
+/**
+ * The newest rate row for one `(venue, symbol)`, whatever board it came from.
+ *
+ * Not `listLatestFundingRates` filtered: the board is capped per venue, so a
+ * tail contract can drop off the newest poll and still be the position someone
+ * is holding. This answers "what is the last thing we know about this
+ * contract", which is what both the close rules and the staleness clock need.
+ */
+export async function getLatestFundingRateFor(
+  db: D1Database,
+  venue: string,
+  symbol: string,
+): Promise<FundingRate | null> {
+  const row = await db
+    .prepare(
+      "SELECT * FROM funding_rates WHERE venue = ?1 AND symbol = ?2" +
+        " ORDER BY ts DESC, id DESC LIMIT 1",
+    )
+    .bind(venue, symbol)
+    .first<FundingRateRow>();
+  return row ? toFundingRate(row) : null;
+}
+
+/**
+ * The rate that was in force at `atTs` for one `(venue, symbol)`: the newest row
+ * at or before it, but no older than `minTs`.
+ *
+ * The floor is not optional. Without it a settlement boundary in the middle of
+ * an outage would be priced off whatever row happened to survive from days
+ * earlier, and the accrual would look complete when it was invented. With it,
+ * an unobserved boundary answers `null` and the caller skips it — see the
+ * accrual notes in `src/engine/carry.ts`.
+ */
+export async function getFundingRateAt(
+  db: D1Database,
+  venue: string,
+  symbol: string,
+  atTs: number,
+  minTs: number,
+): Promise<FundingRate | null> {
+  const row = await db
+    .prepare(
+      "SELECT * FROM funding_rates WHERE venue = ?1 AND symbol = ?2" +
+        " AND ts <= ?3 AND ts >= ?4 ORDER BY ts DESC, id DESC LIMIT 1",
+    )
+    .bind(venue, symbol, atTs, minTs)
+    .first<FundingRateRow>();
+  return row ? toFundingRate(row) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Funding positions (paper carry)
+// ---------------------------------------------------------------------------
+
+/** The two `funding_positions.status` values. Free TEXT in SQL; owned here. */
+export const CARRY_STATUS_OPEN = "open";
+export const CARRY_STATUS_CLOSED = "closed";
+
+export interface FundingPositionRow {
+  id: number;
+  opened_scan_id: number | null;
+  status: string;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  notional_usdt: number;
+  entry_ts: number;
+  entry_rate: number;
+  entry_annualized_pct: number;
+  interval_minutes: number;
+  spot_fee_rate: number;
+  perp_fee_rate: number;
+  accrued_funding_usdt: number;
+  accrual_count: number;
+  last_accrual_ts: number | null;
+  predicted_net_annual_pct: number;
+  close_ts: number | null;
+  close_reason: string | null;
+  realized_pnl_usdt: number | null;
+  realized_annual_pct: number | null;
+}
+
+/** The shape the API hands out: camel-cased, nulls preserved. */
+export interface FundingPosition {
+  id: number;
+  openedScanId: number | null;
+  status: string;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  notionalUsdt: number;
+  entryTs: number;
+  entryRate: number;
+  entryAnnualizedPct: number;
+  intervalMinutes: number;
+  spotFeeRate: number;
+  perpFeeRate: number;
+  accruedFundingUsdt: number;
+  accrualCount: number;
+  lastAccrualTs: number | null;
+  predictedNetAnnualPct: number;
+  closeTs: number | null;
+  closeReason: string | null;
+  realizedPnlUsdt: number | null;
+  realizedAnnualPct: number | null;
+}
+
+export function toFundingPosition(row: FundingPositionRow): FundingPosition {
+  return {
+    id: row.id,
+    openedScanId: row.opened_scan_id ?? null,
+    status: row.status,
+    venue: row.venue,
+    symbol: row.symbol,
+    instrument: row.instrument,
+    notionalUsdt: row.notional_usdt,
+    entryTs: row.entry_ts,
+    entryRate: row.entry_rate,
+    entryAnnualizedPct: row.entry_annualized_pct,
+    intervalMinutes: row.interval_minutes,
+    spotFeeRate: row.spot_fee_rate,
+    perpFeeRate: row.perp_fee_rate,
+    accruedFundingUsdt: row.accrued_funding_usdt ?? 0,
+    accrualCount: row.accrual_count ?? 0,
+    lastAccrualTs: row.last_accrual_ts ?? null,
+    predictedNetAnnualPct: row.predicted_net_annual_pct,
+    closeTs: row.close_ts ?? null,
+    closeReason: row.close_reason ?? null,
+    realizedPnlUsdt: row.realized_pnl_usdt ?? null,
+    realizedAnnualPct: row.realized_annual_pct ?? null,
+  };
+}
+
+/** What the scanner supplies to open a position. */
+export interface FundingPositionInput {
+  venue: string;
+  symbol: string;
+  instrument: string;
+  notionalUsdt: number;
+  entryTs: number;
+  entryRate: number;
+  entryAnnualizedPct: number;
+  intervalMinutes: number;
+  spotFeeRate: number;
+  perpFeeRate: number;
+  predictedNetAnnualPct: number;
+}
+
+/**
+ * Open a position and return its id.
+ *
+ * `accrued_funding_usdt`, `accrual_count` and the four close columns are left
+ * to their schema defaults: a brand-new position has collected nothing and has
+ * no realised anything, and NULL there means "still running" rather than "closed
+ * at zero". `last_accrual_ts` stays NULL too — the accrual grid falls back to
+ * `entry_ts` until the first boundary crosses.
+ */
+export async function insertFundingPosition(
+  db: D1Database,
+  scanId: number | null,
+  input: FundingPositionInput,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      "INSERT INTO funding_positions (opened_scan_id, status, venue, symbol," +
+        " instrument, notional_usdt, entry_ts, entry_rate, entry_annualized_pct," +
+        " interval_minutes, spot_fee_rate, perp_fee_rate, predicted_net_annual_pct)" +
+        " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) RETURNING id",
+    )
+    .bind(
+      scanId,
+      CARRY_STATUS_OPEN,
+      input.venue,
+      input.symbol,
+      input.instrument,
+      input.notionalUsdt,
+      input.entryTs,
+      input.entryRate,
+      input.entryAnnualizedPct,
+      input.intervalMinutes,
+      input.spotFeeRate,
+      input.perpFeeRate,
+      input.predictedNetAnnualPct,
+    )
+    .first<{ id: number }>();
+  if (!row) throw new Error("failed to create funding position");
+  return row.id;
+}
+
+/** Every open position, oldest entry first — the order they are accrued in. */
+export async function listOpenFundingPositions(
+  db: D1Database,
+): Promise<FundingPosition[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM funding_positions WHERE status = ?1 ORDER BY entry_ts ASC, id ASC",
+    )
+    .bind(CARRY_STATUS_OPEN)
+    .all<FundingPositionRow>();
+  return (results ?? []).map(toFundingPosition);
+}
+
+/** The most recently closed positions, newest close first. */
+export async function listClosedFundingPositions(
+  db: D1Database,
+  limit: number,
+): Promise<FundingPosition[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM funding_positions WHERE status = ?1" +
+        " ORDER BY close_ts DESC, id DESC LIMIT ?2",
+    )
+    .bind(CARRY_STATUS_CLOSED, limit)
+    .all<FundingPositionRow>();
+  return (results ?? []).map(toFundingPosition);
+}
+
+export async function getFundingPosition(
+  db: D1Database,
+  id: number,
+): Promise<FundingPosition | null> {
+  const row = await db
+    .prepare("SELECT * FROM funding_positions WHERE id = ?1")
+    .bind(id)
+    .first<FundingPositionRow>();
+  return row ? toFundingPosition(row) : null;
+}
+
+/**
+ * Record one accrual pass: the new running totals and the newest boundary they
+ * cover.
+ *
+ * Absolute values rather than `accrued = accrued + ?`, because the caller has
+ * already rounded the sum through `round8` and a SQL-side addition would
+ * accumulate float noise the API then reports to eight decimals. The read and
+ * the write are not one transaction, which is safe here for the reason the scan
+ * lock exists: accrual only ever runs inside a scan, and D1 has one writer.
+ *
+ * `WHERE status = 'open'` so a position closed by the manual route between the
+ * read and this write is not silently resurrected with new figures.
+ *
+ * Returns whether the row was actually updated, exactly as
+ * {@link closeFundingPosition} does. A no-op means the position was closed
+ * underneath this pass, and the caller must not report the funding it computed
+ * in memory: that USDT is held by no row anywhere.
+ */
+export async function accrueFundingPosition(
+  db: D1Database,
+  id: number,
+  accruedFundingUsdt: number,
+  accrualCount: number,
+  lastAccrualTs: number,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      "UPDATE funding_positions SET accrued_funding_usdt = ?2, accrual_count = ?3," +
+        " last_accrual_ts = ?4 WHERE id = ?1 AND status = ?5",
+    )
+    .bind(id, accruedFundingUsdt, accrualCount, lastAccrualTs, CARRY_STATUS_OPEN)
+    .run();
+  return (result.meta?.changes ?? 0) > 0;
+}
+
+/** The four figures a close writes. */
+export interface FundingPositionClose {
+  closeTs: number;
+  closeReason: string;
+  realizedPnlUsdt: number | null;
+  realizedAnnualPct: number | null;
+}
+
+/**
+ * Close a position, if it is still open.
+ *
+ * Returns whether this call is the one that closed it. The guard is what makes
+ * `POST /api/funding/positions/:id/close` answer 409 rather than overwriting a
+ * realised P&L the scanner already computed — two different close reasons for
+ * one position would make the series unreadable.
+ */
+export async function closeFundingPosition(
+  db: D1Database,
+  id: number,
+  close: FundingPositionClose,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      "UPDATE funding_positions SET status = ?2, close_ts = ?3, close_reason = ?4," +
+        " realized_pnl_usdt = ?5, realized_annual_pct = ?6" +
+        " WHERE id = ?1 AND status = ?7",
+    )
+    .bind(
+      id,
+      CARRY_STATUS_CLOSED,
+      close.closeTs,
+      close.closeReason,
+      close.realizedPnlUsdt,
+      close.realizedAnnualPct,
+      CARRY_STATUS_OPEN,
+    )
+    .run();
+  return (result.meta?.changes ?? 0) > 0;
+}
+
+/**
+ * Lifetime carry aggregates, as its **own** section of the portfolio.
+ *
+ * Never mixed into `equityUsdt` or the `balances` rows: migration 0005's header
+ * is explicit that a position held for days cannot be booked against a paper
+ * balance whose whole history is atomic round trips. So this is reported beside
+ * that figure and never inside it.
+ */
+export interface CarryTotals {
+  openCount: number;
+  closedCount: number;
+  /** Notional of the open book: Σ of one leg per position. */
+  openNotionalUsdt: number;
+  /** Funding collected across every position, open and closed. */
+  accruedUsdt: number;
+  /** Σ realised P&L over closed positions — accrual net of round-trip fees. */
+  realizedPnlUsdt: number;
+  /**
+   * Mean of `realized_annual_pct − predicted_net_annual_pct` over the closed
+   * positions that have both. Negative means the entry figure over-promised,
+   * which is the direction `src/engine/funding.ts` predicts it will. `null`
+   * when nothing has closed yet — an average of no positions is not zero.
+   */
+  avgPredictionErrorPct: number | null;
+}
+
+/**
+ * Aggregate the position columns in two round trips (open and closed differ in
+ * every aggregate they want, and a single query with `CASE` over both would be
+ * harder to read than it is cheap).
+ *
+ * `SUM` over zero rows is `NULL`, so every total is wrapped in `COALESCE` — a
+ * fresh database reports zeros, not nulls the dashboard renders as `—`. The
+ * prediction-error mean is the one exception and is deliberately left `NULL`
+ * when nothing has closed.
+ */
+export async function getCarryTotals(db: D1Database): Promise<CarryTotals> {
+  const open = await db
+    .prepare(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(notional_usdt), 0) AS notional," +
+        " COALESCE(SUM(accrued_funding_usdt), 0) AS accrued" +
+        " FROM funding_positions WHERE status = ?1",
+    )
+    .bind(CARRY_STATUS_OPEN)
+    .first<{ n: number; notional: number; accrued: number }>();
+
+  const closed = await db
+    .prepare(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(accrued_funding_usdt), 0) AS accrued," +
+        " COALESCE(SUM(realized_pnl_usdt), 0) AS realized," +
+        " AVG(realized_annual_pct - predicted_net_annual_pct) AS err" +
+        " FROM funding_positions WHERE status = ?1",
+    )
+    .bind(CARRY_STATUS_CLOSED)
+    .first<{ n: number; accrued: number; realized: number; err: number | null }>();
+
+  const err = closed?.err;
+  return {
+    openCount: open?.n ?? 0,
+    closedCount: closed?.n ?? 0,
+    openNotionalUsdt: round8(open?.notional ?? 0),
+    accruedUsdt: round8((open?.accrued ?? 0) + (closed?.accrued ?? 0)),
+    realizedPnlUsdt: round8(closed?.realized ?? 0),
+    avgPredictionErrorPct:
+      err === null || err === undefined || !Number.isFinite(err)
+        ? null
+        : round8(err),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Reset
 // ---------------------------------------------------------------------------
@@ -1031,6 +1426,15 @@ export async function resetAll(
       // them against scans that no longer exist. The interval cache is *not*
       // dropped: it is a property of the exchanges, not of this portfolio.
       db.prepare("DELETE FROM funding_rates"),
+      // …and so does the scan's poll marker: with the board gone, the next
+      // scan must refill it immediately rather than sit out the rest of an
+      // interval measured against rows that no longer exist.
+      db.prepare("DELETE FROM settings WHERE key = ?1").bind(FUNDING_POLL_TS_KEY),
+      // Carry positions go with the rates they were opened on and accrued
+      // from: keeping a position whose whole rate history has just been
+      // deleted would leave it unable to accrue, unable to price a close, and
+      // 24 hours from being closed as stale.
+      db.prepare("DELETE FROM funding_positions"),
     );
   }
 
