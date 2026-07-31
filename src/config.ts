@@ -162,6 +162,43 @@ export const STRATEGIES: readonly Strategy[] = [
 export const FUNDING_POLL_INTERVAL_MS = 300_000;
 
 /**
+ * How many *best-paying* non-major contracts each venue contributes to a
+ * persisted board.
+ *
+ * Gate and KuCoin quote 850+ and 660+ USDT perps respectively, and the whole
+ * point of Phase 14 is that the fat tail of funding lives out there — but
+ * persisting every contract of every venue on every 5-minute poll would write
+ * ~1.5M rows a week for a table nothing reads past its first page. So each
+ * venue keeps the {@link ASSET_UNIVERSE} majors unconditionally (they are the
+ * continuous series the history charts are built on, and dropping one the day
+ * its funding goes flat would put a hole in it) plus a budget of its own tail:
+ * this many from the top, {@link FUNDING_BOARD_BOTTOM_N} from the bottom.
+ *
+ * 20 + 5 = 25 is a display budget, not a market judgement: the dashboard shows
+ * one board and nobody scrolls past the top few dozen rows. Raising either half
+ * costs rows linearly and nothing else.
+ */
+export const FUNDING_BOARD_TOP_N = 20;
+
+/**
+ * How many *deeply negative* non-major contracts each venue contributes.
+ *
+ * A one-sided "top N by net annual" cap threw these away, and they are not
+ * noise: `rankFundingOpportunities` in `src/engine/funding.ts` keeps them on
+ * the stated grounds that "a deeply negative rate is the headline result of the
+ * scan on the day it happens". A live Gate board quoted `LA_USDT` at roughly
+ * **-1548%/yr**; under a pure top-25 cap that row could never have been
+ * persisted, so the most extreme figure on the board was systematically the one
+ * nobody could ever see. Keeping the rows and then capping them away undid the
+ * decision the engine had already made.
+ *
+ * Five rather than more because the negative tail is thin: on a real board a
+ * handful of contracts sit far below zero and the rest cluster near it, so the
+ * sixth-worst row is rarely telling anyone anything the fifth did not.
+ */
+export const FUNDING_BOARD_BOTTOM_N = 5;
+
+/**
  * How long a cached funding-interval map is trusted, in milliseconds.
  *
  * A contract's settlement cadence changes on the order of never; when a venue

@@ -44,8 +44,9 @@ import {
   type Settings,
 } from "./db";
 import { round8 } from "./engine";
+import { FUNDING_VENUES } from "./funding";
 import { pollFundingRates, runScan } from "./scan";
-import type { Env } from "./types";
+import type { Env, FundingVenue } from "./types";
 
 const MEXC_PING_PATH = "/api/v3/ping";
 const MEXC_PROBE_TIMEOUT_MS = 8000;
@@ -205,6 +206,45 @@ function parseStrategy(
     ok: false,
     error: `unknown strategy: ${raw} (expected ${STRATEGIES.join(" or ")})`,
   };
+}
+
+/**
+ * Parse a `?venue=` filter for the funding history. Absent means "every venue".
+ *
+ * Rejects an unknown name for the same reason {@link parseStrategy} does, and
+ * validates against {@link FUNDING_VENUES} rather than against whatever strings
+ * happen to be in the table: a venue retired tomorrow still has a week of rows
+ * worth querying, and one added tomorrow should be queryable the moment it is
+ * polled.
+ */
+function parseFundingVenue(
+  raw: string | undefined,
+): { ok: true; venue?: FundingVenue } | { ok: false; error: string } {
+  if (raw === undefined || raw === "") return { ok: true };
+  const venue = raw.trim().toLowerCase();
+  if ((FUNDING_VENUES as readonly string[]).includes(venue)) {
+    return { ok: true, venue: venue as FundingVenue };
+  }
+  return {
+    ok: false,
+    error: `unknown venue: ${raw} (expected one of ${FUNDING_VENUES.join(", ")})`,
+  };
+}
+
+/**
+ * Per-venue row counts for a board, in the order the venues first appear —
+ * which, since the board is sorted by net carry, means best-paying venue first.
+ *
+ * Deliberately the same `{venue, count}` shape
+ * {@link import("./scan").FundingPollResult.venues} carries, so the read
+ * and the refresh endpoints describe a board identically.
+ */
+function summariseVenues(rates: FundingRate[]): Array<{ venue: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const rate of rates) {
+    counts.set(rate.venue, (counts.get(rate.venue) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([venue, count]) => ({ venue, count }));
 }
 
 /** Parse a JSON body, treating an absent or malformed body as `{}`. */
@@ -567,6 +607,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
           ageMs: null,
           stale: false,
           venue: null,
+          venues: [],
           count: 0,
           ...shared,
           rates: [],
@@ -579,7 +620,10 @@ export function createApp(): Hono<{ Bindings: Env }> {
         ts,
         ageMs,
         stale: ageMs > FUNDING_STALE_MS,
+        // The venue behind the best row, unchanged in meaning and kept for the
+        // dashboard's one-line summary; `venues` is the full picture.
         venue: rates[0].venue,
+        venues: summariseVenues(rates),
         count: rates.length,
         ...shared,
         rates: rates.map((r: FundingRate) => ({
@@ -592,16 +636,39 @@ export function createApp(): Hono<{ Bindings: Env }> {
     }
   });
 
-  /** One symbol's funding history, newest first. Unknown symbols are empty. */
+  /**
+   * One symbol's funding history, newest first. Unknown symbols are empty.
+   *
+   * `?venue=` is optional and defaults to every venue. Since Phase 14 polls all
+   * of them, one symbol has up to four rows per timestamp, and a series drawn
+   * from the mixture would zig-zag between venues instead of showing either
+   * one's rate. An unrecognised venue is **rejected** rather than ignored, for
+   * the reason `?strategy=` is: a silently-ignored filter looks exactly like a
+   * venue that never quotes.
+   */
   app.get("/api/funding/history", async (c) => {
     try {
       const symbol = (c.req.query("symbol") ?? "").trim().toUpperCase();
       if (!symbol) return c.json({ error: "symbol is required" }, 400);
 
+      const filter = parseFundingVenue(c.req.query("venue"));
+      if (!filter.ok) return c.json({ error: filter.error }, 400);
+
       const [fallback, max] = LIMITS.funding;
       const limit = parseLimit(c.req.query("limit"), fallback, max);
-      const rates = await listFundingRatesForSymbol(c.env.DB, symbol, limit);
-      return c.json({ symbol, count: rates.length, limit, rates });
+      const rates = await listFundingRatesForSymbol(
+        c.env.DB,
+        symbol,
+        limit,
+        filter.venue,
+      );
+      return c.json({
+        symbol,
+        venue: filter.venue ?? null,
+        count: rates.length,
+        limit,
+        rates,
+      });
     } catch (err) {
       return c.json({ error: message(err) }, 500);
     }
@@ -612,14 +679,22 @@ export function createApp(): Hono<{ Bindings: Env }> {
    *
    * Rows land with `scan_id = NULL`: this poll belongs to no scan, and minting
    * a `scans` row for it would put a scan in the history that never looked at a
-   * single market. 502 rather than 500 when both venues fail — the failure is
-   * upstream, exactly as it is for `/api/tickers`.
+   * single market. 502 rather than 500 when *every* venue fails — the failure
+   * is upstream, exactly as it is for `/api/tickers`. One venue failing is a
+   * 200 with the survivors' board and the dead one named in `venueErrors`.
+   *
+   * `venues` is `[{venue, count}]`, the same shape `GET /api/funding` reports:
+   * both describe one board, so a reader must not have to know which endpoint
+   * produced the field in order to parse it.
    */
   app.post("/api/funding/refresh", async (c) => {
     try {
       await ensureSeeded(c.env.DB);
-      const { count, venue, ts } = await pollFundingRates(c.env, null);
-      return c.json({ count, venue, ts });
+      const { count, venue, venues, venueErrors, ts } = await pollFundingRates(
+        c.env,
+        null,
+      );
+      return c.json({ count, venue, venues, venueErrors, ts });
     } catch (err) {
       return c.json({ error: message(err) }, 502);
     }

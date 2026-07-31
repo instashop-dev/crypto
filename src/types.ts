@@ -32,8 +32,14 @@ export type SnapshotSource = "binance-ws" | "mexc-rest";
  * it: these are *perp* venues quoting a funding rate, not spot books, and the
  * two never appear in the same column. Merging them would let a `funding_rates`
  * row claim it came from a spot WebSocket.
+ *
+ * Phase 14 added `gate` and `kucoin`, and with them the *fetch-all* poll: these
+ * two publish their entire board in one request each, so the vocabulary is no
+ * longer "which venue won the fallback race" but "which venues answered". The
+ * `funding_rates.venue` column is free TEXT precisely so adding a name here
+ * needs no migration.
  */
-export type FundingVenue = "bybit" | "okx";
+export type FundingVenue = "bybit" | "okx" | "gate" | "kucoin";
 
 /** A point-in-time view of the order-book tops for a set of symbols. */
 export interface Snapshot {

@@ -835,15 +835,45 @@ export interface FundingRateInput {
 }
 
 /**
- * Persist one poll's board and prune everything older than the retention
- * window, in a single `batch()`.
+ * Statements per `batch()` call when writing a board.
  *
- * One batch, not two calls: the batch is an implicit transaction, so a reader
- * can never observe a moment in which the new board has landed but the old rows
- * have not been pruned — or, worse, in which the prune ran and the insert then
- * failed, leaving a gap. The
- * `DELETE` is relative to *this poll's* `ts` rather than to `Date.now()` so a
- * back-dated poll (a test, a replay) prunes against its own clock.
+ * D1 caps how many statements one batch may carry, and Phase 14's multi-venue
+ * board is the first thing here that can plausibly approach it: four venues x
+ * (11 majors + 25 tail) is ~144 inserts where the single-venue board was 11. 50
+ * is a defensive fraction of the documented limit, chosen so the chunking is
+ * exercised by every real poll rather than only by the day the board grows.
+ */
+export const FUNDING_INSERT_CHUNK = 50;
+
+/**
+ * Persist one poll's board and prune everything older than the retention
+ * window.
+ *
+ * The `DELETE` is relative to *this poll's* `ts` rather than to `Date.now()` so
+ * a back-dated poll (a test, a replay) prunes against its own clock, and it
+ * rides in the **last** chunk: pruning only after every insert has landed means
+ * a failure part-way through costs rows nobody had yet, never rows somebody
+ * already had.
+ *
+ * **The board is no longer one transaction.** It was, while it fit in a single
+ * `batch()`; a multi-venue board does not, and D1 has no cross-batch
+ * transaction. So a reader can observe a *partial* board — fewer rows at the
+ * newest `ts`, never a mixture of two polls, since every row of a poll shares
+ * one timestamp.
+ *
+ * **A chunk that fails part-way leaves that truncated board in place for a full
+ * poll interval, not for the length of the write.** The chunks that already
+ * landed carry the new `ts`, so `getLatestFundingTs` returns it, and the poll
+ * gate in `runScan` then declines to poll again for the whole
+ * `FUNDING_POLL_INTERVAL_MS` (5 minutes) — during which `/api/funding` serves
+ * the truncated board as if it were complete, and the venues whose rows were in
+ * the lost chunks look like venues that quoted nothing. The throw does reach
+ * `ScanResult.fundingError`, so the failure is visible in the scan toast and in
+ * `wrangler tail`; the board itself carries no mark of being short.
+ *
+ * That is the accepted cost of the alternative — exceeding D1's statement limit
+ * and writing no board at all — but it is a five-minute stale-and-wrong window,
+ * not a sub-second cosmetic one.
  */
 export async function insertFundingRates(
   db: D1Database,
@@ -853,7 +883,7 @@ export async function insertFundingRates(
 ): Promise<number> {
   if (rows.length === 0) return 0;
 
-  const statements: D1PreparedStatement[] = rows.map((r) =>
+  const inserts: D1PreparedStatement[] = rows.map((r) =>
     db
       .prepare(
         "INSERT INTO funding_rates (scan_id, ts, venue, symbol, instrument, rate," +
@@ -877,11 +907,21 @@ export async function insertFundingRates(
       ),
   );
 
-  statements.push(
-    db.prepare("DELETE FROM funding_rates WHERE ts < ?1").bind(ts - FUNDING_RETENTION_MS),
-  );
+  const chunks: D1PreparedStatement[][] = [];
+  for (let i = 0; i < inserts.length; i += FUNDING_INSERT_CHUNK) {
+    chunks.push(inserts.slice(i, i + FUNDING_INSERT_CHUNK));
+  }
 
-  await db.batch(statements);
+  const prune = db
+    .prepare("DELETE FROM funding_rates WHERE ts < ?1")
+    .bind(ts - FUNDING_RETENTION_MS);
+  const last = chunks[chunks.length - 1];
+  if (last.length < FUNDING_INSERT_CHUNK) last.push(prune);
+  else chunks.push([prune]);
+
+  for (const chunk of chunks) {
+    await db.batch(chunk);
+  }
   return rows.length;
 }
 
@@ -900,29 +940,52 @@ export async function getLatestFundingTs(db: D1Database): Promise<number | null>
  * n`: one poll writes one timestamp for all of its rows, so this returns
  * exactly one board and never a mixture of two — which is what a `LIMIT` would
  * silently produce if the universe size ever changed between polls.
+ *
+ * Ranked by net carry across **all** venues, which is the question the board
+ * answers since Phase 14: the best carry available anywhere, not the best carry
+ * on whichever venue happened to answer. `venue` joins the tie-break so two
+ * venues quoting one symbol at one rate still come back in a stable order.
  */
 export async function listLatestFundingRates(db: D1Database): Promise<FundingRate[]> {
   const { results } = await db
     .prepare(
       "SELECT * FROM funding_rates WHERE ts = (SELECT MAX(ts) FROM funding_rates)" +
-        " ORDER BY net_annual_pct DESC, symbol ASC",
+        " ORDER BY net_annual_pct DESC, symbol ASC, venue ASC",
     )
     .all<FundingRateRow>();
   return (results ?? []).map(toFundingRate);
 }
 
-/** One symbol's history, newest first. An unknown symbol is simply empty. */
+/**
+ * One symbol's history, newest first. An unknown symbol is simply empty.
+ *
+ * `venue` is optional and defaults to "every venue". It exists because a
+ * multi-venue board makes `?symbol=BTC` ambiguous in a way it never was under
+ * the old fallback chain: up to four rows now share a timestamp, and a chart
+ * drawn from the mixture would zig-zag between venues rather than show either
+ * one's series. Filtering in SQL, not by slicing the result, so a narrowed
+ * request still returns `limit` rows of the venue asked for.
+ */
 export async function listFundingRatesForSymbol(
   db: D1Database,
   symbol: string,
   limit: number,
+  venue?: string,
 ): Promise<FundingRate[]> {
-  const { results } = await db
-    .prepare(
-      "SELECT * FROM funding_rates WHERE symbol = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
-    )
-    .bind(symbol, limit)
-    .all<FundingRateRow>();
+  const { results } = venue
+    ? await db
+        .prepare(
+          "SELECT * FROM funding_rates WHERE symbol = ?1 AND venue = ?3" +
+            " ORDER BY ts DESC, id DESC LIMIT ?2",
+        )
+        .bind(symbol, limit, venue)
+        .all<FundingRateRow>()
+    : await db
+        .prepare(
+          "SELECT * FROM funding_rates WHERE symbol = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
+        )
+        .bind(symbol, limit)
+        .all<FundingRateRow>();
   return (results ?? []).map(toFundingRate);
 }
 

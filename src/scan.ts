@@ -15,6 +15,8 @@ import { getDualSnapshot, discoverPairs, type DualSnapshot } from "./binance";
 import {
   ASSET_UNIVERSE,
   BASE_ASSET,
+  FUNDING_BOARD_BOTTOM_N,
+  FUNDING_BOARD_TOP_N,
   FUNDING_INTERVAL_CACHE_TTL_MS,
   FUNDING_POLL_INTERVAL_MS,
   perpAssets,
@@ -48,6 +50,7 @@ import {
   type VenueBook,
 } from "./engine";
 import {
+  capFundingBoard,
   fetchBybitIntervals,
   getFundingFetcher,
   type FundingFetcher,
@@ -92,12 +95,24 @@ export interface ScanResult {
   bestSpreadNetPct: number | null;
   /** Why cross-exchange produced nothing. Never sets {@link error}. */
   xchgError?: string;
-  /** Which perp venue answered this scan's funding poll; `null` if none did. */
+  /**
+   * The best-paying venue that answered this scan's funding poll; `null` if
+   * none did.
+   *
+   * Kept alongside {@link fundingVenues} — which is the honest answer since
+   * Phase 14 polls every venue — because the dashboard's one-line scan toast
+   * has always named a single source, and "bybit" reading as "the venue behind
+   * the headline carry figure beside it" is still true.
+   */
   fundingVenue: FundingVenue | null;
+  /** Every venue that contributed rows this poll, best-paying first. */
+  fundingVenues: FundingVenue[];
+  /** `venue: reason` for each venue that contributed nothing. Never fails a scan. */
+  fundingVenueErrors?: string[];
   /** Funding rows persisted this scan; `0` when the poll was skipped. */
   fundingCount: number;
   bestFundingNetAnnualPct: number | null;
-  /** Why the funding poll produced nothing. Never sets {@link error}. */
+  /** Why the funding poll produced nothing *at all*. Never sets {@link error}. */
   fundingError?: string;
   /** Set when the poll gate declined: the board is younger than the interval. */
   fundingSkipped?: boolean;
@@ -201,9 +216,29 @@ async function loadFundingIntervals(
   return cached?.intervals ?? {};
 }
 
+/** One venue's share of a persisted board. */
+export interface FundingVenueCount {
+  venue: FundingVenue;
+  count: number;
+}
+
 /** What one funding poll produced. */
 export interface FundingPollResult {
-  venue: FundingVenue;
+  /** The venue behind the best-paying persisted row; `null` if none. */
+  venue: FundingVenue | null;
+  /**
+   * Venues that contributed at least one row, with their share of the board,
+   * best-paying first.
+   *
+   * Objects rather than bare names so `POST /api/funding/refresh` reports the
+   * *same* `venues` shape `GET /api/funding` does — the two describe the same
+   * board, and a caller that had to know which endpoint it asked in order to
+   * read the field was a trap. {@link ScanResult.fundingVenues} stays a name
+   * list: the scan toast names sources, it does not tabulate them.
+   */
+  venues: FundingVenueCount[];
+  /** `venue: reason`, one per venue that contributed nothing. */
+  venueErrors: string[];
   ts: number;
   count: number;
   bestNetAnnualPct: number | null;
@@ -235,14 +270,25 @@ export async function pollFundingRates(
     intervals,
   });
 
+  // Priced across all venues at once, so the ranking answers "the best carry
+  // available anywhere" rather than "the best carry on each venue separately".
+  // The per-venue cap is applied *after* pricing, because which of a venue's
+  // 850 contracts are its best 20 and worst 5 is not knowable before the fee
+  // drag is.
   const ranked = rankFundingOpportunities(
-    snapshot.quotes.values(),
+    snapshot.quotes,
     settings.fee_rate,
     settings.perp_fee_rate,
     settings.funding_hold_days,
   );
+  const kept = capFundingBoard(
+    ranked,
+    assets,
+    FUNDING_BOARD_TOP_N,
+    FUNDING_BOARD_BOTTOM_N,
+  );
 
-  const rows: FundingRateInput[] = ranked.map((r) => ({
+  const rows: FundingRateInput[] = kept.map((r) => ({
     venue: r.quote.venue,
     symbol: r.symbol,
     instrument: r.quote.instrument,
@@ -256,11 +302,32 @@ export async function pollFundingRates(
   }));
   await insertFundingRates(db, scanId, rows, snapshot.ts);
 
+  // Ordered by what each venue actually pays rather than by the order they were
+  // polled in: the first name is the one the dashboard shows beside the best
+  // carry figure, so it has to be the venue that produced it.
+  const venues: FundingVenueCount[] = [];
+  const byVenue = new Map<FundingVenue, FundingVenueCount>();
+  for (const row of kept) {
+    const venue = row.quote.venue;
+    const seen = byVenue.get(venue);
+    if (seen) {
+      seen.count++;
+      continue;
+    }
+    const entry = { venue, count: 1 };
+    byVenue.set(venue, entry);
+    venues.push(entry);
+  }
+
   return {
-    venue: snapshot.venue,
+    venue: venues[0]?.venue ?? null,
+    venues,
+    venueErrors: snapshot.venues
+      .filter((v) => v.error !== null)
+      .map((v) => `${v.venue}: ${v.error}`),
     ts: snapshot.ts,
     count: rows.length,
-    bestNetAnnualPct: ranked.length > 0 ? ranked[0].netAnnualPct : null,
+    bestNetAnnualPct: kept.length > 0 ? kept[0].netAnnualPct : null,
   };
 }
 
@@ -294,6 +361,7 @@ export async function runScan(
       spreadsCount: 0,
       bestSpreadNetPct: null,
       fundingVenue: null,
+      fundingVenues: [],
       fundingCount: 0,
       bestFundingNetAnnualPct: null,
     };
@@ -308,6 +376,8 @@ export async function runScan(
   let bestSpreadNetPct: number | null = null;
   let xchgError: string | null = null;
   let fundingVenue: FundingVenue | null = null;
+  let fundingVenues: FundingVenue[] = [];
+  let fundingVenueErrors: string[] = [];
   let fundingCount = 0;
   let bestFundingNetAnnualPct: number | null = null;
   let fundingError: string | null = null;
@@ -419,8 +489,18 @@ export async function runScan(
     } else {
       const poll = await pollFundingRates(env, scanId, deps, startedAt);
       fundingVenue = poll.venue;
+      // Names only: the scan toast lists sources, and the per-venue counts the
+      // poll returns are what `/api/funding` is for.
+      fundingVenues = poll.venues.map((v) => v.venue);
+      fundingVenueErrors = poll.venueErrors;
       fundingCount = poll.count;
       bestFundingNetAnnualPct = poll.bestNetAnnualPct;
+      // A venue that failed while others served is *not* a failed poll: the
+      // board landed. It is logged and reported so a venue that has been dead
+      // for a week is visible before someone wonders where its rows went.
+      if (fundingVenueErrors.length > 0) {
+        console.warn(`funding venues degraded: ${fundingVenueErrors.join("; ")}`);
+      }
     }
   } catch (err) {
     fundingError = errorMessage(err);
@@ -462,6 +542,8 @@ export async function runScan(
     bestSpreadNetPct,
     ...(xchgError != null ? { xchgError } : {}),
     fundingVenue,
+    fundingVenues,
+    ...(fundingVenueErrors.length > 0 ? { fundingVenueErrors } : {}),
     fundingCount,
     bestFundingNetAnnualPct,
     ...(fundingError != null ? { fundingError } : {}),

@@ -2,27 +2,47 @@
  * Funding-rate client for the cash-and-carry scanner.
  *
  * Mirrors `src/binance.ts` in shape — module seam, per-call dependency
- * injection, pure exported parsers, a fallback chain judged by coverage — so
- * there is one way to reason about every upstream in this app.
+ * injection, pure exported parsers — so there is one way to reason about every
+ * upstream in this app. It differs in one deliberate way: there is **no
+ * fallback chain**. Every configured venue is polled on every board, under
+ * `Promise.allSettled`, and each one's failure costs exactly its own rows.
  *
- * Source chain:
+ * Phase 14 made that switch. A primary/fallback chain answers "which venue do
+ * we trust most", which is the wrong question once the venues quote *different
+ * universes*: Bybit's board covers the majors, Gate's and KuCoin's cover 850+
+ * and 660+ contracts, and the fat tail of funding is precisely what the
+ * majors-only board could not see. Two venues disagreeing about BTC's funding
+ * is also a measurement, not a conflict — `funding_rates` is keyed by
+ * `(venue, symbol)` and always was.
  *
- * - **Primary — Bybit v5 `/v5/market/tickers?category=linear`.** One
- *   unauthenticated request returns the funding rate of *every* linear perp, so
- *   the whole board costs a single subrequest no matter how large the universe
- *   grows. The response does not carry the settlement interval, which is why
- *   {@link fetchBybitIntervals} exists as a separate, day-cached call.
- * - **Fallback — OKX `/api/v5/public/funding-rate?instId=…`.** One request per
- *   instrument (11 for the shipped universe), run under `Promise.allSettled` so
- *   a single dead instrument costs one row rather than the snapshot. Total
- *   worst case is 1 + 1 + 11 = 13 subrequests, inside the free plan's 50.
+ * The sources:
+ *
+ * - **Bybit v5 `/v5/market/tickers?category=linear`.** One unauthenticated
+ *   request returns the funding rate of every linear perp; the response carries
+ *   no settlement interval, which is why {@link fetchBybitIntervals} exists as a
+ *   separate, day-cached call. Reduced to the majors — the cadence cache is
+ *   keyed on them.
+ * - **OKX `/api/v5/public/funding-rate?instId=…`.** One request *per
+ *   instrument*, so it stays capped at the majors: widening OKX to a full board
+ *   would cost one subrequest per contract and blow the plan limit on its own.
+ * - **Gate `/api/v4/futures/usdt/contracts`.** One request, every USDT-margined
+ *   perp, funding rate and interval included.
+ * - **KuCoin futures `/api/v1/contracts/active`.** One request, same deal.
+ *
+ * Gate and KuCoin are new here and **unverified from Cloudflare's egress**:
+ * Binance and Bybit REST answer 403 to it in production and OKX does not, and
+ * which way these two fall is not knowable until phase 18 deploys. That is
+ * exactly why they are added as two more `allSettled` branches rather than as
+ * links in a chain — a venue that turns out to be blocked costs its own rows
+ * and a string in `ScanResult.fundingVenueErrors`, and nothing else.
  *
  * **No credential ever leaves for these hosts.** {@link fundingHeaders} takes no
  * `Env` at all, so there is no code path — not even a mistaken `true` at a call
- * site — by which a Binance API key could be attached to a Bybit or OKX
- * request. That is a structural guarantee, not a convention.
+ * site — by which a Binance API key could be attached to a perp-venue request.
+ * That is a structural guarantee, not a convention.
  */
 import { USER_AGENT } from "./binance";
+import { FUNDING_BOARD_BOTTOM_N, FUNDING_BOARD_TOP_N } from "./config";
 import { DEFAULT_FUNDING_INTERVAL_MINUTES } from "./engine";
 import type { Env, FundingVenue } from "./types";
 
@@ -35,23 +55,62 @@ const BYBIT_INSTRUMENTS_PATH = "/v5/market/instruments-info";
 export const OKX_BASE = "https://www.okx.com";
 const OKX_FUNDING_PATH = "/api/v5/public/funding-rate";
 
-/**
- * Per-call timeout. Shorter than {@link import("./binance").MEXC_TIMEOUT_MS}
- * because these payloads are small (a few hundred KB at most) and the funding
- * block runs *after* the arbitrage half of a scan — it must not be able to push
- * a scan past the cron interval.
- */
-export const FUNDING_TIMEOUT_MS = 6000;
+/** Gate v4 public futures metadata. No auth, no key, no signature. */
+export const GATE_BASE = "https://api.gateio.ws";
+const GATE_CONTRACTS_PATH = "/api/v4/futures/usdt/contracts";
+
+/** KuCoin futures public contract list, same terms. */
+export const KUCOIN_BASE = "https://api-futures.kucoin.com";
+const KUCOIN_CONTRACTS_PATH = "/api/v1/contracts/active";
 
 /**
- * Fraction of the requested assets Bybit must quote for its board to be used.
+ * Every venue polled on a board, in report order.
  *
- * Same rule and same number as the WebSocket's
- * {@link import("./binance").WS_COVERAGE_THRESHOLD}: a board covering three of
- * eleven assets is not a cheaper snapshot, it is a different (and much worse)
- * scan, so the per-instrument fallback is preferred over it.
+ * **Subrequest budget** (Cloudflare's free plan allows 50 per invocation, and
+ * one scan is one invocation):
+ *
+ * ```
+ * spot   Binance WS 1 + MEXC REST 1 (+1 discovery on a cold pairs table) <= 3
+ * perp   bybit tickers        1
+ *        bybit instruments    1   (day-cached; usually 0)
+ *        okx funding-rate    11   (one per major — the only per-instrument leg)
+ *        gate contracts       1
+ *        kucoin contracts     1
+ *                           ---
+ *        funding worst case  15
+ * total worst case            18  <= 50
+ * ```
+ *
+ * The margin is what pays for a future venue: every full-board venue costs one
+ * subrequest, so this list can roughly triple before the budget is the binding
+ * constraint. What must *not* grow is the OKX leg — it is priced per contract,
+ * so pointing it at a full board would cost ~600 subrequests by itself. That is
+ * why the universe widening in Phase 14 goes through Gate and KuCoin only.
+ *
+ * **Kraken futures is deliberately absent.** Its perps fund continuously and
+ * accrue per hour against a different reference, so normalising it into the
+ * per-settlement `rate` this module stores would produce a number that looks
+ * comparable and is not. Modelling it wrong is worse than omitting it; it is
+ * noted as future work in the README.
  */
-export const FUNDING_COVERAGE_THRESHOLD = 0.6;
+export const FUNDING_VENUES: readonly FundingVenue[] = [
+  "bybit",
+  "okx",
+  "gate",
+  "kucoin",
+] as const;
+
+/**
+ * Per-call timeout.
+ *
+ * Raised from 6s in Phase 14: the Gate and KuCoin boards are ~1.1MB and ~1.3MB
+ * of JSON against Bybit's few hundred KB, and a timeout tight enough to clip a
+ * cold TLS handshake plus a megabyte of transfer would read as "venue down"
+ * every time the link was slow. Still well inside the scan's budget — the four
+ * venues run concurrently, so the funding block costs one timeout, not four,
+ * and {@link import("./scan").SCAN_LOCK_TTL_MS} (45s) is untouched.
+ */
+export const FUNDING_TIMEOUT_MS = 9000;
 
 /** Longest cadence accepted from an upstream; see `src/engine/funding.ts`. */
 const MAX_FUNDING_INTERVAL_MINUTES = 1440;
@@ -95,13 +154,32 @@ export interface FundingQuote {
   markPrice: number | null;
 }
 
-/** A point-in-time view of one venue's funding board. */
-export interface FundingSnapshot {
+/** How one venue's leg of a poll turned out. Recorded whether it worked or not. */
+export interface VenueOutcome {
   venue: FundingVenue;
+  /** Quotes this venue contributed. `0` on failure, and on an empty board. */
+  count: number;
+  /** `null` when the venue answered; the reason, prefixed, when it did not. */
+  error: string | null;
+}
+
+/**
+ * A point-in-time view of **every** venue's funding board.
+ *
+ * `quotes` is a flat array rather than the `Map` keyed by symbol this used to
+ * be: with four venues polled at once the same symbol appears up to four times,
+ * and a symbol-keyed map would silently keep whichever venue happened to be
+ * last. Comparing venues *is* the feature.
+ */
+export interface FundingSnapshot {
   /** Epoch millis at which the snapshot was completed. */
   ts: number;
-  /** Keyed by upper-case asset symbol. */
-  quotes: Map<string, FundingQuote>;
+  /** Every venue's quotes, flat. Symbols repeat across venues. */
+  quotes: FundingQuote[];
+  /** One entry per venue attempted, in {@link FUNDING_VENUES} order. */
+  venues: VenueOutcome[];
+  /** The venues that contributed at least one quote, in the same order. */
+  served: FundingVenue[];
 }
 
 /**
@@ -159,6 +237,21 @@ function parseTs(value: unknown): number | null {
 
 /** Parse a decimal-string price, rejecting garbage and non-positive values. */
 function parsePrice(value: unknown): number | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const n = typeof value === "number" ? value : Number.parseFloat(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Parse a positive, finite duration in whatever unit the venue publishes it.
+ *
+ * Deliberately unit-blind: Gate quotes its funding interval in seconds and
+ * KuCoin in milliseconds, and the conversion to the minutes this app stores
+ * happens once, visibly, at each call site. A helper that guessed the unit
+ * would be a factor-of-1000 bug waiting for its first venue.
+ */
+function parseDuration(value: unknown): number | null {
   if (typeof value !== "string" && typeof value !== "number") return null;
   const n = typeof value === "number" ? value : Number.parseFloat(value);
   if (!Number.isFinite(n) || n <= 0) return null;
@@ -422,6 +515,224 @@ export async function fetchOkxFunding(
 }
 
 // ---------------------------------------------------------------------------
+// Gate
+// ---------------------------------------------------------------------------
+
+/**
+ * Contract types Gate lists on its USDT futures board that are **not crypto
+ * perps**: tokenised equities, index, commodity, forex and metal contracts.
+ *
+ * They are excluded because the strategy this scanner prices is *cash and
+ * carry*: long the spot asset, short its perp. There is no spot leg for a
+ * synthetic Tesla or gold contract on a crypto exchange, so a fat funding rate
+ * on one is not an opportunity — it is a row that would push a real one out of
+ * the per-venue top 25.
+ *
+ * A **deny** list rather than an allow list on purpose: crypto perps carry an
+ * empty `contract_type`, and an allow list of `""` would silently empty the
+ * whole board the day Gate starts labelling them `"crypto"`.
+ *
+ * KuCoin has no equivalent list because its board carried no non-crypto perps
+ * when it was captured — an observed asymmetry, not a principled one, so the
+ * day KuCoin lists tokenised equities it needs a list of its own.
+ */
+const GATE_NON_CRYPTO_TYPES = new Set([
+  "stocks",
+  "indices",
+  "commodities",
+  "forex",
+  "metals",
+]);
+
+/** Gate's USDT board names every contract `<BASE>_USDT`. */
+const GATE_SUFFIX = "_USDT";
+
+/**
+ * `BTC_USDT` -> `BTC`. `null` for anything not a USDT-margined contract.
+ *
+ * The multiplier prefix is **kept**: `1000PEPE_USDT` normalises to `1000PEPE`,
+ * not `PEPE`. KuCoin names the same contract `1000PEPEUSDTM`, so keeping it is
+ * what makes the two venues' rows line up — and the row's whole purpose is to
+ * be reproducible on the venue's own UI.
+ */
+export function gateBaseAsset(name: string): string | null {
+  const upper = name.trim().toUpperCase();
+  if (!upper.endsWith(GATE_SUFFIX)) return null;
+  const base = upper.slice(0, -GATE_SUFFIX.length);
+  return base.length > 0 ? base : null;
+}
+
+/**
+ * Reduce a `/futures/usdt/contracts` payload to a board keyed by base asset.
+ *
+ * Gate answers with a bare array — no envelope, no status field — so a failed
+ * request is an HTTP status, which {@link fetchFundingJson} already turns into
+ * a throw. Anything that is not an array here is therefore a shape change, and
+ * it throws rather than reading as an empty board.
+ *
+ * Skipped, per contract and silently: non-USDT names, delisting or non-trading
+ * contracts, pre-market listings (no spot leg exists yet), the non-crypto
+ * contract types above, and any unusable rate. `funding_interval` is published
+ * in **seconds**, so every row is `'api'` unless the field is junk.
+ */
+export function parseGateContracts(payload: unknown): Map<string, FundingQuote> {
+  const quotes = new Map<string, FundingQuote>();
+  if (!Array.isArray(payload)) {
+    throw new Error("gate contracts: payload was not an array");
+  }
+
+  for (const raw of payload) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    if (typeof entry.name !== "string") continue;
+
+    const symbol = gateBaseAsset(entry.name);
+    if (symbol === null || quotes.has(symbol)) continue;
+
+    if (entry.in_delisting === true) continue;
+    if (entry.is_pre_market === true) continue;
+    if (typeof entry.status === "string" && entry.status !== "trading") continue;
+    if (typeof entry.type === "string" && entry.type !== "direct") continue;
+    if (
+      typeof entry.contract_type === "string" &&
+      GATE_NON_CRYPTO_TYPES.has(entry.contract_type)
+    ) {
+      continue;
+    }
+
+    const rate = parseRate(entry.funding_rate);
+    if (rate === null) continue;
+
+    // Gate publishes the cadence in seconds: 28800 -> 480 minutes.
+    const seconds = parseDuration(entry.funding_interval);
+    const minutes = seconds === null ? null : parseInterval(seconds / 60);
+    // Published in seconds since the epoch, unlike every other venue here.
+    const nextSeconds = parseTs(entry.funding_next_apply);
+
+    quotes.set(symbol, {
+      venue: "gate",
+      symbol,
+      instrument: entry.name.trim().toUpperCase(),
+      rate,
+      intervalMinutes: minutes ?? DEFAULT_FUNDING_INTERVAL_MINUTES,
+      intervalSource: minutes === null ? "assumed" : "api",
+      nextFundingTs: nextSeconds === null ? null : nextSeconds * 1000,
+      markPrice: parsePrice(entry.mark_price),
+    });
+  }
+
+  return quotes;
+}
+
+/**
+ * The whole Gate USDT perp board in one request.
+ *
+ * Takes no asset list: the board *is* the point, and narrowing it here would
+ * undo the widening. The caller caps what gets persisted — see
+ * {@link capFundingBoard}.
+ */
+export async function fetchGateFunding(_env?: Env): Promise<Map<string, FundingQuote>> {
+  const payload = await fetchFundingJson(`${GATE_BASE}${GATE_CONTRACTS_PATH}`);
+  return parseGateContracts(payload);
+}
+
+// ---------------------------------------------------------------------------
+// KuCoin futures
+// ---------------------------------------------------------------------------
+
+/** KuCoin's linear USDT-margined perpetuals all end in `USDTM`. */
+const KUCOIN_SUFFIX = "USDTM";
+
+/** KuCoin's contract type for a perpetual swap. `FFICSX` is a dated future. */
+const KUCOIN_PERPETUAL_TYPE = "FFWCSX";
+
+/**
+ * KuCoin still calls Bitcoin `XBT`, the old ISO-style ticker.
+ *
+ * Mapped to `BTC` so one symbol means one asset across the whole table; the
+ * `instrument` column keeps `XBTUSDTM`, which is what someone reproducing the
+ * row has to paste into KuCoin's own UI.
+ */
+const KUCOIN_ASSET_ALIASES: Record<string, string> = { XBT: "BTC" };
+
+/** `XBTUSDTM` -> `BTC`. `null` for anything not a USDT-margined perp. */
+export function kucoinBaseAsset(symbol: string): string | null {
+  const upper = symbol.trim().toUpperCase();
+  if (!upper.endsWith(KUCOIN_SUFFIX)) return null;
+  const base = upper.slice(0, -KUCOIN_SUFFIX.length);
+  if (base.length === 0) return null;
+  return KUCOIN_ASSET_ALIASES[base] ?? base;
+}
+
+/**
+ * Reduce a `/contracts/active` payload to a board keyed by base asset.
+ *
+ * KuCoin wraps everything in `{ code, data }` where `code` is the *string*
+ * `"200000"` on success, so — exactly as with OKX's `"0"` — the comparison is
+ * made as a string. A numeric one would accept every error code.
+ *
+ * Skipped, per contract: anything not `<BASE>USDTM` (the USDC- and
+ * inverse-margined boards ride along in the same response), dated futures,
+ * contracts with an `expireDate` (KuCoin sets one on a perp scheduled for
+ * delisting — a carry you cannot hold to the end is not one worth ranking),
+ * anything not `Open`, and any unusable rate. `fundingRateGranularity` is
+ * published in **milliseconds**.
+ */
+export function parseKucoinContracts(payload: unknown): Map<string, FundingQuote> {
+  const quotes = new Map<string, FundingQuote>();
+  const envelope = (payload ?? {}) as { code?: unknown; msg?: unknown; data?: unknown };
+
+  if (String(envelope.code) !== "200000") {
+    const msg = typeof envelope.msg === "string" ? envelope.msg : "unknown error";
+    throw new Error(`kucoin code ${String(envelope.code)}: ${msg}`);
+  }
+  if (!Array.isArray(envelope.data)) {
+    throw new Error("kucoin contracts: data was not an array");
+  }
+
+  for (const raw of envelope.data) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    if (typeof entry.symbol !== "string") continue;
+
+    const symbol = kucoinBaseAsset(entry.symbol);
+    if (symbol === null || quotes.has(symbol)) continue;
+
+    if (typeof entry.type === "string" && entry.type !== KUCOIN_PERPETUAL_TYPE) continue;
+    if (typeof entry.status === "string" && entry.status !== "Open") continue;
+    if (entry.expireDate !== null && entry.expireDate !== undefined) continue;
+
+    const rate = parseRate(entry.fundingFeeRate);
+    if (rate === null) continue;
+
+    // KuCoin publishes the cadence in milliseconds: 28800000 -> 480 minutes.
+    const granularityMs =
+      parseDuration(entry.fundingRateGranularity) ??
+      parseDuration(entry.currentFundingRateGranularity);
+    const minutes = granularityMs === null ? null : parseInterval(granularityMs / 60_000);
+
+    quotes.set(symbol, {
+      venue: "kucoin",
+      symbol,
+      instrument: entry.symbol.trim().toUpperCase(),
+      rate,
+      intervalMinutes: minutes ?? DEFAULT_FUNDING_INTERVAL_MINUTES,
+      intervalSource: minutes === null ? "assumed" : "api",
+      nextFundingTs: parseTs(entry.nextFundingRateDateTime),
+      markPrice: parsePrice(entry.markPrice),
+    });
+  }
+
+  return quotes;
+}
+
+/** The whole KuCoin USDT perp board in one request. See {@link fetchGateFunding}. */
+export async function fetchKucoinFunding(
+  _env?: Env,
+): Promise<Map<string, FundingQuote>> {
+  const payload = await fetchFundingJson(`${KUCOIN_BASE}${KUCOIN_CONTRACTS_PATH}`);
+  return parseKucoinContracts(payload);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -434,15 +745,30 @@ export interface FundingDeps {
     intervals?: Record<string, number>,
   ) => Promise<Map<string, FundingQuote>>;
   fetchOkx?: (assets: string[], env?: Env) => Promise<Map<string, FundingQuote>>;
+  /** Full-board venues take no asset list: the board is the point. */
+  fetchGate?: (env?: Env) => Promise<Map<string, FundingQuote>>;
+  fetchKucoin?: (env?: Env) => Promise<Map<string, FundingQuote>>;
+  /** Narrow the poll to a subset of {@link FUNDING_VENUES}. Tests use it. */
+  venues?: readonly FundingVenue[];
 }
 
 /**
- * Best-effort funding board for `assets`: Bybit first, OKX as fallback.
+ * Poll **every** configured venue concurrently and return all of their quotes.
  *
- * The Bybit board is accepted only if it covered at least
- * {@link FUNDING_COVERAGE_THRESHOLD} of the requested assets. Throws — naming
- * both failures, in the same shape as
- * {@link import("./binance").getSnapshot} — only when neither venue answered.
+ * `Promise.allSettled`, not `all`: a venue that 403s from Cloudflare's egress —
+ * which is the observed production state of Bybit and Binance, and an open
+ * question for Gate and KuCoin until phase 18 — costs its own rows and a string
+ * in {@link VenueOutcome.error}, and nothing more. An empty board from a venue
+ * that answered is recorded the same way, because "reachable but quoting
+ * nothing" is a distinct and equally interesting failure.
+ *
+ * `assets` bounds the two per-major venues only: Bybit's board is reduced to
+ * them (its cadence cache is keyed on them) and OKX is priced per instrument.
+ * Gate and KuCoin ignore it and return their whole boards.
+ *
+ * Throws — naming every venue's failure, in the same shape as
+ * {@link import("./binance").getSnapshot} — only when *no* venue produced a
+ * single quote. That is the one case the caller cannot report as a board.
  */
 export async function getFundingSnapshot(
   assets: string[],
@@ -451,33 +777,113 @@ export async function getFundingSnapshot(
 ): Promise<FundingSnapshot> {
   const wanted = normaliseAssets(assets);
   const intervals = deps.intervals ?? {};
-  const fetchBybit = deps.fetchBybit ?? fetchBybitFunding;
-  const fetchOkx = deps.fetchOkx ?? fetchOkxFunding;
-  const failures: string[] = [];
+  const venues = deps.venues ?? FUNDING_VENUES;
 
-  if (wanted.length > 0) {
-    try {
-      const quotes = await fetchBybit(wanted, env, intervals);
-      if (quotes.size / wanted.length >= FUNDING_COVERAGE_THRESHOLD) {
-        return { venue: "bybit", ts: Date.now(), quotes };
-      }
-      failures.push(`bybit: covered only ${quotes.size}/${wanted.length} symbols`);
-    } catch (err) {
-      failures.push(`bybit: ${errorMessage(err)}`);
+  const fetchers: Record<FundingVenue, () => Promise<Map<string, FundingQuote>>> = {
+    bybit: () => (deps.fetchBybit ?? fetchBybitFunding)(wanted, env, intervals),
+    okx: () => (deps.fetchOkx ?? fetchOkxFunding)(wanted, env),
+    gate: () => (deps.fetchGate ?? fetchGateFunding)(env),
+    kucoin: () => (deps.fetchKucoin ?? fetchKucoinFunding)(env),
+  };
+
+  const settled = await Promise.allSettled(
+    venues.map(async (venue) => ({ venue, quotes: await fetchers[venue]() })),
+  );
+
+  const quotes: FundingQuote[] = [];
+  const outcomes: VenueOutcome[] = [];
+  const served: FundingVenue[] = [];
+
+  settled.forEach((result, i) => {
+    const venue = venues[i];
+    if (result.status === "rejected") {
+      outcomes.push({ venue, count: 0, error: errorMessage(result.reason) });
+      return;
     }
+
+    const board = [...result.value.quotes.values()];
+    if (board.length === 0) {
+      outcomes.push({ venue, count: 0, error: "returned no usable funding rates" });
+      return;
+    }
+
+    quotes.push(...board);
+    outcomes.push({ venue, count: board.length, error: null });
+    served.push(venue);
+  });
+
+  if (served.length === 0) {
+    const failures = outcomes.map((o) => `${o.venue}: ${o.error}`);
+    throw new Error(`no funding-rate source available (${failures.join("; ")})`);
   }
 
-  try {
-    const quotes = await fetchOkx(wanted, env);
-    if (quotes.size > 0 || wanted.length === 0) {
-      return { venue: "okx", ts: Date.now(), quotes };
-    }
-    failures.push("okx: none of the requested symbols returned a funding rate");
-  } catch (err) {
-    failures.push(`okx: ${errorMessage(err)}`);
+  return { ts: Date.now(), quotes, venues: outcomes, served };
+}
+
+/**
+ * Trim a ranked board to what is worth persisting, **per venue**.
+ *
+ * Three rules, and the reason for each:
+ *
+ * - **Every major is kept**, whatever it pays. They are the continuous series
+ *   the history route serves, and dropping BTC on the day its funding went flat
+ *   would put a hole in exactly the chart someone reads to see funding go flat.
+ * - **Plus that venue's best `topN` of everything else.** The tail is the point
+ *   of polling a full board, but a 850-contract venue writing its whole board
+ *   every 5 minutes is ~1.7M rows a week for nothing.
+ * - **Plus that venue's *worst* `bottomN`.** The budget is split rather than
+ *   spent entirely on the top because the ranking is signed: the engine keeps
+ *   negative rows on purpose ("a deeply negative rate is the headline result of
+ *   the scan on the day it happens"), and a one-sided cap then discarded every
+ *   one of them. A -1548%/yr contract is not a row worth less than the 20th
+ *   best positive one; it is the most interesting row on the board.
+ *
+ * Per venue, not globally: a venue whose whole board happens to pay less than
+ * another's must still contribute its own top rows, or a single hot venue would
+ * crowd every other one out of the board entirely and the cross-venue
+ * comparison would quietly stop existing.
+ *
+ * The two halves are **deduplicated**, so a venue with fewer than
+ * `topN + bottomN` non-majors keeps all of them once rather than twice. The
+ * per-venue non-major budget is therefore `topN + bottomN` at most.
+ *
+ * **Precondition:** `ranked` is sorted by net annual carry, best first — which
+ * is exactly what {@link import("./engine").rankFundingOpportunities} returns.
+ * It is what makes "the last `bottomN` of a venue's rows" mean "its worst".
+ * Input order is preserved in the output, so the caller's ranking survives.
+ */
+export function capFundingBoard<
+  T extends { quote: { venue: string; symbol: string } },
+>(
+  ranked: readonly T[],
+  majors: Iterable<string>,
+  topN: number = FUNDING_BOARD_TOP_N,
+  bottomN: number = FUNDING_BOARD_BOTTOM_N,
+): T[] {
+  const majorSet = new Set(normaliseAssets([...majors]));
+  const isMajor = (row: T) => majorSet.has(row.quote.symbol.toUpperCase());
+
+  // Where each venue's non-major rows sit in `ranked`, in ranked order — so the
+  // head of the list is that venue's best-paying tail and the end is its worst.
+  const positions = new Map<string, number[]>();
+  ranked.forEach((row, i) => {
+    if (isMajor(row)) return;
+    const venue = row.quote.venue;
+    const seen = positions.get(venue);
+    if (seen) seen.push(i);
+    else positions.set(venue, [i]);
+  });
+
+  const top = Math.max(0, topN);
+  const bottom = Math.max(0, bottomN);
+  const keep = new Set<number>();
+  for (const indices of positions.values()) {
+    for (const i of indices.slice(0, top)) keep.add(i);
+    // Guarded: `slice(-0)` is `slice(0)`, i.e. the whole board.
+    if (bottom > 0) for (const i of indices.slice(-bottom)) keep.add(i);
   }
 
-  throw new Error(`no funding-rate source available (${failures.join("; ")})`);
+  return ranked.filter((row, i) => isMajor(row) || keep.has(i));
 }
 
 /** Signature of {@link getFundingSnapshot}; the seam tests substitute. */
