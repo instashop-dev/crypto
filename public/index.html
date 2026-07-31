@@ -186,6 +186,32 @@
             </label>
 
             <label class="field">
+              <span class="field-label">xchg_min_profit_pct</span>
+              <input
+                type="number"
+                step="0.001"
+                class="input num"
+                id="set-xchg-min-profit"
+                data-setting="xchg_min_profit_pct"
+                autocomplete="off"
+              />
+              <span class="field-hint">Net % a spread must beat to fill.</span>
+            </label>
+
+            <label class="field field-check">
+              <span class="field-label">xchg_enabled</span>
+              <span class="check-row">
+                <input
+                  type="checkbox"
+                  class="input-check"
+                  id="set-xchg-enabled"
+                  data-setting="xchg_enabled"
+                />
+                <span class="field-hint">Scan cross-exchange spreads too.</span>
+              </span>
+            </label>
+
+            <label class="field">
               <span class="field-label">tax_rate</span>
               <input
                 type="number"
@@ -205,9 +231,20 @@
 
           <p class="hint">
             A <strong>negative</strong> <code>min_profit_pct</code> forces demo trades: every
-            scan fills its best cycle even when the edge is negative.
+            scan fills its best cycle even when the edge is negative. The same applies to
+            <code>xchg_min_profit_pct</code> and the best <em>spread</em> — the two gates are
+            independent, so a scan can fill one, both or neither.
             <code>initial_usdt</code> is immutable — it is the denominator of every P&amp;L
             figure.
+          </p>
+
+          <p class="hint">
+            <strong>Cross-exchange.</strong> Buy a market on the cheaper venue and sell it on
+            the dearer one, in the same instant. Both books are read per scan (Binance over
+            WebSocket, MEXC over REST) and they are <em>not</em> simultaneous — the WS
+            snapshot accumulates over up to 4s while the REST reply is one instant — so
+            timing skew, not depth or fees, is the main source of spreads that were never
+            fillable. Turn <code>xchg_enabled</code> off to restore the triangles-only scan.
           </p>
 
           <p class="hint">
@@ -224,6 +261,22 @@
       <section class="panel" aria-labelledby="opps-heading">
         <div class="panel-head">
           <h2 id="opps-heading">Opportunities</h2>
+          <!-- Server-side filter: the ?strategy= param, not a client-side slice,
+               so "newest 30 spreads" means 30 spreads. -->
+          <div
+            class="segmented"
+            id="opps-filter"
+            role="group"
+            aria-label="Filter opportunities by strategy"
+          >
+            <button type="button" data-strategy="" aria-pressed="true">All</button>
+            <button type="button" data-strategy="triangular" aria-pressed="false">
+              Triangular
+            </button>
+            <button type="button" data-strategy="cross_exchange" aria-pressed="false">
+              Cross-exchange
+            </button>
+          </div>
           <span class="panel-note" id="opps-note">newest 30</span>
         </div>
         <div class="table-wrap">
@@ -232,6 +285,7 @@
               <tr>
                 <th scope="col" class="col-toggle"><span class="sr-only">Legs</span></th>
                 <th scope="col">Time</th>
+                <th scope="col">Strategy</th>
                 <th scope="col">Cycle</th>
                 <th scope="col" class="right">Gross %</th>
                 <th scope="col" class="right">Net %</th>
@@ -240,7 +294,7 @@
             </thead>
             <tbody id="opps-body">
               <tr class="placeholder-row">
-                <td colspan="6">Loading&hellip;</td>
+                <td colspan="7">Loading&hellip;</td>
               </tr>
             </tbody>
           </table>
@@ -258,6 +312,7 @@
             <thead>
               <tr>
                 <th scope="col">Time</th>
+                <th scope="col">Strategy</th>
                 <th scope="col">Cycle</th>
                 <th scope="col" class="right">Start &rarr; End</th>
                 <th scope="col" class="right">Profit</th>
@@ -269,7 +324,7 @@
             </thead>
             <tbody id="trades-body">
               <tr class="placeholder-row">
-                <td colspan="5">Loading&hellip;</td>
+                <td colspan="6">Loading&hellip;</td>
               </tr>
             </tbody>
           </table>
@@ -293,13 +348,15 @@
                   <th scope="col" class="right">Pairs</th>
                   <th scope="col" class="right">Triangles</th>
                   <th scope="col" class="right">Best net %</th>
+                  <th scope="col" class="right">Spreads</th>
+                  <th scope="col" class="right">Best spread %</th>
                   <th scope="col" class="right">Duration</th>
                   <th scope="col">Error</th>
                 </tr>
               </thead>
               <tbody id="scans-body">
                 <tr class="placeholder-row">
-                  <td colspan="8">Loading&hellip;</td>
+                  <td colspan="10">Loading&hellip;</td>
                 </tr>
               </tbody>
             </table>
@@ -309,7 +366,8 @@
     </main>
 
     <footer class="footer">
-      Paper trading only — no real orders. Data: Binance WS (MEXC fallback).
+      Paper trading only — no real orders. Data: Binance WS + MEXC REST
+      (cross-exchange spreads).
     </footer>
 
     <div class="toasts" id="toasts" role="status" aria-live="polite"></div>

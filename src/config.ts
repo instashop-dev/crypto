@@ -57,9 +57,51 @@ export const DEFAULTS = {
    * include the 4% health-and-education cess.
    */
   tax_rate: 0.3,
+  /**
+   * Minimum net profit, in percent, required before a **spread** is executed.
+   *
+   * Separate from `min_profit_pct` because the two strategies have different
+   * break-evens (2 legs of fees vs 3) and different noise floors — a cross-venue
+   * spread is mostly timing skew, so an operator will usually want it stricter
+   * than the triangular threshold, and one shared knob would force a compromise
+   * that is wrong for both. Negative means demo mode, exactly as it does for
+   * `min_profit_pct`.
+   */
+  xchg_min_profit_pct: 0.05,
+  /**
+   * Cross-exchange kill switch, `0` off / `1` on. Numeric for the same reason
+   * `india_mode` is: the settings table is "TEXT parsed as a finite number".
+   *
+   * On by default — the feature is the point of this phase — but setting it to
+   * `0` restores the pre-Phase-9 scan path exactly: one snapshot through the
+   * usual primary/fallback chain, no second REST call, no spread rows.
+   */
+  xchg_enabled: 1,
 } as const;
 
 export type Defaults = typeof DEFAULTS;
+
+/**
+ * Which scanner produced a row. Persisted in `opportunities.strategy` and
+ * `trades.strategy`, and accepted as the `?strategy=` filter on the history
+ * routes.
+ */
+export type Strategy = "triangular" | "cross_exchange";
+
+/** Triangular cycles within one venue's book: `USDT -> BTC -> ETH -> USDT`. */
+export const STRATEGY_TRIANGULAR = "triangular";
+/** The same market on two venues: buy on the cheaper, sell on the dearer. */
+export const STRATEGY_CROSS_EXCHANGE = "cross_exchange";
+
+/**
+ * Every known strategy. The one place the vocabulary is enumerated — the D1
+ * columns are plain TEXT with a default, so this list (not a CHECK constraint)
+ * is what `?strategy=` validates against.
+ */
+export const STRATEGIES: readonly Strategy[] = [
+  STRATEGY_TRIANGULAR,
+  STRATEGY_CROSS_EXCHANGE,
+] as const;
 
 /**
  * Every ordered concatenation `A + B` with `A !== B` for the given universe.

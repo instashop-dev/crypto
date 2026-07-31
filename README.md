@@ -13,15 +13,18 @@ placed.**
 Cloudflare cron (1/min) ──► runScan()
 POST /api/scan ──────────►    │
                               ▼
-              wss://stream.binance.com  ◄── primary: Binance WS combined
+              wss://stream.binance.com  ◄── venue 1: Binance WS combined
                               │              bookTicker stream (one snapshot
                               │              per scan, then socket closed)
-                 api.mexc.com REST      ◄── fallback (identical Binance schema)
-                              │
+                 api.mexc.com REST      ◄── venue 2 + fallback (same schema),
+                              │              fetched concurrently
                               ▼
-        enumerate triangles over 12-asset universe → net profit after
-        0.1%/leg taker fees → persist top 10 → paper-execute best cycle
-        if net ≥ threshold (atomic D1 batch: balance + trade + flags)
+        [triangular]  enumerate triangles over the 12-asset universe on the
+                      primary book → net after 0.1%/leg → top 10 → fill best
+        [cross-exch]  price every X/USDT market on BOTH books, both ways →
+                      keep the better → top 10 → fill best
+                      → one paper trade per strategy, if net ≥ its threshold
+                      (atomic D1 batch: balance + trade + flags)
                               │
                               ▼
         D1 (SQLite): balances · pairs · scans · opportunities · trades · settings
@@ -48,9 +51,9 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/health` | Probe both market-data sources from the Worker |
 | `POST /api/scan` | Run a scan now (also runs via cron every minute) |
 | `GET /api/portfolio` | Balances, equity, P&L vs 10,000 USDT initial |
-| `GET /api/opportunities?limit=50` | Ranked cycles per scan, with per-leg detail |
-| `GET /api/trades?limit=50` | Simulated fills |
-| `GET /api/scans?limit=20` | Scan log (trigger, source, duration, errors) |
+| `GET /api/opportunities?limit=50` | Ranked cycles and spreads per scan, with per-leg detail. `&strategy=triangular\|cross_exchange` filters; an unknown value is a 400 |
+| `GET /api/trades?limit=50` | Simulated fills. Same `&strategy=` filter |
+| `GET /api/scans?limit=20` | Scan log (trigger, source, duration, errors, spread counts) |
 | `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
@@ -65,6 +68,8 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `india_mode` | `0` | `0` or `1` | Report Indian VDA tax on every fill (see below). |
 | `tds_rate` | `0.01` | `0`–`0.05` | Section 194S withholding per VDA transfer. |
 | `tax_rate` | `0.3` | `0`–`0.5` | Section 115BBH rate on gains. Use `0.312` to include the 4% cess. |
+| `xchg_min_profit_pct` | `0.05` | any | Net % a **spread** must beat to fill. **Negative = demo mode**, same as above. Separate from `min_profit_pct` because two legs of fees is a different break-even from three. |
+| `xchg_enabled` | `1` | `0` or `1` | Scan cross-exchange spreads. `0` restores the exact triangles-only scan path (one snapshot, no second REST call). |
 
 `initial_usdt` is immutable — it is the denominator of every P&L figure ever
 reported, so moving it would rewrite history rather than change behaviour.
@@ -73,7 +78,7 @@ reported, so moving it would rewrite history rather than change behaviour.
 
 ```bash
 npm install
-npm test                                        # 155 tests: pure engine math +
+npm test                                        # 218 tests: pure engine math +
                                                 # workerd integration (in-memory D1,
                                                 # mocked network)
 npx wrangler d1 migrations apply crypto-arb --local
@@ -153,14 +158,83 @@ hard-coded (set `tax_rate: 0.312`); and 115BBH allows only cost of acquisition
 as a deduction anyway, which for an atomic cycle is exactly the start notional.
 **None of this is tax advice.**
 
+## Cross-exchange spreads
+
+The scanner runs a second strategy alongside the triangles: the *same* market on
+two venues at once. Binance (WebSocket) and MEXC (REST) are fetched
+concurrently per scan; where both list a `X/USDT` market, the pair of books is
+priced in both directions and the better one is kept.
+
+```
+leg 1  BUY  X on venue A at askA:  base = (N / askA) x (1 - f)
+leg 2  SELL X on venue B at bidB:  out  = base x bidB x (1 - f)
+
+grossPct = (bidB / askA - 1) x 100
+netPct   = ((bidB / askA) x (1 - f)^2 - 1) x 100
+```
+
+Only one direction can ever pay: `(bidB/askA)(bidA/askB) = (bidA/askA)(bidB/askB)
+<= 1`, because `bid <= ask` on each venue. So the mirror is priced, proven a
+loss, and dropped rather than persisted.
+
+Worked example, at 0.1%/leg:
+
+```
+binance-ws  BTCUSDT  bid 60000 / ask 60010
+mexc-rest   BTCUSDT  bid 60500 / ask 60510
+
+buy Binance @60010, sell MEXC @60500
+  gross  (60500 / 60010 - 1) x 100              = +0.8165305782%
+  net    x (1 - 0.001)^2                        = +0.6149983335%
+  on 100 USDT: 100 -> 0.00166472 BTC -> 100.61499833 USDT   (+0.61499833)
+
+mirror (buy MEXC @60510, sell Binance @60000)   =  -1.0410510700%
+```
+
+Persisted rows carry a `strategy` column (`triangular` / `cross_exchange`) and
+a label instead of a cycle — `BTCUSDT binance-ws>mexc-rest`. Each strategy has
+its own threshold and fills **at most one trade per scan**, so a scan books 0, 1
+or 2 trades.
+
+**Simplifications**, all documented in `src/engine/crossExchange.ts`:
+
+- **Instant top-of-book fills**, as with triangles — depth and slippage ignored.
+- **No transfer is simulated.** No withdrawal, no confirmation wait, no transfer
+  fee: a real desk pre-positions inventory on both venues and rebalances out of
+  band rather than moving coins per trade. Modelling a per-trade transfer would
+  price a workflow nobody uses. The funding cost of that standing inventory is
+  not modelled either.
+- **One fee rate for both venues** — `fee_rate` is a single setting.
+- **Timing skew is the dominant false positive.** The Binance book is a
+  WebSocket snapshot accumulated over up to ~4s; the MEXC book is one REST
+  response read at the end of it. The two are *not* simultaneous, so a market
+  that moved during the collection window shows up as a spread that was never
+  fillable. This — not fees, not depth — is why a scanner like this reports far
+  more "opportunities" than any desk could fill, and why nothing here places an
+  order. Treat a reported spread as an upper bound on an upper bound.
+
+A missing second venue is recorded in `scans.xchg_error`, never in `scans.error`:
+a scan whose triangular half ranked and filled normally did not fail because
+MEXC was slow.
+
+**India mode applies to spreads too**, and they fare slightly better: a spread is
+a **two-disposal** chain (USDT on the buy venue, then the asset on the sell
+venue) against a triangle's three, so ~2% of notional is withheld rather than
+~3%. Each disposal is valued on the book of the venue where that leg actually
+executes. On the worked example above, at 100 USDT: base `200.7325`, TDS
+`2.007325`, tax due `0.18953025`, net `0.44223725` — still a ~2% drag on a
+~0.6% edge, so the conclusion of the India-mode section holds with one leg less.
+
 ## Simplifications (MVP)
 
 - Fills at snapshot best bid/ask; order-book depth, lot-size/notional filters,
   and slippage are ignored.
-- Equity = USDT balance (every cycle returns to USDT).
+- Equity = USDT balance (every cycle and every spread returns to USDT).
 - Pair discovery uses MEXC's listing (REST-reachable), which covers 19 of the
   ~38 Binance-listed pairs in the universe — fewer triangles than the full set.
-- Max one paper trade per scan.
+- Max one paper trade **per strategy** per scan (so at most two).
+- Cross-exchange spreads assume pre-positioned inventory: no transfer, no
+  withdrawal fee, no latency between the two legs. See the section above.
 
 ## Architecture decisions
 

@@ -282,6 +282,35 @@ export async function fetchMexcSnapshot(
   return book;
 }
 
+/** Signature of {@link fetchMexcSnapshot}; the seam tests substitute. */
+export type RestFetcher = (
+  symbols: string[],
+  env?: Env,
+) => Promise<Map<string, BookTickerEntry>>;
+
+/**
+ * Module-level REST seam, mirroring {@link setWsCollector}.
+ *
+ * Phase 9 gave the REST source a second role — it is no longer only a fallback
+ * but a venue in its own right, quoted alongside Binance — so it needs the same
+ * substitutability the WebSocket collector has had. Tests that need *both*
+ * venues up can override this instead of hand-building a MEXC payload for
+ * `fetchMock`, which is a lot of JSON to say "this venue quotes BTC at 60500".
+ *
+ * Production never calls the setter; tests restore the default in `afterEach`.
+ */
+let activeRestFetcher: RestFetcher = fetchMexcSnapshot;
+
+/** Replace the default REST fetcher. Pass `null` to restore it. */
+export function setRestFetcher(fetcher: RestFetcher | null): void {
+  activeRestFetcher = fetcher ?? fetchMexcSnapshot;
+}
+
+/** The REST fetcher currently in effect. */
+export function getRestFetcher(): RestFetcher {
+  return activeRestFetcher;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -337,6 +366,101 @@ export async function getSnapshot(
   }
 
   throw new Error(`no market-data source available (${failures.join("; ")})`);
+}
+
+/** Both venues' books plus whichever of them the rest of the app should use. */
+export interface DualSnapshot {
+  /** `null` when the WebSocket failed or came back below the coverage bar. */
+  binance: Snapshot | null;
+  /** `null` when the REST call failed or matched none of the symbols. */
+  mexc: Snapshot | null;
+  /**
+   * `binance ?? mexc` — the snapshot every pre-Phase-9 consumer reads.
+   *
+   * Identical to what {@link getSnapshot} would have returned for the same
+   * symbols and the same upstream behaviour, which is the whole point: the
+   * triangular scanner must not be able to tell that a second venue was
+   * fetched alongside it.
+   */
+  primary: Snapshot;
+  /** One human-readable line per source that did not qualify. Possibly empty. */
+  failures: string[];
+}
+
+/**
+ * Fetch **both** venues concurrently, for cross-exchange spreads.
+ *
+ * The acceptance rules are deliberately identical to {@link getSnapshot}'s — a
+ * WebSocket book must cover {@link WS_COVERAGE_THRESHOLD} of the requested
+ * symbols, a REST book must match at least one — so that `primary` is exactly
+ * the snapshot the sequential path would have produced. The two differences are
+ * mechanical:
+ *
+ * - **Concurrent, not sequential.** `getSnapshot` only calls MEXC when Binance
+ *   failed; here MEXC is always wanted, so both run under `Promise.allSettled`
+ *   and the scan pays one latency rather than two. `allSettled` (not `all`) is
+ *   what makes a dead venue a `null` field instead of a thrown scan.
+ * - **Nothing short-circuits.** A perfectly good WebSocket book no longer
+ *   cancels the REST call, because the REST book is a second opinion now, not a
+ *   fallback.
+ *
+ * Throws the same message as `getSnapshot` when neither venue qualifies, so the
+ * scan-row error text does not change depending on which path produced it.
+ * {@link getSnapshot} itself is untouched: `GET /api/tickers` and the
+ * `xchg_enabled: 0` scan path keep their exact sequential semantics.
+ */
+export async function getDualSnapshot(
+  symbols: string[],
+  env: Env,
+  deps: SnapshotDeps = {},
+): Promise<DualSnapshot> {
+  const wanted = normaliseSymbols(symbols);
+  const collectWs = deps.collectWs ?? getWsCollector();
+  const fetchRest = deps.fetchRest ?? getRestFetcher();
+  const failures: string[] = [];
+
+  const [wsResult, restResult] = await Promise.allSettled([
+    // An empty request has nothing to stream, and opening a socket for zero
+    // symbols would be a guaranteed timeout — `getSnapshot` skips it for the
+    // same reason.
+    wanted.length > 0
+      ? collectWs(wanted, { deadlineMs: deps.wsDeadlineMs ?? WS_DEADLINE_MS, env })
+      : Promise.resolve(new Map<string, BookTickerEntry>()),
+    fetchRest(wanted, env),
+  ]);
+
+  let binance: Snapshot | null = null;
+  if (wanted.length === 0) {
+    failures.push("binance-ws: no symbols requested");
+  } else if (wsResult.status === "fulfilled") {
+    const book = wsResult.value;
+    if (book.size / wanted.length >= WS_COVERAGE_THRESHOLD) {
+      binance = { source: "binance-ws", ts: Date.now(), book };
+    } else {
+      failures.push(`binance-ws: covered only ${book.size}/${wanted.length} symbols`);
+    }
+  } else {
+    failures.push(`binance-ws: ${errorMessage(wsResult.reason)}`);
+  }
+
+  let mexc: Snapshot | null = null;
+  if (restResult.status === "fulfilled") {
+    const book = restResult.value;
+    if (book.size > 0 || wanted.length === 0) {
+      mexc = { source: "mexc-rest", ts: Date.now(), book };
+    } else {
+      failures.push("mexc-rest: none of the requested symbols were listed");
+    }
+  } else {
+    failures.push(`mexc-rest: ${errorMessage(restResult.reason)}`);
+  }
+
+  const primary = binance ?? mexc;
+  if (!primary) {
+    throw new Error(`no market-data source available (${failures.join("; ")})`);
+  }
+
+  return { binance, mexc, primary, failures };
 }
 
 /**

@@ -13,7 +13,7 @@
  *   balance credited without its trade row (or vice versa) would corrupt P&L
  *   with no way to reconstruct the truth.
  */
-import { BASE_ASSET, DEFAULTS } from "./config";
+import { BASE_ASSET, DEFAULTS, STRATEGY_TRIANGULAR, type Strategy } from "./config";
 import {
   round8,
   type ExecutedLeg,
@@ -36,6 +36,8 @@ export interface Settings {
   india_mode: number;
   tds_rate: number;
   tax_rate: number;
+  xchg_min_profit_pct: number;
+  xchg_enabled: number;
 }
 
 export type SettingKey = keyof Settings;
@@ -53,6 +55,8 @@ export const SETTING_KEYS: readonly SettingKey[] = [
   "india_mode",
   "tds_rate",
   "tax_rate",
+  "xchg_min_profit_pct",
+  "xchg_enabled",
 ] as const;
 
 /**
@@ -294,6 +298,11 @@ export interface ScanRow {
   executed_count: number;
   duration_ms: number;
   error: string | null;
+  /** Cross-exchange spreads priced this scan; `0` when the strategy was off. */
+  spreads_count: number;
+  best_spread_net_pct: number | null;
+  /** Why cross-exchange produced nothing. Never populates {@link error}. */
+  xchg_error: string | null;
 }
 
 /**
@@ -323,6 +332,19 @@ export interface ScanOutcome {
   bestNetPct: number | null;
   durationMs: number;
   error: string | null;
+  /**
+   * Cross-exchange figures. Optional so that a caller which knows nothing about
+   * the strategy writes the same row it always did (0 / NULL / NULL) rather
+   * than having to name fields it does not own.
+   */
+  spreadsCount?: number;
+  bestSpreadNetPct?: number | null;
+  /**
+   * A cross-exchange failure. Kept out of {@link error} on purpose: `error`
+   * means "this scan failed", and a scan whose triangular half ranked and
+   * filled normally did not fail because one of two venues was unreachable.
+   */
+  xchgError?: string | null;
 }
 
 /**
@@ -338,7 +360,8 @@ export async function finalizeScan(
   await db
     .prepare(
       "UPDATE scans SET source = ?2, pairs_count = ?3, triangles_count = ?4," +
-        " best_net_pct = ?5, duration_ms = ?6, error = ?7 WHERE id = ?1",
+        " best_net_pct = ?5, duration_ms = ?6, error = ?7, spreads_count = ?8," +
+        " best_spread_net_pct = ?9, xchg_error = ?10 WHERE id = ?1",
     )
     .bind(
       scanId,
@@ -348,6 +371,9 @@ export async function finalizeScan(
       outcome.bestNetPct,
       outcome.durationMs,
       outcome.error,
+      outcome.spreadsCount ?? 0,
+      outcome.bestSpreadNetPct ?? null,
+      outcome.xchgError ?? null,
     )
     .run();
 }
@@ -380,6 +406,8 @@ export interface OpportunityRow {
   /** `NULL` when india mode was off for the scan that produced the row. */
   india_net_pct: number | null;
   tds_pct: number | null;
+  /** `'triangular'` or `'cross_exchange'`; defaulted, never NULL. */
+  strategy: string;
 }
 
 /** The shape the API hands out: `legs_json` parsed, `executed` as a boolean. */
@@ -395,6 +423,7 @@ export interface Opportunity {
   /** `null` when india mode was off — "not measured", not "measured as zero". */
   indiaNetPct: number | null;
   tdsPct: number | null;
+  strategy: string;
 }
 
 /** Tolerant parse: a corrupt `legs_json` degrades to `[]` rather than a 500. */
@@ -419,6 +448,9 @@ export function toOpportunity(row: OpportunityRow): Opportunity {
     legs: parseLegs(row.legs_json),
     indiaNetPct: row.india_net_pct ?? null,
     tdsPct: row.tds_pct ?? null,
+    // A row written before migration 0003 has no column at all; it was a
+    // triangle, so that is what it reads back as rather than an empty string.
+    strategy: row.strategy ?? STRATEGY_TRIANGULAR,
   };
 }
 
@@ -436,12 +468,17 @@ export interface OpportunityInput {
 /**
  * Persist a scan's ranked cycles and return their ids **in the same order**,
  * so the caller can mark the executed one without a second query.
+ *
+ * `strategy` is a trailing parameter with the pre-Phase-9 value as its default:
+ * every existing call site keeps writing triangles without being edited, and a
+ * new one has to name the strategy deliberately.
  */
 export async function insertOpportunities(
   db: D1Database,
   scanId: number,
   quotes: OpportunityInput[],
   ts: number = Date.now(),
+  strategy: Strategy = STRATEGY_TRIANGULAR,
 ): Promise<number[]> {
   if (quotes.length === 0) return [];
 
@@ -450,8 +487,8 @@ export async function insertOpportunities(
       db
         .prepare(
           "INSERT INTO opportunities (scan_id, ts, cycle, gross_pct, net_pct, executed," +
-            " legs_json, india_net_pct, tds_pct)" +
-            " VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8) RETURNING id",
+            " legs_json, india_net_pct, tds_pct, strategy)" +
+            " VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9) RETURNING id",
         )
         .bind(
           scanId,
@@ -462,6 +499,7 @@ export async function insertOpportunities(
           JSON.stringify(q.legs),
           q.indiaNetPct ?? null,
           q.tdsPct ?? null,
+          strategy,
         ),
     ),
   );
@@ -479,14 +517,30 @@ export async function markOpportunityExecuted(
     .run();
 }
 
+/**
+ * Newest opportunities first, optionally narrowed to one strategy.
+ *
+ * The filter is applied in SQL rather than by slicing the result, so a
+ * `?strategy=` request still returns `limit` rows of the strategy asked for
+ * instead of however many happen to survive in the newest `limit` overall.
+ */
 export async function listOpportunities(
   db: D1Database,
   limit: number,
+  strategy?: Strategy,
 ): Promise<Opportunity[]> {
-  const { results } = await db
-    .prepare("SELECT * FROM opportunities ORDER BY ts DESC, id DESC LIMIT ?1")
-    .bind(limit)
-    .all<OpportunityRow>();
+  const { results } = strategy
+    ? await db
+        .prepare(
+          "SELECT * FROM opportunities WHERE strategy = ?2" +
+            " ORDER BY ts DESC, id DESC LIMIT ?1",
+        )
+        .bind(limit, strategy)
+        .all<OpportunityRow>()
+    : await db
+        .prepare("SELECT * FROM opportunities ORDER BY ts DESC, id DESC LIMIT ?1")
+        .bind(limit)
+        .all<OpportunityRow>();
   return (results ?? []).map(toOpportunity);
 }
 
@@ -523,6 +577,8 @@ export interface TradeRow {
   net_profit: number | null;
   tds_rate: number;
   tax_rate: number;
+  /** `'triangular'` or `'cross_exchange'`; defaulted, never NULL. */
+  strategy: string;
 }
 
 export interface Trade {
@@ -544,6 +600,7 @@ export interface Trade {
   netProfitPct: number;
   tdsRate: number;
   taxRate: number;
+  strategy: string;
 }
 
 export function toTrade(row: TradeRow): Trade {
@@ -573,14 +630,28 @@ export function toTrade(row: TradeRow): Trade {
     netProfitPct: startAmount > 0 ? round8((netProfit / startAmount) * 100) : 0,
     tdsRate: row.tds_rate ?? 0,
     taxRate: row.tax_rate ?? 0,
+    strategy: row.strategy ?? STRATEGY_TRIANGULAR,
   };
 }
 
-export async function listTrades(db: D1Database, limit: number): Promise<Trade[]> {
-  const { results } = await db
-    .prepare("SELECT * FROM trades ORDER BY ts DESC, id DESC LIMIT ?1")
-    .bind(limit)
-    .all<TradeRow>();
+/** Newest trades first, optionally narrowed to one strategy (see
+ *  {@link listOpportunities} for why the filter is in SQL). */
+export async function listTrades(
+  db: D1Database,
+  limit: number,
+  strategy?: Strategy,
+): Promise<Trade[]> {
+  const { results } = strategy
+    ? await db
+        .prepare(
+          "SELECT * FROM trades WHERE strategy = ?2 ORDER BY ts DESC, id DESC LIMIT ?1",
+        )
+        .bind(limit, strategy)
+        .all<TradeRow>()
+    : await db
+        .prepare("SELECT * FROM trades ORDER BY ts DESC, id DESC LIMIT ?1")
+        .bind(limit)
+        .all<TradeRow>();
   return (results ?? []).map(toTrade);
 }
 
@@ -638,15 +709,29 @@ export interface CommitTradeInput {
   scanId: number;
   opportunityId: number | null;
   trade: ExecutedTrade;
-  source: SnapshotSource | null;
+  /**
+   * Which upstream priced the fill. Widened from `SnapshotSource` to a plain
+   * string in Phase 9: a cross-exchange fill is priced by *two* venues at once
+   * and records `"binance-ws+mexc-rest"`, which is not one of the two enum
+   * members and should not be forced to pick one of them.
+   */
+  source: SnapshotSource | string | null;
   ts?: number;
   /** India-mode figures. Absent means "no tax regime applied to this fill". */
   tax?: TaxBreakdown;
+  /** Defaults to `triangular`, so pre-Phase-9 call sites are unchanged. */
+  strategy?: Strategy;
 }
 
 /**
- * Book a simulated cycle: balance, trade row, opportunity flag and the scan's
+ * Book a simulated fill: balance, trade row, opportunity flag and the scan's
  * `executed_count`, all in one `batch()` so they land together or not at all.
+ *
+ * Called **at most once per strategy per scan**, so `executed_count` is 0, 1 or
+ * 2 — one triangular fill and one cross-exchange fill. The two are deliberately
+ * independent: they are different books, different notionals of the same
+ * balance, and one being unaffordable or below threshold says nothing about the
+ * other.
  *
  * The balance moves by the profit **less any TDS withheld**. The start notional
  * is debited and the end notional credited within the same instant, so
@@ -672,8 +757,8 @@ export async function commitTrade(
       .prepare(
         "INSERT INTO trades (ts, cycle, start_amount, end_amount, profit, profit_pct," +
           " legs_json, source, opportunity_id, tds_base, tds_withheld, tax_due," +
-          " net_profit, tds_rate, tax_rate)" +
-          " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)" +
+          " net_profit, tds_rate, tax_rate, strategy)" +
+          " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)" +
           " RETURNING id",
       )
       .bind(
@@ -694,6 +779,7 @@ export async function commitTrade(
         // today's settings would rewrite history on the next retune.
         tax?.tdsRate ?? 0,
         tax?.taxRate ?? 0,
+        input.strategy ?? STRATEGY_TRIANGULAR,
       ),
     db
       .prepare("UPDATE scans SET executed_count = executed_count + 1 WHERE id = ?1")

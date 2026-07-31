@@ -22,6 +22,21 @@ export {
   type TriangleQuote,
 } from "./profit";
 export {
+  crossVenueBook,
+  evaluateSpread,
+  rankSpreads,
+  simulateSpread,
+  spreadHops,
+  spreadLabel,
+  spreadQuoteTax,
+  spreadTax,
+  type RankSpreadsOptions,
+  type SpreadMarket,
+  type SpreadQuote,
+  type SpreadQuoteTax,
+  type VenueBook,
+} from "./crossExchange";
+export {
   computeChainTax,
   computeTradeTax,
   disposalValues,

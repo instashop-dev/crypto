@@ -3,8 +3,13 @@
  * trades. `POST /api/scan` and (from Phase 5) the cron handler both call
  * {@link runScan}, so manual and scheduled scans can never drift apart.
  */
-import { discoverPairs, getSnapshot } from "./binance";
-import { ASSET_UNIVERSE, BASE_ASSET } from "./config";
+import { discoverPairs, getDualSnapshot, getSnapshot, type DualSnapshot } from "./binance";
+import {
+  ASSET_UNIVERSE,
+  BASE_ASSET,
+  STRATEGY_CROSS_EXCHANGE,
+  STRATEGY_TRIANGULAR,
+} from "./config";
 import {
   commitTrade,
   ensureSeeded,
@@ -27,12 +32,30 @@ import {
   computeTradeTax,
   quoteTax,
   rankOpportunities,
+  rankSpreads,
   simulateExecution,
+  simulateSpread,
+  spreadQuoteTax,
+  spreadTax,
+  type VenueBook,
 } from "./engine";
 import type { Env, PairInfo, SnapshotSource } from "./types";
 
 /** How many ranked cycles are kept per scan. */
 export const OPPORTUNITIES_PER_SCAN = 10;
+
+/**
+ * How many ranked spreads are kept per scan.
+ *
+ * A separate budget from {@link OPPORTUNITIES_PER_SCAN} rather than a shared
+ * one: the two strategies rank on incomparable universes, so a shared top-10
+ * would let a day of wide spreads evict every triangle from the history (or the
+ * reverse) and silently change what the dashboard is a record of.
+ */
+export const SPREADS_PER_SCAN = 10;
+
+/** Recorded as the `source` of a cross-exchange fill: it took both venues. */
+const XCHG_SOURCE = "binance-ws+mexc-rest";
 
 /**
  * A lock older than this is treated as abandoned.
@@ -57,6 +80,7 @@ export interface ScanResult {
   trianglesCount: number;
   /** Net percent of the best cycle, or `null` when none could be priced. */
   bestNetPct: number | null;
+  /** Triangular execution only; cross-exchange has its own flag below. */
   executed: boolean;
   tradeId?: number;
   durationMs: number;
@@ -65,12 +89,21 @@ export interface ScanResult {
   skipped?: boolean;
   /** India-mode figures for the executed trade; absent when the mode is off. */
   tax?: { tdsWithheld: number; taxDue: number; netProfit: number };
+  /** Cross-exchange spreads priced; `0` when the strategy is off or degraded. */
+  spreadsCount: number;
+  bestSpreadNetPct: number | null;
+  xchgExecuted: boolean;
+  xchgTradeId?: number;
+  /** Why cross-exchange produced nothing. Never sets {@link error}. */
+  xchgError?: string;
 }
 
 /** Injection seams. Production passes nothing; tests override the clock. */
 export interface ScanDeps {
   now?: () => number;
   discover?: (universe: string[], env: Env) => Promise<PairInfo[]>;
+  /** Dual-venue snapshot seam; defaults to the real two-source fetch. */
+  getSnapshots?: (symbols: string[], env: Env) => Promise<DualSnapshot>;
 }
 
 function errorMessage(err: unknown): string {
@@ -148,6 +181,9 @@ export async function runScan(
       durationMs: now() - startedAt,
       skipped: true,
       error: "scan already in progress",
+      spreadsCount: 0,
+      bestSpreadNetPct: null,
+      xchgExecuted: false,
     };
   }
 
@@ -161,6 +197,11 @@ export async function runScan(
   let tradeId: number | undefined;
   let error: string | null = null;
   let tax: ScanResult["tax"];
+  let spreadsCount = 0;
+  let bestSpreadNetPct: number | null = null;
+  let xchgExecuted = false;
+  let xchgTradeId: number | undefined;
+  let xchgError: string | null = null;
 
   try {
     const settings = await getSettings(db);
@@ -170,10 +211,17 @@ export async function runScan(
     pairsCount = pairs.length;
     if (pairsCount === 0) throw new Error("no tradable pairs available");
 
-    const snapshot = await getSnapshot(
-      pairs.map((p) => p.symbol),
-      env,
-    );
+    const symbols = pairs.map((p) => p.symbol);
+    // With the strategy on, both venues are wanted, so they are fetched
+    // concurrently and the triangular scanner reads `primary` — which is
+    // exactly the snapshot the sequential chain would have produced. With it
+    // off, nothing changes at all: the same single call, the same fallback
+    // order, no second REST request.
+    const dual =
+      settings.xchg_enabled !== 0
+        ? await (deps.getSnapshots ?? getDualSnapshot)(symbols, env)
+        : null;
+    const snapshot = dual ? dual.primary : await getSnapshot(symbols, env);
     source = snapshot.source;
 
     const quotes = rankOpportunities(
@@ -204,7 +252,16 @@ export async function runScan(
         tdsPct: figures?.tdsPct ?? null,
       };
     });
-    const opportunityIds = await insertOpportunities(db, scanId, rows, snapshot.ts);
+    // Tagged explicitly rather than leaning on the default: with two strategies
+    // writing to one table, "which one wrote this row" should be visible at the
+    // call site rather than inherited from a signature.
+    const opportunityIds = await insertOpportunities(
+      db,
+      scanId,
+      rows,
+      snapshot.ts,
+      STRATEGY_TRIANGULAR,
+    );
 
     const best = top[0];
     // A negative threshold means demo mode: fill the best cycle uncondition-
@@ -246,6 +303,7 @@ export async function runScan(
               trade: simulated,
               source: snapshot.source,
               ts: snapshot.ts,
+              strategy: STRATEGY_TRIANGULAR,
               ...(breakdown ? { tax: breakdown } : {}),
             });
             executed = true;
@@ -258,6 +316,116 @@ export async function runScan(
             }
           }
         }
+      }
+    }
+
+    // -- cross-exchange spreads ---------------------------------------------
+    //
+    // Deliberately last, and deliberately inside its own try/catch. The
+    // triangular half is the product's original promise and must not be able to
+    // fail because a second venue was unreachable or a new engine path threw,
+    // so anything raised here lands in `xchgError` (a column of its own) and
+    // never in `error`. The scan is degraded, not failed.
+    if (dual && settings.xchg_enabled !== 0) {
+      try {
+        if (!dual.binance || !dual.mexc) {
+          // A spread needs two opinions by definition; one venue is not a
+          // degraded spread, it is no spread at all.
+          xchgError =
+            dual.failures.join("; ") || "cross-exchange needs both venues";
+        } else {
+          const venues: [VenueBook, VenueBook] = [
+            { venue: dual.binance.source, book: dual.binance.book },
+            { venue: dual.mexc.source, book: dual.mexc.book },
+          ];
+          // Only markets that settle in the base asset: an ETH/BTC spread
+          // would leave the paper portfolio holding a directional BTC position
+          // rather than closing back to USDT.
+          const markets = pairs.filter((p) => p.quote === BASE_ASSET);
+
+          const spreads = rankSpreads(
+            markets,
+            venues[0],
+            venues[1],
+            settings.fee_rate,
+            BASE_ASSET,
+          );
+          spreadsCount = spreads.length;
+          bestSpreadNetPct = spreads.length > 0 ? spreads[0].netPct : null;
+
+          const topSpreads = spreads.slice(0, SPREADS_PER_SCAN);
+          const spreadRows: OpportunityInput[] = topSpreads.map((q) => {
+            const figures = policy.enabled
+              ? spreadQuoteTax(q, settings.fee_rate, BASE_ASSET, policy)
+              : null;
+            return {
+              cycle: q.label,
+              grossPct: q.grossPct,
+              netPct: q.netPct,
+              legs: q.legs,
+              indiaNetPct: figures?.indiaNetPct ?? null,
+              tdsPct: figures?.tdsPct ?? null,
+            };
+          });
+          const spreadIds = await insertOpportunities(
+            db,
+            scanId,
+            spreadRows,
+            snapshot.ts,
+            STRATEGY_CROSS_EXCHANGE,
+          );
+
+          const bestSpread = topSpreads[0];
+          // Same demo-mode convention as the triangular threshold.
+          const xchgDemo = settings.xchg_min_profit_pct < 0;
+          if (
+            bestSpread &&
+            (xchgDemo || bestSpread.netPct >= settings.xchg_min_profit_pct)
+          ) {
+            // Re-read: the triangular fill above may already have moved the
+            // balance (up, or down by its TDS), and a stale read here could
+            // book a fill the portfolio cannot fund.
+            const balance = await getBalance(db, BASE_ASSET);
+            if (balance >= settings.trade_size_usdt) {
+              const simulated = simulateSpread(
+                bestSpread,
+                venues[0],
+                venues[1],
+                settings.fee_rate,
+                settings.trade_size_usdt,
+              );
+              if (simulated) {
+                // A spread is a two-disposal chain, and both disposals are of a
+                // VDA — see src/engine/crossExchange.ts. Re-priced from the
+                // quote, never from `simulated.legs`, whose amounts are
+                // round8-quantised for reporting.
+                const breakdown = policy.enabled
+                  ? spreadTax(
+                      bestSpread,
+                      settings.fee_rate,
+                      settings.trade_size_usdt,
+                      BASE_ASSET,
+                      policy,
+                    )
+                  : null;
+                if (breakdown || !policy.enabled) {
+                  xchgTradeId = await commitTrade(db, {
+                    scanId,
+                    opportunityId: spreadIds[0] ?? null,
+                    trade: simulated,
+                    source: XCHG_SOURCE,
+                    ts: snapshot.ts,
+                    strategy: STRATEGY_CROSS_EXCHANGE,
+                    ...(breakdown ? { tax: breakdown } : {}),
+                  });
+                  xchgExecuted = true;
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        xchgError = errorMessage(err);
       }
     }
   } catch (err) {
@@ -281,6 +449,9 @@ export async function runScan(
       bestNetPct,
       durationMs,
       error,
+      spreadsCount,
+      bestSpreadNetPct,
+      xchgError,
     });
   } catch (err) {
     error = error ?? errorMessage(err);
@@ -297,5 +468,10 @@ export async function runScan(
     durationMs,
     ...(error != null ? { error } : {}),
     ...(tax != null ? { tax } : {}),
+    spreadsCount,
+    bestSpreadNetPct,
+    xchgExecuted,
+    ...(xchgTradeId != null ? { xchgTradeId } : {}),
+    ...(xchgError != null ? { xchgError } : {}),
   };
 }

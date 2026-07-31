@@ -5,8 +5,12 @@ import {
   buildStreamUrl,
   discoverPairs,
   fetchMexcSnapshot,
+  getDualSnapshot,
+  getRestFetcher,
   getSnapshot,
   MEXC_BASE,
+  setRestFetcher,
+  type RestFetcher,
 } from "../src/binance";
 import { ASSET_UNIVERSE, candidateSymbols } from "../src/config";
 import type { BookTickerEntry, Env } from "../src/types";
@@ -26,6 +30,7 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+  setRestFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -249,6 +254,145 @@ describe("getSnapshot", () => {
     await expect(
       getSnapshot(symbols, mockEnv, { collectWs: async () => bookOf(["BTCUSDT", 1, 2]) }),
     ).rejects.toThrow(/covered only 1\/3 symbols/);
+  });
+});
+
+describe("getDualSnapshot", () => {
+  const symbols = ["BTCUSDT", "ETHUSDT", "ETHBTC"];
+
+  function bookOf(...entries: Array<[string, number, number]>) {
+    return new Map<string, BookTickerEntry>(
+      entries.map(([symbol, bid, ask]) => [symbol, { symbol, bid, ask }]),
+    );
+  }
+
+  const full = () => bookOf(["BTCUSDT", 1, 2], ["ETHUSDT", 3, 4], ["ETHBTC", 5, 6]);
+
+  it("returns both venues' books, with Binance as primary", async () => {
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => full(),
+      fetchRest: async () => bookOf(["BTCUSDT", 10, 20], ["ETHUSDT", 30, 40]),
+    });
+
+    expect(dual.binance?.source).toBe("binance-ws");
+    expect(dual.mexc?.source).toBe("mexc-rest");
+    expect(dual.binance?.book.size).toBe(3);
+    expect(dual.mexc?.book.size).toBe(2);
+    // The two books really are distinct venues, not the same object twice.
+    expect(dual.binance!.book.get("BTCUSDT")).toEqual({
+      symbol: "BTCUSDT",
+      bid: 1,
+      ask: 2,
+    });
+    expect(dual.mexc!.book.get("BTCUSDT")).toEqual({
+      symbol: "BTCUSDT",
+      bid: 10,
+      ask: 20,
+    });
+
+    // `primary` is exactly what getSnapshot would have returned.
+    expect(dual.primary).toBe(dual.binance);
+    expect(dual.failures).toEqual([]);
+  });
+
+  it("calls each source exactly once", async () => {
+    let ws = 0;
+    let rest = 0;
+
+    await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => {
+        ws++;
+        return full();
+      },
+      fetchRest: async () => {
+        rest++;
+        return full();
+      },
+    });
+
+    // A healthy WebSocket no longer short-circuits the REST call — the second
+    // venue is a second opinion now, not a fallback — but neither is retried.
+    expect(ws).toBe(1);
+    expect(rest).toBe(1);
+  });
+
+  it("drops a WebSocket book that is below the coverage threshold", async () => {
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      // 1 of 3 = 33% < 60%
+      collectWs: async () => bookOf(["BTCUSDT", 1, 2]),
+      fetchRest: async () => full(),
+    });
+
+    expect(dual.binance).toBeNull();
+    expect(dual.mexc?.source).toBe("mexc-rest");
+    expect(dual.primary.source).toBe("mexc-rest");
+    expect(dual.failures).toEqual(["binance-ws: covered only 1/3 symbols"]);
+  });
+
+  it("keeps Binance as primary when the REST venue fails", async () => {
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => full(),
+      fetchRest: async () => {
+        throw new Error("HTTP 451");
+      },
+    });
+
+    expect(dual.mexc).toBeNull();
+    expect(dual.binance?.source).toBe("binance-ws");
+    expect(dual.primary.source).toBe("binance-ws");
+    expect(dual.failures.join()).toContain("mexc-rest:");
+    expect(dual.failures.join()).toContain("451");
+  });
+
+  it("reports an unmatched REST book as a failure, not an empty venue", async () => {
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => full(),
+      fetchRest: async () => new Map(),
+    });
+
+    expect(dual.mexc).toBeNull();
+    expect(dual.failures).toEqual([
+      "mexc-rest: none of the requested symbols were listed",
+    ]);
+  });
+
+  it("throws the same message as getSnapshot when both venues fail", async () => {
+    const deps = {
+      collectWs: async () => {
+        throw new Error("websocket upgrade rejected (HTTP 403)");
+      },
+      fetchRest: async () => {
+        throw new Error("HTTP 451");
+      },
+    };
+
+    // Byte-identical failure text, so a scan row's error does not depend on
+    // which of the two code paths produced it.
+    const sequential = await getSnapshot(symbols, mockEnv, deps).catch((e) => e);
+    const dual = await getDualSnapshot(symbols, mockEnv, deps).catch((e) => e);
+
+    expect(dual).toBeInstanceOf(Error);
+    expect(dual.message).toBe(sequential.message);
+    expect(dual.message).toMatch(/no market-data source available/);
+    expect(dual.message).toMatch(/binance-ws:.*403.*mexc-rest:.*451/s);
+  });
+
+  it("uses the module-level REST seam, and restores it", async () => {
+    const stub: RestFetcher = async () => bookOf(["BTCUSDT", 99, 100]);
+    setRestFetcher(stub);
+    expect(getRestFetcher()).toBe(stub);
+
+    const dual = await getDualSnapshot(symbols, mockEnv, {
+      collectWs: async () => full(),
+    });
+    expect(dual.mexc!.book.get("BTCUSDT")).toEqual({
+      symbol: "BTCUSDT",
+      bid: 99,
+      ask: 100,
+    });
+
+    setRestFetcher(null);
+    expect(getRestFetcher()).toBe(fetchMexcSnapshot);
   });
 });
 
