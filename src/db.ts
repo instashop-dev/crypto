@@ -31,6 +31,7 @@ import type { PairInfo } from "./types";
 /** The tunables, always fully populated (DEFAULTS fill any gap). */
 export interface Settings {
   fee_rate: number;
+  perp_fee_rate: number;
   initial_usdt: number;
   india_mode: number;
   tds_rate: number;
@@ -62,6 +63,7 @@ export const SETTING_KEYS: readonly SettingKey[] = [
   "xchg_enabled",
   "funding_min_annual_pct",
   "funding_hold_days",
+  "perp_fee_rate",
 ] as const;
 
 /**

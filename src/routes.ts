@@ -74,6 +74,7 @@ const LIMITS = {
  *  would silently rewrite history rather than change behaviour. */
 const MUTABLE_SETTINGS = [
   "fee_rate",
+  "perp_fee_rate",
   "india_mode",
   "tds_rate",
   "tax_rate",
@@ -327,8 +328,13 @@ export function validateSettingsPatch(
     if (typeof value !== "number" || !Number.isFinite(value)) {
       return { ok: false, error: `${key} must be a finite number` };
     }
-    if (key === "fee_rate" && (value < 0 || value > MAX_FEE_RATE)) {
-      return { ok: false, error: `fee_rate must be between 0 and ${MAX_FEE_RATE}` };
+    // Both taker rates share one ceiling: the spot leg and the perp leg differ
+    // in what they typically cost, not in what counts as a fat finger.
+    if (
+      (key === "fee_rate" || key === "perp_fee_rate") &&
+      (value < 0 || value > MAX_FEE_RATE)
+    ) {
+      return { ok: false, error: `${key} must be between 0 and ${MAX_FEE_RATE}` };
     }
     // A flag, not a rate: `1.5` or `2` almost certainly means the caller thinks
     // this field means something else, so it is rejected rather than coerced.
@@ -531,8 +537,9 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * about a measurement, not part of it, and raising the threshold must
    * re-classify yesterday's rows rather than leave them claiming an answer to a
    * question nobody asks any more. The two percentages beside it are the
-   * opposite case — they were computed from the fee rate in force at poll time
-   * and are stored, so retuning `fee_rate` does not rewrite history.
+   * opposite case — they were computed from the fee rates in force at poll time
+   * and are stored, so retuning `fee_rate` or `perp_fee_rate` re-prices future
+   * boards only and does not rewrite history.
    *
    * An empty table answers 200, not 404: "no board yet" is the state of every
    * deployment for its first few seconds.
@@ -550,6 +557,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
         minAnnualPct,
         holdDays: settings.funding_hold_days,
         feeRate: settings.fee_rate,
+        perpFeeRate: settings.perp_fee_rate,
         pollIntervalMs: FUNDING_POLL_INTERVAL_MS,
       };
 

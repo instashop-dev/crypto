@@ -220,7 +220,7 @@ describe("scheduled()", () => {
     expect(rates).toHaveLength(perpAssets(ASSET_UNIVERSE, BASE_ASSET).length);
     expect(rates.every((r) => r.venue === "bybit")).toBe(true);
     expect(rates[0].annualizedPct).toBeCloseTo(10.95, 8);
-    expect(rates[0].netAnnualPct).toBeCloseTo(6.08333333, 6);
+    expect(rates[0].netAnnualPct).toBeCloseTo(7.3, 6);
 
     const [scan] = await listScans(env.DB, 10);
     const { results } = await env.DB.prepare(

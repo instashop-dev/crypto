@@ -3,15 +3,18 @@
  *
  * Every expectation here is hand-derived from the closed forms in the module
  * docblock — no fixtures, no clock, no I/O. The worked example
- * (0.0001 per 8h, 0.1%/leg, held 30 days) is the same one the README and the
- * module comments quote, so all three move together or not at all.
+ * (0.0001 per 8h, 0.1%/spot leg, 0.05%/perp leg, held 30 days) is the same one
+ * the README and the module comments quote, so all three move together or not
+ * at all.
  */
 import { describe, expect, it } from "vitest";
 import {
   annualizedPct,
   DEFAULT_FUNDING_INTERVAL_MINUTES,
   feeDragAnnualPct,
+  FUNDING_PERP_LEGS,
   FUNDING_ROUND_TRIP_LEGS,
+  FUNDING_SPOT_LEGS,
   MINUTES_PER_YEAR,
   netAnnualPct,
   periodsPerYear,
@@ -23,11 +26,23 @@ import {
 /** The worked example, named once. */
 const RATE = 0.0001;
 const INTERVAL = 480;
-const FEE = 0.001;
+/** Spot taker, charged on the buy-spot and sell-spot legs. */
+const SPOT_FEE = 0.001;
+/** Perp taker, charged on the sell-perp and buy-back legs: half the spot rate. */
+const PERP_FEE = 0.0005;
 const HOLD_DAYS = 30;
 const ANNUAL = 10.95;
-const DRAG = 4.86666667;
-const NET = 6.08333333;
+/** (2 x 0.001 + 2 x 0.0005) x (365/30) x 100. */
+const DRAG = 3.65;
+const NET = 7.3;
+
+/**
+ * What the same example priced at before the fees were split — the spot rate
+ * charged on all four legs. Kept as a named constant because several tests
+ * assert the size of the correction, not just the new number.
+ */
+const SPOT_ONLY_DRAG = 4.86666667;
+const SPOT_ONLY_NET = 6.08333333;
 
 describe("periodsPerYear", () => {
   it("divides the 365-day year by the settlement cadence", () => {
@@ -86,72 +101,109 @@ describe("annualizedPct", () => {
 });
 
 describe("roundTripFeeFraction", () => {
-  it("charges all four legs: in and out, on both venues", () => {
+  it("charges all four legs: in and out, two spot and two perp", () => {
+    expect(FUNDING_SPOT_LEGS).toBe(2);
+    expect(FUNDING_PERP_LEGS).toBe(2);
     expect(FUNDING_ROUND_TRIP_LEGS).toBe(4);
-    expect(roundTripFeeFraction(FEE)).toBe(0.004);
-    expect(roundTripFeeFraction(FEE, 2)).toBe(0.002);
-    expect(roundTripFeeFraction(0)).toBe(0);
+    // 2 x 0.001 + 2 x 0.0005
+    expect(roundTripFeeFraction(SPOT_FEE, PERP_FEE)).toBe(0.003);
+    expect(roundTripFeeFraction(0, 0)).toBe(0);
   });
 
-  it("returns null for an out-of-range fee or leg count", () => {
-    expect(roundTripFeeFraction(1)).toBeNull();
-    expect(roundTripFeeFraction(-0.001)).toBeNull();
-    expect(roundTripFeeFraction(Number.NaN)).toBeNull();
-    expect(roundTripFeeFraction(FEE, 0)).toBeNull();
+  it("prices the perp legs cheaper than the spot ones", () => {
+    // The whole point of the split: charging the spot rate on all four legs
+    // costs 0.4% of notional where the real round trip costs 0.3%.
+    expect(roundTripFeeFraction(SPOT_FEE, SPOT_FEE)).toBe(0.004);
+    expect(roundTripFeeFraction(SPOT_FEE, 0)).toBe(0.002);
+    expect(roundTripFeeFraction(0, PERP_FEE)).toBe(0.001);
+  });
+
+  it("returns null when either rate is out of range, never a free leg", () => {
+    expect(roundTripFeeFraction(1, PERP_FEE)).toBeNull();
+    expect(roundTripFeeFraction(SPOT_FEE, 1)).toBeNull();
+    expect(roundTripFeeFraction(-0.001, PERP_FEE)).toBeNull();
+    expect(roundTripFeeFraction(SPOT_FEE, -0.001)).toBeNull();
+    expect(roundTripFeeFraction(Number.NaN, PERP_FEE)).toBeNull();
+    expect(roundTripFeeFraction(SPOT_FEE, Number.NaN)).toBeNull();
   });
 });
 
 describe("feeDragAnnualPct", () => {
   it("amortises the round trip over the holding period", () => {
-    expect(feeDragAnnualPct(FEE, HOLD_DAYS)).toBe(DRAG);
-    // Held a year, the whole round trip is 0.4% of one year's notional.
-    expect(feeDragAnnualPct(FEE, 365)).toBe(0.4);
-    // Held a day, the same 0.4% is paid 365 times over.
-    expect(feeDragAnnualPct(FEE, 1)).toBe(146);
+    expect(feeDragAnnualPct(SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBe(DRAG);
+    // Held a year, the whole round trip is 0.3% of one year's notional.
+    expect(feeDragAnnualPct(SPOT_FEE, PERP_FEE, 365)).toBe(0.3);
+    // Held a day, the same 0.3% is paid 365 times over.
+    expect(feeDragAnnualPct(SPOT_FEE, PERP_FEE, 1)).toBe(109.5);
+  });
+
+  it("is a quarter lighter than charging the spot rate on all four legs", () => {
+    expect(feeDragAnnualPct(SPOT_FEE, SPOT_FEE, HOLD_DAYS)).toBe(SPOT_ONLY_DRAG);
+    // 0.001 of notional per round trip, annualised over 30 days.
+    expect(SPOT_ONLY_DRAG - DRAG).toBeCloseTo(0.001 * (365 / 30) * 100, 6);
+    expect(DRAG / SPOT_ONLY_DRAG).toBeCloseTo(0.75, 8);
   });
 
   it("returns null for a non-positive or non-finite holding period", () => {
     for (const bad of [0, -30, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(feeDragAnnualPct(FEE, bad), String(bad)).toBeNull();
+      expect(feeDragAnnualPct(SPOT_FEE, PERP_FEE, bad), String(bad)).toBeNull();
     }
   });
 });
 
 describe("netAnnualPct", () => {
   it("reproduces the worked example end to end", () => {
-    expect(netAnnualPct(RATE, INTERVAL, FEE, HOLD_DAYS)).toBe(NET);
-    expect(netAnnualPct(RATE, INTERVAL, FEE, HOLD_DAYS)).toBeCloseTo(6, 0);
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBe(NET);
     expect(ANNUAL - DRAG).toBeCloseTo(NET, 8);
   });
 
+  it("lifts the worked example from 6.08% to 7.30% by pricing the perp legs", () => {
+    // The recorded production figure was computed with the spot rate on all
+    // four legs; the correction is exactly the two perp legs' overcharge,
+    // 2 x (0.001 - 0.0005) of notional, annualised over the 30-day hold.
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, SPOT_FEE, HOLD_DAYS)).toBe(
+      SPOT_ONLY_NET,
+    );
+    expect(NET - SPOT_ONLY_NET).toBeCloseTo(
+      2 * (SPOT_FEE - PERP_FEE) * (365 / HOLD_DAYS) * 100,
+      6,
+    );
+  });
+
   it("keeps more of the carry the longer the position is held", () => {
-    expect(netAnnualPct(RATE, INTERVAL, FEE, 365)).toBe(10.55);
-    expect(netAnnualPct(RATE, INTERVAL, FEE, 1)).toBe(-135.05);
-    // The break-even holding period: drag equals the carry.
-    const breakEven = (0.004 * 365 * 100) / ANNUAL;
-    expect(netAnnualPct(RATE, INTERVAL, FEE, breakEven)).toBeCloseTo(0, 6);
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, PERP_FEE, 365)).toBe(10.65);
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, PERP_FEE, 1)).toBe(-98.55);
+    // The break-even holding period: drag equals the carry. At 0.3% a round
+    // trip against 10.95% a year, that is exactly 10 days.
+    const breakEven = (0.003 * 365 * 100) / ANNUAL;
+    expect(breakEven).toBeCloseTo(10, 8);
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, PERP_FEE, breakEven)).toBeCloseTo(
+      0,
+      6,
+    );
   });
 
   it("agrees with the holding-period return re-annualised", () => {
     // The whole point of annualising: netAnnual x (days/365) must equal the
     // return actually earned over those days, which is the funding collected
     // less the one round trip of fees.
-    const periodNet = (ANNUAL * HOLD_DAYS) / 365 - 0.004 * 100;
+    const periodNet = (ANNUAL * HOLD_DAYS) / 365 - 0.003 * 100;
     expect((NET * HOLD_DAYS) / 365).toBeCloseTo(periodNet, 8);
-    expect(periodNet).toBeCloseTo(0.5, 8);
+    expect(periodNet).toBeCloseTo(0.6, 8);
   });
 
   it("is interval-agnostic: 4h at half the rate is the same trade", () => {
-    expect(netAnnualPct(0.00005, 240, FEE, HOLD_DAYS)).toBe(NET);
-    expect(netAnnualPct(0.0000125, 60, FEE, HOLD_DAYS)).toBe(NET);
+    expect(netAnnualPct(0.00005, 240, SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBe(NET);
+    expect(netAnnualPct(0.0000125, 60, SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBe(NET);
   });
 
   it("returns null, never NaN, when either half is unpriceable", () => {
-    expect(netAnnualPct(1, INTERVAL, FEE, HOLD_DAYS)).toBeNull();
-    expect(netAnnualPct(RATE, 0, FEE, HOLD_DAYS)).toBeNull();
-    expect(netAnnualPct(RATE, INTERVAL, 1, HOLD_DAYS)).toBeNull();
-    expect(netAnnualPct(RATE, INTERVAL, FEE, 0)).toBeNull();
-    expect(netAnnualPct(Number.NaN, INTERVAL, FEE, HOLD_DAYS)).toBeNull();
+    expect(netAnnualPct(1, INTERVAL, SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBeNull();
+    expect(netAnnualPct(RATE, 0, SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBeNull();
+    expect(netAnnualPct(RATE, INTERVAL, 1, PERP_FEE, HOLD_DAYS)).toBeNull();
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, 1, HOLD_DAYS)).toBeNull();
+    expect(netAnnualPct(RATE, INTERVAL, SPOT_FEE, PERP_FEE, 0)).toBeNull();
+    expect(netAnnualPct(Number.NaN, INTERVAL, SPOT_FEE, PERP_FEE, HOLD_DAYS)).toBeNull();
   });
 });
 
@@ -165,7 +217,8 @@ describe("rankFundingOpportunities", () => {
   it("sorts by net annual return, best first", () => {
     const ranked = rankFundingOpportunities(
       [quote("BTC", 0.0001), quote("ETH", 0.00025), quote("SOL", 0.00005)],
-      FEE,
+      SPOT_FEE,
+      PERP_FEE,
       HOLD_DAYS,
     );
 
@@ -180,7 +233,8 @@ describe("rankFundingOpportunities", () => {
   it("keeps ties in input order, so two scans of one board rank identically", () => {
     const ranked = rankFundingOpportunities(
       [quote("ADA", 0.0001), quote("BTC", 0.0001), quote("LTC", 0.0001)],
-      FEE,
+      SPOT_FEE,
+      PERP_FEE,
       HOLD_DAYS,
     );
     expect(ranked.map((r) => r.symbol)).toEqual(["ADA", "BTC", "LTC"]);
@@ -196,7 +250,8 @@ describe("rankFundingOpportunities", () => {
         quote("NAN", Number.NaN),
         { symbol: "", rate: 0.0001, intervalMinutes: INTERVAL },
       ],
-      FEE,
+      SPOT_FEE,
+      PERP_FEE,
       HOLD_DAYS,
     );
 
@@ -208,7 +263,8 @@ describe("rankFundingOpportunities", () => {
   it("keeps negative rows — they are the finding on the day they happen", () => {
     const ranked = rankFundingOpportunities(
       [quote("SOL", -0.001034), quote("BTC", 0.0001), quote("ADA", -0.00002)],
-      FEE,
+      SPOT_FEE,
+      PERP_FEE,
       HOLD_DAYS,
     );
 
@@ -217,11 +273,12 @@ describe("rankFundingOpportunities", () => {
     expect(ranked.filter((r) => r.netAnnualPct < 0)).toHaveLength(2);
   });
 
-  it("drops everything when the fee or holding period is unusable", () => {
+  it("drops everything when either fee or the holding period is unusable", () => {
     const quotes = [quote("BTC", 0.0001), quote("ETH", 0.00025)];
-    expect(rankFundingOpportunities(quotes, 1, HOLD_DAYS)).toEqual([]);
-    expect(rankFundingOpportunities(quotes, FEE, 0)).toEqual([]);
-    expect(rankFundingOpportunities([], FEE, HOLD_DAYS)).toEqual([]);
+    expect(rankFundingOpportunities(quotes, 1, PERP_FEE, HOLD_DAYS)).toEqual([]);
+    expect(rankFundingOpportunities(quotes, SPOT_FEE, 1, HOLD_DAYS)).toEqual([]);
+    expect(rankFundingOpportunities(quotes, SPOT_FEE, PERP_FEE, 0)).toEqual([]);
+    expect(rankFundingOpportunities([], SPOT_FEE, PERP_FEE, HOLD_DAYS)).toEqual([]);
   });
 
   it("assumes 8 hours when a venue does not publish its cadence", () => {

@@ -149,8 +149,9 @@ describe("runScan - funding poll", () => {
     expect(result.fundingSkipped).toBeUndefined();
     expect(result.fundingVenue).toBe("bybit");
     expect(result.fundingCount).toBe(11);
-    // 0.0002 per 8h = 21.9% annual, less the 4.86666667% drag at 30 days.
-    expect(result.bestFundingNetAnnualPct).toBeCloseTo(17.03333333, 6);
+    // 0.0002 per 8h = 21.9% annual, less the 3.65% drag at 30 days
+    // (2 x 0.1% spot + 2 x 0.05% perp, annualised).
+    expect(result.bestFundingNetAnnualPct).toBeCloseTo(18.25, 6);
 
     const rows = await fundingRows();
     expect(rows).toHaveLength(11);
@@ -167,14 +168,14 @@ describe("runScan - funding poll", () => {
     expect(rates[0].symbol).toBe("BTC");
     expect(rates[0].rate).toBe(0.0002);
     expect(rates[0].annualizedPct).toBeCloseTo(21.9, 8);
-    expect(rates[0].netAnnualPct).toBeCloseTo(17.03333333, 6);
+    expect(rates[0].netAnnualPct).toBeCloseTo(18.25, 6);
     expect(rates[0].instrument).toBe("BTCUSDT");
     expect(rates[0].venue).toBe("bybit");
     expect(rates[0].nextFundingTs).toBe(clock + 3_600_000);
     // Sorted descending, and every row priced at the same fee drag.
     for (let i = 1; i < rates.length; i++) {
       expect(rates[i].netAnnualPct).toBeLessThanOrEqual(rates[i - 1].netAnnualPct);
-      expect(rates[i].annualizedPct - rates[i].netAnnualPct).toBeCloseTo(4.86666667, 6);
+      expect(rates[i].annualizedPct - rates[i].netAnnualPct).toBeCloseTo(3.65, 6);
     }
   });
 
@@ -198,8 +199,31 @@ describe("runScan - funding poll", () => {
     const [best] = await listLatestFundingRates(env.DB);
     expect(best.rate).toBe(0.0002);
     expect(best.annualizedPct).toBeCloseTo(21.9, 8);
-    // Held a year, the 0.4% round trip is a 0.4% drag rather than 4.87%.
-    expect(best.netAnnualPct).toBeCloseTo(21.5, 6);
+    // Held a year, the 0.3% round trip is a 0.3% drag rather than 3.65%.
+    expect(best.netAnnualPct).toBeCloseTo(21.6, 6);
+  });
+
+  it("charges the perp legs at perp_fee_rate, not the spot rate", async () => {
+    // Raising the perp rate to the spot one reproduces the pre-Phase-13
+    // figure exactly: 21.9% less a 4.86666667% drag. That is the whole size of
+    // the correction, and it is worth 1.21666667%/yr at a 30-day hold.
+    await updateSettings(env.DB, { perp_fee_rate: 0.001 });
+
+    await runScan(env, "manual", { now, fetchFunding: board() });
+
+    const [best] = await listLatestFundingRates(env.DB);
+    expect(best.annualizedPct).toBeCloseTo(21.9, 8);
+    expect(best.netAnnualPct).toBeCloseTo(17.03333333, 6);
+  });
+
+  it("prices the perp legs free when perp_fee_rate is zero", async () => {
+    await updateSettings(env.DB, { perp_fee_rate: 0 });
+
+    await runScan(env, "manual", { now, fetchFunding: board() });
+
+    const [best] = await listLatestFundingRates(env.DB);
+    // Only the two spot legs are left: 0.002 x (365/30) x 100 = 2.43333333%.
+    expect(best.netAnnualPct).toBeCloseTo(21.9 - 2.43333333, 6);
   });
 });
 
@@ -344,7 +368,7 @@ describe("runScan - retention", () => {
       intervalMinutes: 480,
       intervalSource: "api",
       annualizedPct: 10.95,
-      netAnnualPct: 6.08333333,
+      netAnnualPct: 7.3,
       nextFundingTs: null,
       markPrice: null,
     });
