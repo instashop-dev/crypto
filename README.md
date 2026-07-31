@@ -291,6 +291,11 @@ persist_checked_ts set, persist_net_pct set re-priced; this is what was left of 
 persist_checked_ts set, persist_net_pct NULL expired: no fresh snapshot reached it in time
 ```
 
+Rows are also re-priced only once they are **at least 30 seconds old** — a manual
+`POST /api/scan` landing seconds after a cron tick would otherwise measure at a
+near-zero horizon and bias the distribution upward — and a row's actual horizon
+is always readable as `persist_checked_ts − ts`, never assumed.
+
 Rows are re-priced only while younger than 2 minutes, are measured exactly once
 (the write is guarded on `persist_checked_ts IS NULL`), and are never re-priced
 by the scan that wrote them — a zero-second survival horizon is a tautology, not

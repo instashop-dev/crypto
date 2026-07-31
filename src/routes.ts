@@ -656,6 +656,11 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * the row expired before any fresh snapshot could price it. Those three are
    * the whole of the evidence for whether this strategy is real; see the
    * decision rule in the README.
+   *
+   * `feeRate` rides along for the same reason `minProfitPct` does: the two-leg
+   * break-even the UI marks surviving nets against is a function of the fee in
+   * force *now*, so an operator who retunes `fee_rate` must move the bar rather
+   * than leave the dashboard drawing a line from a rate nobody charges.
    */
   app.get("/api/opportunities", async (c) => {
     try {
@@ -676,6 +681,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
         limit,
         strategy: filter.strategy ?? null,
         minProfitPct,
+        feeRate: settings.fee_rate,
         opportunities: opportunities.map((o) => ({
           ...o,
           qualifies: o.netPct >= minProfitPct,

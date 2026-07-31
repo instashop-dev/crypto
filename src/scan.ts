@@ -127,6 +127,24 @@ export const SCAN_LOCK_TTL_MS = 45_000;
 export const SPREAD_PERSIST_MAX_AGE_MS = 120_000;
 
 /**
+ * How *young* a spread row may be and still be re-priced: 30 seconds.
+ *
+ * The floor at the other end of {@link SPREAD_PERSIST_MAX_AGE_MS}, and it exists
+ * because scans are not evenly spaced. The cron ticks minutely, but a manual
+ * `POST /api/scan` can land seconds after one — and would then measure rows at a
+ * survival horizon of near zero, where nothing has had time to move and almost
+ * everything "survives". Those measurements are not wrong so much as answering a
+ * different question, and mixed into the same column they bias the survival
+ * distribution upward.
+ *
+ * A row younger than this is therefore left completely untouched — NULL
+ * `persist_checked_ts`, still eligible — for whichever later scan finds it
+ * inside the window. Since the window runs to two minutes, an ordinary minutely
+ * cadence still gives every row at least one qualifying scan.
+ */
+export const SPREAD_PERSIST_MIN_AGE_MS = 30_000;
+
+/**
  * How far back the survival pass will look for unmeasured rows: one hour.
  *
  * Rows older than this are never even selected, so they keep the NULL that
@@ -311,7 +329,9 @@ async function acquireLock(db: D1Database, now: number): Promise<boolean> {
  *
  * Runs **before** the new board is persisted, so a scan can never measure its
  * own rows: a survival horizon of zero seconds would be a tautology, not a
- * measurement.
+ * measurement. {@link SPREAD_PERSIST_MIN_AGE_MS} extends the same argument to
+ * rows the *previous* scan wrote seconds ago — a manual scan chasing a cron
+ * tick — which are skipped rather than stamped, and taken by a later scan.
  *
  * Returns how many rows were actually stamped.
  */
@@ -342,6 +362,12 @@ export async function measureSpreadPersistence(
       marks.push({ id: row.id, persistNetPct: null, checkedTs: nowTs });
       continue;
     }
+
+    // ...and rows that are too *young* are not stamped at all, only skipped:
+    // measuring one now would quote a near-zero survival horizon into a column
+    // whose whole meaning is "~1 minute later". It stays eligible, and a later
+    // scan inside the window takes it.
+    if (nowTs - row.ts < SPREAD_PERSIST_MIN_AGE_MS) continue;
 
     const label = parseSpreadLabel(row.cycle);
     if (!label) continue;

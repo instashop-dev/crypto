@@ -1021,6 +1021,23 @@ describe("GET /api/opportunities - the qualifies flag", () => {
     expect(body.opportunities.every((o) => o.persistCheckedTs === null)).toBe(true);
   });
 
+  it("reports the fee rate the break-even marker is drawn from", async () => {
+    serveBothVenues();
+    await send("/api/scan", "POST");
+
+    type Body = { feeRate: number; minProfitPct: number };
+    const read = async () => (await (await get("/api/opportunities")).json()) as Body;
+
+    expect((await read()).feeRate).toBe(DEFAULTS.fee_rate);
+
+    // Retuning the fee must move the reported rate, for the same reason
+    // `minProfitPct` tracks its setting: the dashboard's break-even line is a
+    // function of the fee in force now, not the one that priced the rows.
+    await send("/api/settings", "PUT", { fee_rate: 0.004 });
+    expect((await read()).feeRate).toBe(0.004);
+    await send("/api/settings", "PUT", { fee_rate: DEFAULTS.fee_rate });
+  });
+
   it("nothing is ever marked executed, however good the spread looks", async () => {
     serveBothVenues();
     await send("/api/scan", "POST");

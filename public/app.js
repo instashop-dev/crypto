@@ -216,15 +216,32 @@
   const CARRY_CLOSED_COLS = 9;
 
   /**
-   * Two-leg break-even at the **default** 0.1%/leg taker fee, in percent:
-   * `(1 - (1 - 0.001)^2) x 100`. Hard-coded because `/api/opportunities` reports
-   * no fee rate, and it is a display marker only — an operator who retunes
-   * `fee_rate` moves the real bar and this line does not follow them. It marks
-   * which surviving nets clear the bar the README's decision rule names; the
-   * stored `netPct` figures themselves are already net of the fees in force
-   * when they were priced.
+   * Two-leg break-even at the **default** 0.1%/leg taker fee: ~0.2% of notional,
+   * the figure the README's decision rule quotes. Used only when
+   * `/api/opportunities` reports no `feeRate` — an older Worker against a newer
+   * dashboard — so the marker degrades to the default bar rather than vanishing.
    */
-  const SPREAD_BREAK_EVEN_PCT = 0.2002;
+  const SPREAD_BREAK_EVEN_FALLBACK_PCT = 0.2002;
+
+  /**
+   * The bar surviving nets are marked against, in percent: the round-trip cost
+   * of buying and selling once at the taker fee `f`, `(1 / (1 - f)^2 - 1) x 100`.
+   *
+   * Tracked from `/api/opportunities` rather than hard-coded, because the real
+   * break-even moves with `fee_rate` and a display marker that stayed at the
+   * default would quietly mis-flag every row once an operator retuned it. It is
+   * still a marker only: the stored `netPct` figures are already net of the fees
+   * in force when they were priced.
+   */
+  let spreadBreakEvenPct = SPREAD_BREAK_EVEN_FALLBACK_PCT;
+
+  /** Break-even for a taker fee rate; the fallback for anything unusable. */
+  function breakEvenPct(feeRate) {
+    if (!isNum(feeRate) || feeRate < 0 || feeRate >= 1) {
+      return SPREAD_BREAK_EVEN_FALLBACK_PCT;
+    }
+    return (1 / ((1 - feeRate) * (1 - feeRate)) - 1) * 100;
+  }
 
   function setIndiaMode(on) {
     indiaMode = Boolean(on);
@@ -413,7 +430,7 @@
    */
   function survivalCell(netPct, checkedTs) {
     if (isNum(netPct)) {
-      const survives = netPct >= SPREAD_BREAK_EVEN_PCT;
+      const survives = netPct >= spreadBreakEvenPct;
       return (
         '<td class="right num nowrap ' +
         signClass(netPct) +
@@ -447,7 +464,11 @@
    * — exactly as the funding board does with its own threshold. It replaced an
    * "executed" column when Phase 12 removed the fill paths.
    */
-  function renderOpportunities(list, minProfitPct) {
+  function renderOpportunities(list, minProfitPct, feeRate) {
+    // Before any row is drawn: the "clears" flag in `survivalCell` is judged
+    // against the fee the server is pricing at right now.
+    spreadBreakEvenPct = breakEvenPct(feeRate);
+
     const body = $("opps-body");
     if (list.length === 0) {
       placeholder(body, OPPS_COLS, "No spreads recorded yet — run a scan.");
@@ -1300,7 +1321,11 @@
       else portfolioUnavailable(portfolio.reason.message);
 
       if (opps.status === "fulfilled") {
-        renderOpportunities(opps.value.opportunities || [], opps.value.minProfitPct);
+        renderOpportunities(
+          opps.value.opportunities || [],
+          opps.value.minProfitPct,
+          opps.value.feeRate,
+        );
       } else {
         placeholder(
           $("opps-body"),

@@ -39,7 +39,7 @@ import {
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { serveFlatBoard } from "./funding-stub";
-import { runScan } from "../src/scan";
+import { runScan, SPREAD_PERSIST_MIN_AGE_MS } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
 beforeAll(() => {
@@ -482,6 +482,43 @@ describe("runScan - skew and spread survival", () => {
     expect(expired).toHaveLength(2);
     expect(expired.every((o) => o.persistCheckedTs === T0 + 180_000)).toBe(true);
     expect(expired.every((o) => o.persistNetPct === null)).toBe(true);
+  });
+
+  it("leaves a row younger than the horizon floor alone, and takes it next scan", async () => {
+    const first = await runScan(env, "manual", { getSnapshots: dualAt(T0, 5) });
+
+    // A manual scan chasing the cron tick by 10 seconds. Re-pricing here would
+    // quote a ~0s survival horizon into a column that means "~1 minute later",
+    // and near-zero horizons survive almost by construction — so the pass must
+    // skip the row entirely rather than stamp a flattering number on it.
+    const second = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 10_000, 5),
+    });
+    expect(second.spreadsRechecked).toBe(0);
+
+    // Skipped, not stamped: NULL still says "not measured", and the row stays
+    // eligible instead of being burned at the wrong horizon.
+    const young = await rowsOfScan(first.scanId);
+    expect(young).toHaveLength(2);
+    expect(young.every((o) => o.persistCheckedTs === null)).toBe(true);
+    expect(young.every((o) => o.persistNetPct === null)).toBe(true);
+
+    // A scan past the floor takes both scans' rows — the first at 45s, the
+    // second at 35s — so nothing was lost by waiting.
+    const third = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 45_000, 5),
+    });
+    expect(third.spreadsRechecked).toBe(4);
+
+    const measured = await rowsOfScan(first.scanId);
+    expect(measured.every((o) => o.persistCheckedTs === T0 + 45_000)).toBe(true);
+    expect(measured.every((o) => o.persistNetPct !== null)).toBe(true);
+    // And the horizon a reader recovers from the row is the real one, floored.
+    for (const row of measured) {
+      expect(row.persistCheckedTs! - row.ts).toBeGreaterThanOrEqual(
+        SPREAD_PERSIST_MIN_AGE_MS,
+      );
+    }
   });
 
   it("skips the pass silently when the fresh snapshot lost a venue", async () => {
