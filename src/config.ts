@@ -229,6 +229,15 @@ export const FUNDING_POLL_INTERVAL_MS = 300_000;
  * Half the interval rather than a smaller nudge because it is the only offset
  * that is equally far from the poll before and the poll after, so neither drifts
  * back into the other under jitter.
+ *
+ * **The guarantee is conditional on the scan cadence.** Both gates open on the
+ * first scan at or past their due time, so the offset only survives if a scan
+ * actually fires inside the 150s window between them. That holds for the
+ * deployed every-minute cron, and for any cadence up to 150s. Slow the cron
+ * down past that — a five-minute `crons` entry, say — and every tick is past
+ * both due times at once: the two blocks silently co-fire again in one scan,
+ * restoring the ~35s-of-45s lock pressure this constant exists to remove. A
+ * cadence change is a change to this invariant, not just to freshness.
  */
 export const BASIS_POLL_STAGGER_MS = 150_000;
 

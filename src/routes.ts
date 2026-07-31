@@ -670,7 +670,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
     return c.json({ ok: sources.some((s) => s.ok), ts: Date.now(), sources });
   });
 
-  app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 10 }));
+  app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 18 }));
 
   /**
    * Dev aid: resolve a snapshot for the given symbols through the real source
@@ -756,6 +756,12 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * break-even the UI marks surviving nets against is a function of the fee in
    * force *now*, so an operator who retunes `fee_rate` must move the bar rather
    * than leave the dashboard drawing a line from a rate nobody charges.
+   *
+   * Deliberately **no `ensureSeeded`**: this route only reads settings, and
+   * {@link getSettings} already merges `DEFAULTS` over whatever the table holds,
+   * so an unseeded database answers with the same thresholds a seeded one does.
+   * The dashboard polls this every 5 seconds, and a write batch per poll to
+   * materialise rows nothing here needs is pure D1 traffic.
    */
   app.get("/api/opportunities", async (c) => {
     try {
@@ -764,7 +770,6 @@ export function createApp(): Hono<{ Bindings: Env }> {
       const filter = parseStrategy(c.req.query("strategy"));
       if (!filter.ok) return c.json({ error: filter.error }, 400);
 
-      await ensureSeeded(c.env.DB);
       const [opportunities, settings] = await Promise.all([
         listOpportunities(c.env.DB, limit, filter.strategy),
         getSettings(c.env.DB),

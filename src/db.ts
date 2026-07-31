@@ -11,14 +11,16 @@
  *   as one implicit transaction — a board of funding rows landing without its
  *   retention prune, or the reverse, would leave a gap no reader could explain.
  *
- * ## `trades` and `balances` are read-only now
+ * ## `trades` and `balances` no longer move with the market
  *
  * Phase 12 deleted every paper-fill path, so nothing in this module writes a
- * trade or moves a balance any more; `ensureSeeded` materialises the one
- * starting balance and that is the last word on it. The tables, their columns
- * and their readers all stay: the rows already on disk are the record of what
- * the fill-era scanner did, and `GET /api/trades` and `GET /api/portfolio`
- * still serve them. There is no destructive migration.
+ * trade or *moves* a balance any more. Two writers are left, and both set the
+ * balance rather than adjust it: `ensureSeeded` materialises the starting
+ * balance on a cold table, and `resetAll` re-establishes it on an explicit
+ * `POST /api/reset`. The tables, their columns and their readers all stay: the
+ * rows already on disk are the record of what the fill-era scanner did, and
+ * `GET /api/trades` and `GET /api/portfolio` still serve them. There is no
+ * destructive migration.
  */
 import { BASE_ASSET, DEFAULTS, STRATEGY_TRIANGULAR, type Strategy } from "./config";
 import { round8, type ExecutedLeg, type TaxPolicy } from "./engine";
@@ -283,8 +285,9 @@ async function countRows(db: D1Database, table: string): Promise<number> {
  * Settings are inserted with `INSERT OR IGNORE` per key, so adding a new
  * tunable in a later release back-fills it without clobbering the ones the
  * operator already tuned. Balances are seeded only when the table is entirely
- * empty — a deliberately zeroed balance is real state, not an absence — and
- * this is now the only write the app ever makes to that table.
+ * empty — a deliberately zeroed balance is real state, not an absence — so
+ * this is the only write to that table the app makes on its own; the only
+ * other one is {@link resetAll}, which an operator has to ask for.
  */
 export async function ensureSeeded(db: D1Database): Promise<void> {
   await db.batch(
@@ -1936,10 +1939,15 @@ export interface ReportXchg {
   /**
    * Measured rows whose re-priced net cleared `xchg_min_profit_pct`.
    *
-   * A strictly higher bar than {@link survived}, and a display preference rather
-   * than an economic one: it is the same threshold the dashboard's `qualifies`
-   * badge uses, so the report and the board agree about which rows are worth
-   * looking at.
+   * A display preference rather than an economic one: it is the same threshold
+   * the dashboard's `qualifies` badge uses, so the report and the board agree
+   * about which rows are worth looking at.
+   *
+   * A *higher* bar than {@link survived} only while `xchg_min_profit_pct` is
+   * positive. The setting may legitimately be zero or negative (`src/routes.ts`
+   * documents why a negative bar is meaningful here), and at or below zero this
+   * is the **wider** count of the two: `survived` is a strict `> 0` where this
+   * one is `>= minProfitPct`.
    */
   qualifying: number;
   avgPersistNetPct: number | null;

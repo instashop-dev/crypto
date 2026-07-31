@@ -536,7 +536,8 @@ export async function fetchOkxFunding(
  * carry*: long the spot asset, short its perp. There is no spot leg for a
  * synthetic Tesla or gold contract on a crypto exchange, so a fat funding rate
  * on one is not an opportunity — it is a row that would push a real one out of
- * the per-venue top 25.
+ * the per-venue tail budget ({@link FUNDING_BOARD_TOP_N} best-paying plus
+ * {@link FUNDING_BOARD_BOTTOM_N} deepest-negative).
  *
  * A **deny** list rather than an allow list on purpose: crypto perps carry an
  * empty `contract_type`, and an allow list of `""` would silently empty the

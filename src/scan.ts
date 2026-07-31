@@ -1291,7 +1291,8 @@ export async function runScan(
     //
     // **The cold start is the one place this gate is not the funding gate.**
     // There, a missing marker forces the poll, because a cold database has an
-    // empty board and nothing to show. Here it *seeds* the marker instead, at
+    // empty board and nothing to show. Here an *unreadable* marker — absent, or
+    // present but not parseable as a finite number — seeds it instead, at
     // `startedAt − FUNDING_POLL_INTERVAL_MS + BASIS_POLL_STAGGER_MS`, so the
     // first basis poll lands half an interval after the first funding one and
     // the two alternate from then on. Polling here would put both blocks in

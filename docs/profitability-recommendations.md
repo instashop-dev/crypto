@@ -2,6 +2,45 @@
 
 *2026-07-31 · Based on live production data through phase 11. Suggestions only — no code changes accompany this document.*
 
+---
+
+## Status (2026-07-31) — what shipped
+
+This document was written as a roadmap and has since been executed. It is kept
+as the **dated record of the reasoning**, not as a description of the current
+system; where the two disagree the code and the README are authoritative. The
+sections below are the original text, annotated in place where a claim has
+since been overtaken.
+
+| Item | Status | Where |
+|---|---|---|
+| R1 — widen the funding universe, multi-venue boards | **shipped** | phase 14 (Gate + KuCoin boards, per-venue tail cap) |
+| R2 — paper funding-carry positions | **shipped** | phase 15 (`funding_positions`, `src/engine/carry.ts`, realised-vs-predicted) |
+| R3 — per-leg fee split (spot vs perp) | **shipped** | phase 13 (`perp_fee_rate`) |
+| R4 — dated-futures basis capture | **shipped** | phase 17 (OKX basis board, `GET /api/basis`) |
+| R5 — cross-venue funding spread | **shipped** | phase 16 (read-time `spreads` on `GET /api/funding`) |
+| R6 — cross-exchange skew + persistence instrumentation | **shipped** | phase 16 (`skew_ms`, `persist_net_pct`, `persist_checked_ts`) |
+| R7 — 7-day profitability report | **shipped** | phase 17 (`GET /api/report?days=7`) |
+
+Two things went further than this document proposed:
+
+- **Triangular arbitrage was REMOVED, not kept as an observer.** Phase 12
+  deleted the strategy and its code outright. `"triangular"` survives only as
+  history vocabulary — `?strategy=triangular` reads rows already on disk and
+  the scanner never writes another (`STRATEGY_TRIANGULAR` in `src/config.ts`).
+  §1's "keep as an observer, spend nothing further" was the weaker call.
+- **Paper spot fills were removed entirely**, also in phase 12 — not just for
+  triangular. Nothing in the repo books a fill or moves a balance any more;
+  `balances` and `trades` are a frozen historical record. §3's R2 warning about
+  not booking carry P&L against `balances` was overtaken by there being no
+  booking path left at all.
+
+Stale references corrected below: `test/profit.test.ts` no longer exists (the
+break-even assertions live in `test/crossExchange.test.ts` and
+`test/report.test.ts`), and `trade_size_usdt` was retired in phase 12.
+
+---
+
 This document answers one question: **given what this system has actually measured, where should effort go to make it profitable?** Every number below traces to code, tests, or recorded production scans in this repo. "Profitable" here means the paper model identifying edges that would credibly survive real-world costs — this repo does not execute real trades, and nothing here is investment or tax advice.
 
 ---
@@ -12,7 +51,9 @@ Three strategies are live. The recorded data already settles their ranking.
 
 ### Triangular arb: structurally dead — keep as an observer, spend nothing further
 
-- Break-even is **0.3006% gross** per cycle at 0.1%/leg taker (`1/(1-0.001)³ − 1`, asserted in `test/profit.test.ts:288-293`, documented in README).
+> **Superseded:** phase 12 removed the strategy rather than demoting it to an observer. See the status block above.
+
+- Break-even is **0.3006% gross** per cycle at 0.1%/leg taker (`1/(1-0.001)³ − 1`, documented in README). *No test asserts the three-leg figure any more — it went with the strategy in phase 12; the two-leg `0.2003004%` analogue is asserted in `test/crossExchange.test.ts` (`nets ~0 at the exact break-even bid`) and against `twoLegBreakEvenPct` in `test/report.test.ts`.*
 - Live observation: *"real best nets hover around −0.3%"* (README:110-115, `src/scan.ts:406-407`). That means the best **gross** edge on the 19 scanned pairs is ~0.0006% — effectively zero. **Even at 0% fees this strategy earns nothing**; the spread itself is absent on major pairs. Cheaper fees, maker orders, or more spot pairs all attack the wrong term.
 - The checked-in real Binance book fixture (`test/fixtures/bookTicker.json`) confirms it: 42 priceable triangles, zero positive net, best gross +0.013%.
 - Under India mode the cash break-even is **≈3.02%/cycle** (3 legs × 1% TDS, `test/tax.test.ts:229-233`) — two orders of magnitude away.
@@ -26,7 +67,7 @@ Three strategies are live. The recorded data already settles their ranking.
 ### Funding-rate carry: the only measured positive edge — lean into it
 
 - First production scan (2026-07-31, `docs/superpowers/specs/2026-07-31-funding-venue-probe.md`): best net annualized carry **6.08%**, 3 of 11 perps clearing the 5% threshold, all on 8h intervals, venue = OKX.
-- The current model **understates** this edge: it charges the spot taker rate (0.1%) on all 4 legs, but perp legs on OKX are ~0.05% taker. Honestly modeled, drag at a 30-day hold drops from 4.87%/yr to ~3.65%/yr and the measured best net rises to **~7.3%** (R3).
+- The model **understated** this edge at the time of writing: it charged the spot taker rate (0.1%) on all 4 legs, but perp legs on OKX are ~0.05% taker. Honestly modeled, drag at a 30-day hold drops from 4.87%/yr to ~3.65%/yr and the measured best net rises to **~7.3%** (R3). *Fixed in phase 13 — `perp_fee_rate` is a setting and the four legs are charged separately; boards recorded before phase 13 still read ~1.22%/yr low.*
 - It is also the only strategy whose India TDS drag amortizes: 4 legs per multi-week hold instead of 3 legs per minute (see §5).
 
 ---
@@ -73,7 +114,9 @@ The point is the `entry_annualized_pct` vs `realized_annual_pct` pair: it direct
 
 ### R3 — Per-leg fee split (fold in before R2's math)
 
-Add `perp_fee_rate` (default 0.0005, OKX taker) alongside `fee_rate`. Drag becomes `(2·spotFee + 2·perpFee) × (365/holdDays) × 100` in `src/engine/funding.ts` (overload alongside the existing single-fee signature for 0004 back-compat). At 30-day hold: drag 4.87% → 3.65%/yr; the recorded 6.08% best net becomes ~7.3%. Update the worked examples in `test/funding-math.test.ts`.
+Add `perp_fee_rate` (default 0.0005, OKX taker) alongside `fee_rate`. Drag becomes `(2·spotFee + 2·perpFee) × (365/holdDays) × 100` in `src/engine/funding.ts`. At 30-day hold: drag 4.87% → 3.65%/yr; the recorded 6.08% best net becomes ~7.3%. Update the worked examples in `test/funding-math.test.ts`.
+
+> **As shipped (phase 13):** no overload and no single-fee back-compat path. `roundTripFeeFraction` / `feeDragAnnualPct` / `netAnnualPct` simply take both rates, and the callers were changed with them. Back-compat was unnecessary: 0004 rows store the rate, not the drag, so every persisted board is re-priced against current settings at read time anyway — a legacy signature would only have preserved the wrong answer.
 
 ### R4 — Dated-futures basis capture (OKX quarterlies)
 
@@ -102,7 +145,7 @@ Cheap columns on `opportunities` (`skew_ms`, `persist_net_pct`, `persist_checked
 - **Real-money execution** — out of scope for this repo; paper measurement first, and several model gaps (depth, filters, transfer costs) must close before real capital is even discussable.
 - **Anything needing Binance REST or Bybit REST** — blocked from CF egress (451/403; only `wss://stream.binance.com` works).
 - **Widening the spot triangular universe or maker-simulating spot arb** — the gross edge is zero; there is nothing to capture more cheaply.
-- **Per-symbol order-book depth endpoints** — at 100 USDT notional, top-of-book is approximately correct; depth costs subrequests per symbol. Revisit only if `trade_size_usdt` grows.
+- **Per-symbol order-book depth endpoints** — at 100 USDT notional, top-of-book is approximately correct; depth costs subrequests per symbol. Revisit only if the modelled notional grows. *(`trade_size_usdt`, the setting this originally named, was retired in phase 12 with the fill paths it sized. The live analogue is `funding_position_size_usdt`, which sizes paper carry legs at 1000 USDT.)*
 - **Latency-sensitive spread arb generally** — unwinnable from a 1-minute cron; see §2.
 
 ## 5. India-mode note

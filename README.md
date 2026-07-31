@@ -82,6 +82,7 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | Probe both market-data sources from the Worker |
+| `GET /api/version` | App name and the phase the deployment was cut at (currently `18`) |
 | `POST /api/scan` | Run a scan now (also runs via cron every minute) |
 | `GET /api/portfolio` | **Historical.** Balances, equity, P&L vs 10,000 USDT initial, frozen where the fill era left them |
 | `GET /api/opportunities?limit=50` | Ranked spreads per scan, with per-leg detail, the `skewMs` / `persistNetPct` / `persistCheckedTs` instrumentation, and a `qualifies` flag judged against the current `xchg_min_profit_pct`. `&strategy=cross_exchange\|triangular` filters (the latter reads history only); an unknown value is a 400 |
@@ -96,7 +97,9 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/report?days=7` | The 7-day profitability report. `days` is **clamped** to `1..7` (the rate tables' retention) and `meta.requestedDays` says what was asked for |
 | `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
+| `GET /api/pairs` | The cached tradable-pair list the scanner prices against |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
+| `GET /api/tickers?symbols=BTCUSDT,...` | Debug passthrough: one raw dual-venue book snapshot (max 100 symbols) |
 
 ### Settings
 
@@ -128,7 +131,7 @@ table are simply never read — no migration, destructive or otherwise.
 
 ```bash
 npm install
-npm test                                        # 385 tests: pure engine math +
+npm test                                        # 524 tests: pure engine math +
                                                 # workerd integration (in-memory D1,
                                                 # mocked network)
 npx wrangler d1 migrations apply crypto-arb --local

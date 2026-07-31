@@ -143,10 +143,11 @@ function isValidFee(feeRate: number): boolean {
  * taker is ~0.05% where spot taker is ~0.1%, so a single rate applied to all
  * four legs overstates the cost by a third.
  *
- * Approximated as `legs x rate` rather than `1 - (1 - rate)^legs`: at realistic
- * taker fees the two differ in the sixth decimal, and the linear form is the one
- * a desk actually quotes. Being marginally the *larger* of the two also keeps
- * the estimate on the conservative side.
+ * Each side is summed linearly — `2 x spotFeeRate`, `2 x perpFeeRate` — rather
+ * than compounded as `1 - (1 - rate)^2`: at realistic taker fees the two forms
+ * differ in the sixth decimal, and the linear one is what a desk actually
+ * quotes. Being marginally the *larger* of the two also keeps the estimate on
+ * the conservative side.
  *
  * `null` if either rate is unusable — a missing perp rate must not silently
  * price as a free perp leg.
