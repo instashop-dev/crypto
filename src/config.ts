@@ -1,13 +1,14 @@
 /**
- * Static configuration for the paper-trading arbitrage MVP.
+ * Static configuration for the market-observation scanner.
  *
  * Pure module: no Workers imports, no I/O. Safe to import from the engine,
  * the client, tests and throwaway scripts alike.
  */
 
 /**
- * Assets the scanner is allowed to route through. Every triangle starts and
- * ends at {@link BASE_ASSET}; the remaining assets are the intermediate hops.
+ * Assets the scanner watches. Cross-exchange spreads are priced on the
+ * `<asset>/{@link BASE_ASSET}` markets; funding carry is quoted on the
+ * `<asset>USDT` perpetuals (see {@link perpAssets}).
  */
 export const ASSET_UNIVERSE: string[] = [
   "USDT",
@@ -24,22 +25,23 @@ export const ASSET_UNIVERSE: string[] = [
   "LINK",
 ];
 
-/** The settlement asset: paper balances and P&L are denominated in it. */
+/** The settlement asset: the historical paper balances and P&L are in it. */
 export const BASE_ASSET = "USDT";
 
 /**
- * Tunable strategy defaults. Phase 4 seeds the D1 `settings` table from these
- * and thereafter reads the table, so this object is the fallback / first-run
- * source of truth only.
+ * Tunable defaults. `ensureSeeded` materialises the D1 `settings` table from
+ * these and thereafter reads the table, so this object is the fallback /
+ * first-run source of truth only.
+ *
+ * Keys removed here (Phase 12 dropped `min_profit_pct` and `trade_size_usdt`
+ * with the paper-fill machinery) simply stop being read: `getSettings` ignores
+ * rows whose key is not in `SETTING_KEYS`, so a database seeded by an older
+ * release keeps working and its stale rows are inert.
  */
 export const DEFAULTS = {
   /** Taker fee charged per leg, as a fraction (0.001 = 0.1%). */
   fee_rate: 0.001,
-  /** Minimum net profit, in percent, required before a cycle is executed. */
-  min_profit_pct: 0.05,
-  /** Notional committed to each simulated cycle, in USDT. */
-  trade_size_usdt: 100,
-  /** Starting paper balance, in USDT. */
+  /** Starting paper balance, in USDT: the denominator of every P&L figure. */
   initial_usdt: 10000,
   /**
    * India-mode toggle, `0` off / `1` on. Numeric rather than boolean because
@@ -58,23 +60,21 @@ export const DEFAULTS = {
    */
   tax_rate: 0.3,
   /**
-   * Minimum net profit, in percent, required before a **spread** is executed.
+   * Net percent a **spread** must clear to be flagged as an opportunity.
    *
-   * Separate from `min_profit_pct` because the two strategies have different
-   * break-evens (2 legs of fees vs 3) and different noise floors — a cross-venue
-   * spread is mostly timing skew, so an operator will usually want it stricter
-   * than the triangular threshold, and one shared knob would force a compromise
-   * that is wrong for both. Negative means demo mode, exactly as it does for
-   * `min_profit_pct`.
+   * Display-only, exactly like `funding_min_annual_pct`: every priced spread is
+   * persisted regardless, and nothing is ever filled. Phase 12 demoted it from
+   * an execution gate — a gate that dropped rows would have thrown away the
+   * measurement this scanner exists to make.
    */
   xchg_min_profit_pct: 0.05,
   /**
    * Cross-exchange kill switch, `0` off / `1` on. Numeric for the same reason
    * `india_mode` is: the settings table is "TEXT parsed as a finite number".
    *
-   * On by default — the feature is the point of this phase — but setting it to
-   * `0` restores the pre-Phase-9 scan path exactly: one snapshot through the
-   * usual primary/fallback chain, no second REST call, no spread rows.
+   * On by default. Setting it to `0` leaves the scan with nothing to do on the
+   * spot side: no snapshots are fetched and no spread rows are written, while
+   * the funding poll carries on untouched.
    */
   xchg_enabled: 1,
   /**
@@ -85,8 +85,7 @@ export const DEFAULTS = {
    * Every quote it prices is persisted regardless of this number, because a
    * carry position is held for days and the history is the point — a row that
    * was 4% yesterday and 12% today is the signal, and a threshold applied at
-   * write time would have thrown the first half away. Compare `min_profit_pct`,
-   * which gates an actual (paper) fill and therefore must be applied up front.
+   * write time would have thrown the first half away.
    *
    * 5% is roughly the point above which the carry beats a T-bill, which is the
    * only honest benchmark for a delta-neutral trade.
@@ -112,15 +111,24 @@ export type Defaults = typeof DEFAULTS;
  */
 export type Strategy = "triangular" | "cross_exchange";
 
-/** Triangular cycles within one venue's book: `USDT -> BTC -> ETH -> USDT`. */
+/**
+ * Triangular cycles within one venue's book: `USDT -> BTC -> ETH -> USDT`.
+ *
+ * **Historical only.** Phase 12 deleted the strategy — no new row is ever
+ * written with this value. It survives as the vocabulary for the rows already
+ * on disk: it is what `toOpportunity`/`toTrade` fall back to for a row written
+ * before the `strategy` column existed, and what `?strategy=triangular` reads
+ * back. Removing it would make years of history unqueryable to save one line.
+ */
 export const STRATEGY_TRIANGULAR = "triangular";
 /** The same market on two venues: buy on the cheaper, sell on the dearer. */
 export const STRATEGY_CROSS_EXCHANGE = "cross_exchange";
 
 /**
- * Every known strategy. The one place the vocabulary is enumerated — the D1
- * columns are plain TEXT with a default, so this list (not a CHECK constraint)
- * is what `?strategy=` validates against.
+ * Every strategy the history may contain. The one place the vocabulary is
+ * enumerated — the D1 columns are plain TEXT with a default, so this list (not
+ * a CHECK constraint) is what `?strategy=` validates against. It is a superset
+ * of what the scanner still writes; see {@link STRATEGY_TRIANGULAR}.
  */
 export const STRATEGIES: readonly Strategy[] = [
   STRATEGY_TRIANGULAR,

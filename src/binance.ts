@@ -31,7 +31,7 @@ export const WS_DEADLINE_MS = 4000;
 export const MEXC_TIMEOUT_MS = 8000;
 /**
  * Fraction of requested symbols a WebSocket snapshot must cover to be used.
- * Below this the snapshot is too sparse to enumerate triangles from, so the
+ * Below this the snapshot is too sparse to price the universe against, so the
  * REST fallback (which always returns the complete list) is preferred.
  */
 export const WS_COVERAGE_THRESHOLD = 0.6;
@@ -378,9 +378,8 @@ export interface DualSnapshot {
    * `binance ?? mexc` — the snapshot every pre-Phase-9 consumer reads.
    *
    * Identical to what {@link getSnapshot} would have returned for the same
-   * symbols and the same upstream behaviour, which is the whole point: the
-   * triangular scanner must not be able to tell that a second venue was
-   * fetched alongside it.
+   * symbols and the same upstream behaviour, so the scan row's `source` means
+   * the same thing however the book was obtained.
    */
   primary: Snapshot;
   /** One human-readable line per source that did not qualify. Possibly empty. */
@@ -406,8 +405,8 @@ export interface DualSnapshot {
  *
  * Throws the same message as `getSnapshot` when neither venue qualifies, so the
  * scan-row error text does not change depending on which path produced it.
- * {@link getSnapshot} itself is untouched: `GET /api/tickers` and the
- * `xchg_enabled: 0` scan path keep their exact sequential semantics.
+ * {@link getSnapshot} itself is untouched, and is now reached only by
+ * `GET /api/tickers`: with `xchg_enabled: 0` the scan fetches no book at all.
  */
 export async function getDualSnapshot(
   symbols: string[],

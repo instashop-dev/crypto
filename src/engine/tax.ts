@@ -1,9 +1,9 @@
 /**
  * India-mode P&L: what a VDA trade actually nets an Indian resident.
  *
- * Pure module in the same sense as `./profit` — plain functions over a snapshot
- * `Book`, no I/O, no clock, no Workers imports, and no dependency on `src/`
- * outside `src/engine/`. Everything here is deterministic given
+ * Pure module in the same sense as `./pricing` — plain functions over a
+ * snapshot `Book`, no I/O, no clock, no Workers imports, and no dependency on
+ * `src/` outside `src/engine/`. Everything here is deterministic given
  * `(chain, book, feeRate, startAmount, baseAsset, policy)`.
  *
  * ## The two Indian levies, and why they behave so differently
@@ -22,14 +22,16 @@
  * `Side` here is an *exchange listing* artefact: `USDT -> BTC` is a BUY only
  * because the market happens to be listed as `BTCUSDT`. Under 194S what matters
  * is that a VDA changed hands, and **USDT is itself a VDA** in Indian law — it
- * is not legal tender and not a "currency" for these purposes. So each of the
- * three hops disposes of a VDA (USDT, then BTC, then ETH) and each attracts
- * TDS. Charging only the SELL legs would understate the withholding by ~2/3 and
- * would flip depending on how the exchange spells its symbols, which is exactly
- * the kind of accident this module exists to rule out.
+ * is not legal tender and not a "currency" for these purposes. So both hops of
+ * a `USDT -> X -> USDT` spread dispose of a VDA and each attracts TDS. Charging
+ * only the SELL legs would halve the withholding and would flip depending on
+ * how the exchange spells its symbols, which is exactly the kind of accident
+ * this module exists to rule out.
  *
- * That is the headline result: a 3-leg cycle withholds ~3% of notional in TDS
- * against a real triangular edge measured in basis points. See the README.
+ * That is the headline result: a 2-leg spread withholds ~2% of notional in TDS
+ * against a real cross-venue edge measured in basis points — and the 3-leg
+ * triangular cycle this module was first written for withheld ~3%, which is why
+ * that strategy is gone. See the README.
  *
  * ## Why TDS is not compounded into the chain
  *
@@ -57,7 +59,7 @@
  *
  * `ExecutedLeg.inAmount` / `outAmount` are `round8`-quantised *for reporting*.
  * On a BTC leg of a 100 USDT notional that is ~1.7e-3 BTC, where 8-decimal
- * rounding is a ~1e-6 relative error — small, but the TDS base is ~3x notional
+ * rounding is a ~1e-6 relative error — small, but the TDS base is ~2x notional
  * and the edge being measured is ~1e-4 relative, so reading `leg.inAmount` back
  * would inject error of the same order as the answer. **Tax math therefore
  * never reads `ExecutedLeg` amounts**: {@link priceChain} re-runs the whole
@@ -77,7 +79,7 @@
  *   effective rate 31.2%; rather than hard-code it, `tax_rate` is a setting and
  *   an operator who wants it can set `0.312`.
  * - **No cost-of-acquisition subtleties.** 115BBH allows only cost of
- *   acquisition as a deduction, and for an atomic same-instant cycle the cost of
+ *   acquisition as a deduction, and for an atomic same-instant chain the cost of
  *   acquisition *is* the start notional — so `endAmount - startAmount` is
  *   already the statutory gain. Fees are absorbed into the chain, which is
  *   arguably generous to the taxpayer, and is called out here rather than
@@ -85,8 +87,7 @@
  *
  * None of this is tax advice.
  */
-import { convert, round8, type TriangleQuote } from "./profit";
-import type { Triangle } from "./triangles";
+import { convert, round8 } from "./pricing";
 import type { Book } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -133,9 +134,9 @@ function sanitise(policy: TaxPolicy): TaxPolicy {
 
 /**
  * One hop of a conversion chain, reduced to the only two facts the tax core
- * needs. Structurally a subset of {@link import("./triangles").Leg}, so a
- * `Triangle`'s legs can be passed straight in — while a future two-leg
- * cross-exchange spread (or any n-leg chain) can be priced by the same code.
+ * needs. Structurally a subset of {@link import("./pricing").Leg}, so any
+ * n-hop chain — a two-leg cross-exchange spread today — can be priced by the
+ * same code.
  */
 export interface ChainHop {
   from: string;
@@ -221,11 +222,11 @@ export function disposalValues(
 // ---------------------------------------------------------------------------
 
 /**
- * Everything india mode has to say about one executed cycle.
+ * Everything india mode has to say about one priced chain.
  *
- * Every figure is `round8`-quantised, for the same reason `ExecutedTrade`'s
- * are: D1 rows, API responses and test expectations must agree exactly rather
- * than drift by float dust.
+ * Every figure is `round8`-quantised, for the same reason every reported leg
+ * amount is: D1 rows, API responses and test expectations must agree exactly
+ * rather than drift by float dust.
  */
 export interface TaxBreakdown {
   startAmount: number;
@@ -233,7 +234,7 @@ export interface TaxBreakdown {
   /** `endAmount - startAmount`. Identical with the policy on or off. */
   grossProfit: number;
   grossProfitPct: number;
-  /** Sum of the per-leg disposal values: the 194S base, ~3x notional. */
+  /** Sum of the per-leg disposal values: the 194S base, ~2x notional. */
   tdsBase: number;
   /** `tdsRate * tdsBase` — cash withheld, later credited back. */
   tdsWithheld: number;
@@ -271,7 +272,7 @@ function total(values: readonly number[]): number {
 
 /**
  * Price and tax an arbitrary ordered chain of hops. The generic core; see
- * {@link computeTradeTax} for the triangle-shaped wrapper.
+ * `spreadTax` in `./crossExchange` for the two-hop wrapper.
  *
  * A **disabled** policy still returns a breakdown rather than `null`: callers
  * (the executor, the API) want one shape to render either way, and the zeros it
@@ -337,77 +338,5 @@ export function computeChainTax(
     cashProfit: round8(grossProfit - tdsWithheld),
     tdsRate,
     taxRate,
-  };
-}
-
-/**
- * Tax one triangular cycle at a real notional.
- *
- * A thin wrapper over {@link computeChainTax}: a `Triangle`'s legs already carry
- * `from`/`to`, so the three-hop case needs no special-casing beyond naming it.
- * The chain is re-priced here rather than read off the caller's `ExecutedTrade`
- * precisely so that no `round8`-quantised amount can leak into the tax base.
- */
-export function computeTradeTax(
-  tri: Triangle,
-  book: Book,
-  feeRate: number,
-  startAmount: number,
-  baseAsset: string,
-  policy: TaxPolicy,
-): TaxBreakdown | null {
-  return computeChainTax(tri.legs, book, feeRate, startAmount, baseAsset, policy);
-}
-
-/** Opportunity-level tax figures, per unit of notional. */
-export interface QuoteTax {
-  /**
-   * `netPct` after the 115BBH charge. Losses pass through untouched — no
-   * set-off is available, so a negative cycle is not made less negative by tax.
-   */
-  indiaNetPct: number;
-  /** TDS withheld as a percent of notional. ~3% for a 3-leg cycle at 1%/leg. */
-  tdsPct: number;
-}
-
-/**
- * Tax figures for a ranked quote, on a notional of 1 base unit.
- *
- * `indiaNetPct` is derived from the quote's **reported** `netPct` rather than
- * re-derived from a fresh chain: `x -> x > 0 ? x * (1 - taxRate) : x` is
- * strictly increasing for any `taxRate < 1`, so ranking by `indiaNetPct` and
- * ranking by `netPct` are provably the same ordering — including ties, which
- * map to ties. That is what lets the scanner keep sorting on `netPct` and
- * attach these purely as a display column.
- *
- * `tdsPct` is computed from `tdsBase` rather than from the notional-1
- * `tdsWithheld`: at a notional of 1 the withheld figure is ~0.03, where `round8`
- * would throw away two significant digits and the number would stop agreeing
- * with the executed trade's.
- */
-export function quoteTax(
-  quote: TriangleQuote,
-  book: Book,
-  feeRate: number,
-  baseAsset: string,
-  policy: TaxPolicy,
-): QuoteTax | null {
-  const { enabled, taxRate } = sanitise(policy);
-  if (!enabled) return { indiaNetPct: quote.netPct, tdsPct: 0 };
-
-  const breakdown = computeChainTax(
-    quote.triangle.legs,
-    book,
-    feeRate,
-    1,
-    baseAsset,
-    policy,
-  );
-  if (!breakdown) return null;
-
-  return {
-    indiaNetPct:
-      quote.netPct > 0 ? round8(quote.netPct * (1 - taxRate)) : quote.netPct,
-    tdsPct: round8(breakdown.tdsBase * breakdown.tdsRate * 100),
   };
 }

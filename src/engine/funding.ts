@@ -34,7 +34,7 @@
  *   is assumed withdrawn, not reinvested. Compounding would raise every figure
  *   below and would be the less conservative choice.
  */
-import { round8 } from "./profit";
+import { round8 } from "./pricing";
 
 /** Minutes in a 365-day year: the annualisation constant everything shares. */
 export const MINUTES_PER_YEAR = 525_600;

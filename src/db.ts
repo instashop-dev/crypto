@@ -8,30 +8,29 @@
  *   database and a seeded one all answer the same reads; `ensureSeeded` is the
  *   single place that materialises defaults, and it is idempotent.
  * - **Anything that must not half-apply goes through `D1.batch()`**, which runs
- *   as one implicit transaction. That is why {@link commitTrade} exists as a
- *   single call rather than four helpers the caller sequences itself: a paper
- *   balance credited without its trade row (or vice versa) would corrupt P&L
- *   with no way to reconstruct the truth.
+ *   as one implicit transaction — a board of funding rows landing without its
+ *   retention prune, or the reverse, would leave a gap no reader could explain.
+ *
+ * ## `trades` and `balances` are read-only now
+ *
+ * Phase 12 deleted every paper-fill path, so nothing in this module writes a
+ * trade or moves a balance any more; `ensureSeeded` materialises the one
+ * starting balance and that is the last word on it. The tables, their columns
+ * and their readers all stay: the rows already on disk are the record of what
+ * the fill-era scanner did, and `GET /api/trades` and `GET /api/portfolio`
+ * still serve them. There is no destructive migration.
  */
 import { BASE_ASSET, DEFAULTS, STRATEGY_TRIANGULAR, type Strategy } from "./config";
-import {
-  round8,
-  type ExecutedLeg,
-  type ExecutedTrade,
-  type TaxBreakdown,
-  type TaxPolicy,
-} from "./engine";
-import type { PairInfo, SnapshotSource } from "./types";
+import { round8, type ExecutedLeg, type TaxPolicy } from "./engine";
+import type { PairInfo } from "./types";
 
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
-/** The strategy tunables, always fully populated (DEFAULTS fill any gap). */
+/** The tunables, always fully populated (DEFAULTS fill any gap). */
 export interface Settings {
   fee_rate: number;
-  min_profit_pct: number;
-  trade_size_usdt: number;
   initial_usdt: number;
   india_mode: number;
   tds_rate: number;
@@ -48,11 +47,13 @@ export type SettingKey = keyof Settings;
  * Numeric setting keys, in a stable order. New keys are **appended**: the order
  * is what `ensureSeeded` batches in, and keeping it append-only means a
  * back-fill of a new tunable can never reorder the writes of the old ones.
+ *
+ * Retiring a key (Phase 12 dropped `min_profit_pct` and `trade_size_usdt`)
+ * needs no migration: {@link getSettings} ignores any stored row whose key is
+ * not listed here, so the orphaned rows are simply never read again.
  */
 export const SETTING_KEYS: readonly SettingKey[] = [
   "fee_rate",
-  "min_profit_pct",
-  "trade_size_usdt",
   "initial_usdt",
   "india_mode",
   "tds_rate",
@@ -250,9 +251,10 @@ async function countRows(db: D1Database, table: string): Promise<number> {
  * Materialise first-run state. Safe to call on every request.
  *
  * Settings are inserted with `INSERT OR IGNORE` per key, so adding a new
- * tunable in a later release back-fills it without clobbering the three the
+ * tunable in a later release back-fills it without clobbering the ones the
  * operator already tuned. Balances are seeded only when the table is entirely
- * empty — a deliberately zeroed balance is real state, not an absence.
+ * empty — a deliberately zeroed balance is real state, not an absence — and
+ * this is now the only write the app ever makes to that table.
  */
 export async function ensureSeeded(db: D1Database): Promise<void> {
   await db.batch(
@@ -273,7 +275,7 @@ export async function ensureSeeded(db: D1Database): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Balances
+// Balances (read-only; see the module header)
 // ---------------------------------------------------------------------------
 
 export interface BalanceRow {
@@ -286,39 +288,6 @@ export async function getBalances(db: D1Database): Promise<BalanceRow[]> {
     .prepare("SELECT asset, amount FROM balances ORDER BY asset")
     .all<BalanceRow>();
   return results ?? [];
-}
-
-/** Balance of one asset; `0` when the asset has never been held. */
-export async function getBalance(db: D1Database, asset: string): Promise<number> {
-  const row = await db
-    .prepare("SELECT amount FROM balances WHERE asset = ?1")
-    .bind(asset)
-    .first<{ amount: number }>();
-  return row?.amount ?? 0;
-}
-
-function balanceDeltaStmt(
-  db: D1Database,
-  asset: string,
-  delta: number,
-): D1PreparedStatement {
-  // Upsert rather than UPDATE: the first credit of a non-base asset would
-  // otherwise silently affect zero rows.
-  return db
-    .prepare(
-      "INSERT INTO balances (asset, amount) VALUES (?1, ?2)" +
-        " ON CONFLICT(asset) DO UPDATE SET amount = amount + ?2",
-    )
-    .bind(asset, delta);
-}
-
-/** Apply a signed delta to one asset's balance. */
-export async function applyBalanceDelta(
-  db: D1Database,
-  asset: string,
-  delta: number,
-): Promise<void> {
-  await balanceDeltaStmt(db, asset, delta).run();
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +341,12 @@ export interface ScanRow {
   trigger: string;
   source: string | null;
   pairs_count: number;
+  /**
+   * Triangular figures, **historical**. Phase 12 deleted that strategy and
+   * `finalizeScan` no longer writes these three, so every new row carries the
+   * column defaults (`0` / `NULL` / `0`). They are still selected and still
+   * served, because on the rows written before Phase 12 they are real data.
+   */
   triangles_count: number;
   best_net_pct: number | null;
   executed_count: number;
@@ -407,29 +382,26 @@ export async function insertScan(
 export interface ScanOutcome {
   source: string | null;
   pairsCount: number;
-  trianglesCount: number;
-  bestNetPct: number | null;
   durationMs: number;
   error: string | null;
-  /**
-   * Cross-exchange figures. Optional so that a caller which knows nothing about
-   * the strategy writes the same row it always did (0 / NULL / NULL) rather
-   * than having to name fields it does not own.
-   */
-  spreadsCount?: number;
-  bestSpreadNetPct?: number | null;
+  spreadsCount: number;
+  bestSpreadNetPct: number | null;
   /**
    * A cross-exchange failure. Kept out of {@link error} on purpose: `error`
-   * means "this scan failed", and a scan whose triangular half ranked and
-   * filled normally did not fail because one of two venues was unreachable.
+   * means "this scan failed", and a scan whose funding poll landed a full board
+   * did not fail because one of two spot venues was unreachable.
    */
-  xchgError?: string | null;
+  xchgError: string | null;
 }
 
 /**
- * Record a scan's outcome. Deliberately does **not** touch `executed_count`:
- * that column is owned by {@link commitTrade}'s batch, so the trade and its
- * count can never disagree.
+ * Record a scan's outcome.
+ *
+ * The three triangular columns are deliberately left out of the `UPDATE`
+ * rather than written as zeros: the strategy is gone, and the schema default
+ * (`0` / `NULL` / `0`) already says "not measured". `executed_count` is in the
+ * same position for the same reason — nothing books a trade any more, and the
+ * column stays only so the pre-Phase-12 rows keep their meaning.
  */
 export async function finalizeScan(
   db: D1Database,
@@ -438,21 +410,19 @@ export async function finalizeScan(
 ): Promise<void> {
   await db
     .prepare(
-      "UPDATE scans SET source = ?2, pairs_count = ?3, triangles_count = ?4," +
-        " best_net_pct = ?5, duration_ms = ?6, error = ?7, spreads_count = ?8," +
-        " best_spread_net_pct = ?9, xchg_error = ?10 WHERE id = ?1",
+      "UPDATE scans SET source = ?2, pairs_count = ?3, duration_ms = ?4," +
+        " error = ?5, spreads_count = ?6, best_spread_net_pct = ?7," +
+        " xchg_error = ?8 WHERE id = ?1",
     )
     .bind(
       scanId,
       outcome.source,
       outcome.pairsCount,
-      outcome.trianglesCount,
-      outcome.bestNetPct,
       outcome.durationMs,
       outcome.error,
-      outcome.spreadsCount ?? 0,
-      outcome.bestSpreadNetPct ?? null,
-      outcome.xchgError ?? null,
+      outcome.spreadsCount,
+      outcome.bestSpreadNetPct,
+      outcome.xchgError,
     )
     .run();
 }
@@ -480,6 +450,7 @@ export interface OpportunityRow {
   cycle: string;
   gross_pct: number;
   net_pct: number;
+  /** Historical: `1` only on rows the pre-Phase-12 executor filled. */
   executed: number;
   legs_json: string;
   /** `NULL` when india mode was off for the scan that produced the row. */
@@ -545,19 +516,22 @@ export interface OpportunityInput {
 }
 
 /**
- * Persist a scan's ranked cycles and return their ids **in the same order**,
- * so the caller can mark the executed one without a second query.
+ * Persist a scan's ranked opportunities and return their ids **in the same
+ * order**, so the caller can correlate a row with the quote it came from.
  *
- * `strategy` is a trailing parameter with the pre-Phase-9 value as its default:
- * every existing call site keeps writing triangles without being edited, and a
- * new one has to name the strategy deliberately.
+ * `executed` is written as a literal `0`: nothing fills any more, and the
+ * column is kept only so the pre-Phase-12 rows keep their meaning.
+ *
+ * `strategy` is required rather than defaulted. It used to default to
+ * `triangular` so that pre-Phase-9 call sites needed no edit; with that
+ * strategy deleted, a default would be a wrong answer waiting to be inherited.
  */
 export async function insertOpportunities(
   db: D1Database,
   scanId: number,
   quotes: OpportunityInput[],
-  ts: number = Date.now(),
-  strategy: Strategy = STRATEGY_TRIANGULAR,
+  ts: number,
+  strategy: Strategy,
 ): Promise<number[]> {
   if (quotes.length === 0) return [];
 
@@ -584,16 +558,6 @@ export async function insertOpportunities(
   );
 
   return results.map((r) => r.results[0]?.id).filter((id): id is number => id != null);
-}
-
-export async function markOpportunityExecuted(
-  db: D1Database,
-  opportunityId: number,
-): Promise<void> {
-  await db
-    .prepare("UPDATE opportunities SET executed = 1 WHERE id = ?1")
-    .bind(opportunityId)
-    .run();
 }
 
 /**
@@ -635,7 +599,7 @@ export async function listOpportunitiesForScan(
 }
 
 // ---------------------------------------------------------------------------
-// Trades
+// Trades (read-only; see the module header)
 // ---------------------------------------------------------------------------
 
 export interface TradeRow {
@@ -734,7 +698,7 @@ export async function listTrades(
   return (results ?? []).map(toTrade);
 }
 
-/** Lifetime tax aggregates over every booked trade. */
+/** Lifetime tax aggregates over every trade ever booked. */
 export interface TaxTotals {
   trades: number;
   /** Trades with a positive gross profit — the only ones that owe 115BBH tax. */
@@ -782,101 +746,6 @@ export async function getTaxTotals(db: D1Database): Promise<TaxTotals> {
     taxDue: round8(row?.tax_due ?? 0),
     netProfit: round8(row?.net_profit ?? 0),
   };
-}
-
-export interface CommitTradeInput {
-  scanId: number;
-  opportunityId: number | null;
-  trade: ExecutedTrade;
-  /**
-   * Which upstream priced the fill. Widened from `SnapshotSource` to a plain
-   * string in Phase 9: a cross-exchange fill is priced by *two* venues at once
-   * and records `"binance-ws+mexc-rest"`, which is not one of the two enum
-   * members and should not be forced to pick one of them.
-   */
-  source: SnapshotSource | string | null;
-  ts?: number;
-  /** India-mode figures. Absent means "no tax regime applied to this fill". */
-  tax?: TaxBreakdown;
-  /** Defaults to `triangular`, so pre-Phase-9 call sites are unchanged. */
-  strategy?: Strategy;
-}
-
-/**
- * Book a simulated fill: balance, trade row, opportunity flag and the scan's
- * `executed_count`, all in one `batch()` so they land together or not at all.
- *
- * Called **at most once per strategy per scan**, so `executed_count` is 0, 1 or
- * 2 — one triangular fill and one cross-exchange fill. The two are deliberately
- * independent: they are different books, different notionals of the same
- * balance, and one being unaffordable or below threshold says nothing about the
- * other.
- *
- * The balance moves by the profit **less any TDS withheld**. The start notional
- * is debited and the end notional credited within the same instant, so
- * `end - start` is the whole of the trading effect — modelling it as two writes
- * would only create a window in which the paper portfolio looks 100 USDT
- * poorer. On top of that, `tds_withheld` genuinely leaves the account at
- * settlement, which is why it is netted here and `tax_due` is not: the 115BBH
- * charge is assessed annually and is carried as a liability, not a debit. See
- * the `tax` block of `GET /api/portfolio` for the two views side by side.
- */
-export async function commitTrade(
-  db: D1Database,
-  input: CommitTradeInput,
-): Promise<number> {
-  const { trade, tax } = input;
-  const ts = input.ts ?? Date.now();
-  const legsJson = JSON.stringify(trade.legs);
-  const delta = round8(trade.endAmount - trade.startAmount - (tax?.tdsWithheld ?? 0));
-
-  const statements: D1PreparedStatement[] = [
-    balanceDeltaStmt(db, BASE_ASSET, delta),
-    db
-      .prepare(
-        "INSERT INTO trades (ts, cycle, start_amount, end_amount, profit, profit_pct," +
-          " legs_json, source, opportunity_id, tds_base, tds_withheld, tax_due," +
-          " net_profit, tds_rate, tax_rate, strategy)" +
-          " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)" +
-          " RETURNING id",
-      )
-      .bind(
-        ts,
-        trade.cycle,
-        trade.startAmount,
-        trade.endAmount,
-        trade.profit,
-        trade.profitPct,
-        legsJson,
-        input.source,
-        input.opportunityId,
-        tax?.tdsBase ?? 0,
-        tax?.tdsWithheld ?? 0,
-        tax?.taxDue ?? 0,
-        tax?.netProfit ?? trade.profit,
-        // The rates in force at fill time, snapshotted: re-deriving them from
-        // today's settings would rewrite history on the next retune.
-        tax?.tdsRate ?? 0,
-        tax?.taxRate ?? 0,
-        input.strategy ?? STRATEGY_TRIANGULAR,
-      ),
-    db
-      .prepare("UPDATE scans SET executed_count = executed_count + 1 WHERE id = ?1")
-      .bind(input.scanId),
-  ];
-
-  if (input.opportunityId != null) {
-    statements.push(
-      db
-        .prepare("UPDATE opportunities SET executed = 1 WHERE id = ?1")
-        .bind(input.opportunityId),
-    );
-  }
-
-  const results = await db.batch<{ id: number }>(statements);
-  const id = results[1]?.results?.[0]?.id;
-  if (id == null) throw new Error("trade insert returned no id");
-  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,10 +836,10 @@ export interface FundingRateInput {
  * Persist one poll's board and prune everything older than the retention
  * window, in a single `batch()`.
  *
- * One batch, not two calls, for the same reason {@link commitTrade} is one: the
- * batch is an implicit transaction, so a reader can never observe a moment in
- * which the new board has landed but the old rows have not been pruned — or,
- * worse, in which the prune ran and the insert then failed, leaving a gap. The
+ * One batch, not two calls: the batch is an implicit transaction, so a reader
+ * can never observe a moment in which the new board has landed but the old rows
+ * have not been pruned — or, worse, in which the prune ran and the insert then
+ * failed, leaving a gap. The
  * `DELETE` is relative to *this poll's* `ts` rather than to `Date.now()` so a
  * back-dated poll (a test, a replay) prunes against its own clock.
  */
@@ -1068,10 +937,10 @@ export interface ResetOptions {
 /**
  * Restore the paper portfolio to a single `initial_usdt` USDT balance.
  *
- * Settings survive a reset — an operator who tuned the threshold to demo a
- * negative-edge fill does not want that undone by "start over". The scan lock
- * is dropped, because a reset is also the escape hatch for a lock left behind
- * by a Worker that was evicted mid-scan.
+ * Settings survive a reset — an operator who tuned a threshold does not want
+ * that undone by "start over". The scan lock is dropped, because a reset is
+ * also the escape hatch for a lock left behind by a Worker that was evicted
+ * mid-scan.
  */
 export async function resetAll(
   db: D1Database,

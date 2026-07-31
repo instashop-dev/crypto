@@ -1,31 +1,22 @@
 /**
- * Public surface of the pure arbitrage engine.
+ * Public surface of the pure market-observation engine.
  *
- * Phase 4 imports from `./engine` only; nothing here touches Workers, Hono, the
+ * `src/` imports from `./engine` only; nothing here touches Workers, Hono, the
  * network or a clock, so the whole module is unit-testable in isolation.
+ *
+ * Nothing here simulates a fill — Phase 12 deleted the triangular strategy and
+ * every paper-execution path with it. What remains prices, ranks and taxes what
+ * was observed.
  */
 export type { Book, BookEntry, ExecutedLeg, Side } from "./types";
-export {
-  cycleLabel,
-  enumerateTriangles,
-  resolveLeg,
-  type Leg,
-  type Triangle,
-} from "./triangles";
-export {
-  convert,
-  evaluateTriangle,
-  rankOpportunities,
-  round8,
-  simulateExecution,
-  type ExecutedTrade,
-  type TriangleQuote,
-} from "./profit";
+// Only `round8` is re-exported: `convert`/`resolveLeg` are chain-pricing
+// internals that `./tax` imports directly, and nothing outside `src/engine/`
+// has any business resolving a leg for itself.
+export { round8 } from "./pricing";
 export {
   crossVenueBook,
   evaluateSpread,
   rankSpreads,
-  simulateSpread,
   spreadHops,
   spreadLabel,
   spreadQuoteTax,
@@ -51,15 +42,12 @@ export {
 } from "./funding";
 export {
   computeChainTax,
-  computeTradeTax,
   disposalValues,
   NO_TAX,
   priceChain,
-  quoteTax,
   taxOnProfit,
   type ChainHop,
   type DisposalLeg,
-  type QuoteTax,
   type TaxBreakdown,
   type TaxPolicy,
 } from "./tax";

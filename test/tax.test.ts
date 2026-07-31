@@ -1,24 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { evaluateTriangle, rankOpportunities } from "../src/engine/profit";
 import {
   computeChainTax,
-  computeTradeTax,
   disposalValues,
   NO_TAX,
   priceChain,
-  quoteTax,
   taxOnProfit,
+  type ChainHop,
   type TaxPolicy,
 } from "../src/engine/tax";
-import { enumerateTriangles } from "../src/engine/triangles";
 import type { Book, BookEntry } from "../src/engine/types";
 
 /**
+ * The tax core, driven directly by an ordered chain of hops.
+ *
+ * `computeChainTax` is deliberately generic in the chain length — the live
+ * caller is the two-hop cross-exchange spread (`spreadTax` in
+ * `src/engine/crossExchange.ts`, exercised in `test/crossExchange.test.ts`),
+ * but the worked example here is the **three-hop** `USDT>BTC>ETH>USDT` chain,
+ * kept for two reasons: its arithmetic is the one written out in the README's
+ * India-mode section, and a three-hop case is a stronger test of the per-leg
+ * disposal machinery than a two-hop one.
+ *
  * Every expectation below is derived by hand from the book fixtures and written
  * out in full, so the derivation can be re-checked without running the engine.
- *
- * The fixture is deliberately the same book `test/executor.test.ts` uses, so the
- * pure numbers here and the persisted rows there are the same arithmetic.
  */
 function book(entries: Record<string, [number, number]>): Book {
   const map = new Map<string, BookEntry>();
@@ -28,18 +32,17 @@ function book(entries: Record<string, [number, number]>): Book {
   return map;
 }
 
-const UNIVERSE = ["USDT", "BTC", "ETH"];
 const BASE = "USDT";
 const FEE = 0.001;
 
-/** +1.694305898% on USDT>BTC>ETH>USDT. See test/executor.test.ts. */
+/** +1.694305898% over the three hops below. */
 const PROFITABLE = book({
   BTCUSDT: [59990, 60000],
   ETHBTC: [0.0499, 0.05],
   ETHUSDT: [3060, 3061],
 });
 
-/** Same markets, ETH marked down so every cycle loses to fees. */
+/** Same markets, ETH marked down so the chain loses to fees. */
 const LOSING = book({
   BTCUSDT: [59990, 60000],
   ETHBTC: [0.0499, 0.05],
@@ -49,15 +52,16 @@ const LOSING = book({
 /** Statutory rates: 1% TDS u/s 194S, 30% u/s 115BBH. */
 const INDIA: TaxPolicy = { enabled: true, tdsRate: 0.01, taxRate: 0.3 };
 
-function triangle(label: string, b: Book) {
-  const tri = enumerateTriangles(UNIVERSE, BASE, b).find(
-    (t) => t.assets.join(">") === label,
-  );
-  if (!tri) throw new Error(`triangle ${label} not enumerated`);
-  return tri;
-}
-
-const FORWARD = "USDT>BTC>ETH>USDT";
+/**
+ * The chain under test, spelled out rather than enumerated: the tax core takes
+ * `{from, to}` pairs and resolves the market (and therefore the side) from the
+ * book's own keys, so this is the whole input.
+ */
+const FORWARD: ChainHop[] = [
+  { from: "USDT", to: "BTC" },
+  { from: "BTC", to: "ETH" },
+  { from: "ETH", to: "USDT" },
+];
 
 // ---------------------------------------------------------------------------
 // The worked example, on 100 USDT of notional at fee 0.1%
@@ -99,7 +103,7 @@ const NET_PROFIT = to8(1.694305898 - TAX_DUE); // 1.18601413
 const CASH_PROFIT = to8(1.694305898 - TDS_WITHHELD); // -1.32248862
 
 const tax100 = (policy: TaxPolicy = INDIA, b: Book = PROFITABLE) =>
-  computeTradeTax(triangle(FORWARD, b), b, FEE, 100, BASE, policy);
+  computeChainTax(FORWARD, b, FEE, 100, BASE, policy);
 
 // ---------------------------------------------------------------------------
 // (1)-(4) taxOnProfit: 115BBH allows no loss offset
@@ -167,7 +171,7 @@ describe("(5) disabled policy", () => {
 
 describe("(6) disposalValues", () => {
   it("values every leg's input asset in USDT at the fee-free bid", () => {
-    const chain = priceChain(triangle(FORWARD, PROFITABLE).legs, PROFITABLE, FEE, 100)!;
+    const chain = priceChain(FORWARD, PROFITABLE, FEE, 100)!;
     expect(chain).not.toBeNull();
     expect(chain.disposals.map((d) => d.inAsset)).toEqual(["USDT", "BTC", "ETH"]);
 
@@ -175,7 +179,7 @@ describe("(6) disposalValues", () => {
   });
 
   it("values all three legs, not just the one the exchange calls a SELL", () => {
-    const chain = priceChain(triangle(FORWARD, PROFITABLE).legs, PROFITABLE, FEE, 100)!;
+    const chain = priceChain(FORWARD, PROFITABLE, FEE, 100)!;
     const values = disposalValues(chain.disposals, PROFITABLE, BASE)!;
 
     // Legs 1 and 2 are BUYs by listing direction, yet both dispose of a VDA.
@@ -218,7 +222,7 @@ describe("(9) netProfit nets the tax, not the withholding", () => {
 });
 
 describe("(10) cashProfit is the honest headline", () => {
-  it("goes negative on a +1.69% cycle because TDS is ~3% of notional", () => {
+  it("goes negative on a +1.69% chain because TDS is ~3% of notional", () => {
     const t = tax100()!;
     expect(t.cashProfit).toBe(CASH_PROFIT); // -1.32248862
     expect(t.cashProfit).toBeLessThan(0);
@@ -227,8 +231,8 @@ describe("(10) cashProfit is the honest headline", () => {
     expect(t.netProfit).toBeGreaterThan(0);
 
     // Break-even for the cash view needs a net edge above tdsBase/notional %,
-    // i.e. about 3.02% per cycle — an order of magnitude above any real
-    // triangular edge.
+    // i.e. about 3.02% per round trip — an order of magnitude above any
+    // edge this repo has ever measured, on any strategy.
     expect((t.tdsWithheld / t.startAmount) * 100).toBeCloseTo(3.01679452, 8);
     expect(t.grossProfitPct).toBeLessThan((t.tdsWithheld / t.startAmount) * 100);
   });
@@ -243,7 +247,7 @@ describe("(11) legTds", () => {
 });
 
 // ---------------------------------------------------------------------------
-// (12) a losing cycle still bleeds TDS
+// (12) a losing chain still bleeds TDS
 // ---------------------------------------------------------------------------
 
 describe("(12) losing book", () => {
@@ -266,14 +270,7 @@ describe("(12) losing book", () => {
 describe("(13) scaling the notional", () => {
   it("doubles every absolute figure and leaves every percentage alone", () => {
     const one = tax100()!;
-    const two = computeTradeTax(
-      triangle(FORWARD, PROFITABLE),
-      PROFITABLE,
-      FEE,
-      200,
-      BASE,
-      INDIA,
-    )!;
+    const two = computeChainTax(FORWARD, PROFITABLE, FEE, 200, BASE, INDIA)!;
 
     expect(two.startAmount).toBe(200);
     expect(two.grossProfit).toBeCloseTo(one.grossProfit * 2, 8);
@@ -285,35 +282,6 @@ describe("(13) scaling the notional", () => {
 
     expect(two.grossProfitPct).toBeCloseTo(one.grossProfitPct, 8);
     expect(two.netProfitPct).toBeCloseTo(one.netProfitPct, 8);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// (14) quote-level and trade-level figures agree
-// ---------------------------------------------------------------------------
-
-describe("(14) quoteTax", () => {
-  it("reports per-unit figures that scale to the executed trade's", () => {
-    const quote = evaluateTriangle(triangle(FORWARD, PROFITABLE), PROFITABLE, FEE)!;
-    const q = quoteTax(quote, PROFITABLE, FEE, BASE, INDIA)!;
-    const t = tax100()!;
-
-    expect(q).not.toBeNull();
-    // tdsPct is a percent of notional: x 100 USDT / 100 = the withheld amount.
-    expect((q.tdsPct * 100) / 100).toBeCloseTo(t.tdsWithheld, 8);
-    expect(q.tdsPct).toBeCloseTo(3.01679452, 8);
-
-    // indiaNetPct is netPct after the 30% charge, and equals the trade's
-    // post-tax return on notional.
-    expect(q.indiaNetPct).toBeCloseTo(quote.netPct * 0.7, 8);
-    expect(q.indiaNetPct).toBeCloseTo(t.netProfitPct, 6);
-
-    // A loss passes through untouched — there is nothing to offset it against.
-    const losing = evaluateTriangle(triangle(FORWARD, LOSING), LOSING, FEE)!;
-    const ql = quoteTax(losing, LOSING, FEE, BASE, INDIA)!;
-    expect(losing.netPct).toBeLessThan(0);
-    expect(ql.indiaNetPct).toBe(losing.netPct);
-    expect(ql.tdsPct).toBeGreaterThan(0);
   });
 });
 
@@ -332,68 +300,30 @@ describe("(15) poisoned books", () => {
 
   for (const [name, entry] of Object.entries(poison)) {
     it(`returns null, never NaN, for a ${name} on ETHBTC`, () => {
-      const tri = triangle(FORWARD, PROFITABLE);
       const bad = book({
         BTCUSDT: [59990, 60000],
         ETHBTC: entry,
         ETHUSDT: [3060, 3061],
       });
 
-      expect(priceChain(tri.legs, bad, FEE, 100)).toBeNull();
-      expect(computeTradeTax(tri, bad, FEE, 100, BASE, INDIA)).toBeNull();
-      expect(computeTradeTax(tri, bad, FEE, 100, BASE, NO_TAX)).toBeNull();
-
-      const quote = evaluateTriangle(tri, PROFITABLE, FEE)!;
-      expect(quoteTax(quote, bad, FEE, BASE, INDIA)).toBeNull();
+      expect(priceChain(FORWARD, bad, FEE, 100)).toBeNull();
+      expect(computeChainTax(FORWARD, bad, FEE, 100, BASE, INDIA)).toBeNull();
+      expect(computeChainTax(FORWARD, bad, FEE, 100, BASE, NO_TAX)).toBeNull();
     });
   }
 
   it("returns null for an unusable notional, an empty chain and a missing leg", () => {
-    const tri = triangle(FORWARD, PROFITABLE);
-    expect(computeTradeTax(tri, PROFITABLE, FEE, 0, BASE, INDIA)).toBeNull();
-    expect(computeTradeTax(tri, PROFITABLE, FEE, Number.NaN, BASE, INDIA)).toBeNull();
+    expect(computeChainTax(FORWARD, PROFITABLE, FEE, 0, BASE, INDIA)).toBeNull();
+    expect(computeChainTax(FORWARD, PROFITABLE, FEE, Number.NaN, BASE, INDIA)).toBeNull();
     expect(computeChainTax([], PROFITABLE, FEE, 100, BASE, INDIA)).toBeNull();
 
-    // The book lost a market since the quote was ranked.
+    // The book lost a market since the chain was priced.
     const stale = book({ BTCUSDT: [59990, 60000], ETHUSDT: [3060, 3061] });
-    expect(computeTradeTax(tri, stale, FEE, 100, BASE, INDIA)).toBeNull();
+    expect(computeChainTax(FORWARD, stale, FEE, 100, BASE, INDIA)).toBeNull();
 
     // A chain whose disposed asset cannot be marked into the base asset.
     const orphan = disposalValues([{ inAsset: "DOGE", inAmount: 5 }], PROFITABLE, BASE);
     expect(orphan).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// (16) the ranking is unchanged by the transform
-// ---------------------------------------------------------------------------
-
-describe("(16) sort-order preservation", () => {
-  it("ranks identically by netPct and by indiaNetPct", () => {
-    const books = [PROFITABLE, LOSING];
-    for (const b of books) {
-      const ranked = rankOpportunities(UNIVERSE, BASE, b, FEE);
-      expect(ranked.length).toBeGreaterThan(1);
-
-      const withTax = ranked.map((q) => ({
-        cycle: q.cycle,
-        netPct: q.netPct,
-        indiaNetPct: quoteTax(q, b, FEE, BASE, INDIA)!.indiaNetPct,
-      }));
-
-      const byNet = [...withTax].sort((x, y) => y.netPct - x.netPct);
-      const byIndia = [...withTax].sort((x, y) => y.indiaNetPct - x.indiaNetPct);
-      expect(byIndia.map((x) => x.cycle)).toEqual(byNet.map((x) => x.cycle));
-    }
-  });
-
-  it("is strictly increasing across the sign change", () => {
-    // f(x) = x > 0 ? x * 0.7 : x. Monotone for any rate < 1, including at 0.
-    const f = (x: number) => (x > 0 ? x * 0.7 : x);
-    const xs = [-5, -1, -0.001, 0, 0.001, 1, 5];
-    for (let i = 1; i < xs.length; i++) {
-      expect(f(xs[i])).toBeGreaterThan(f(xs[i - 1]));
-    }
   });
 });
 
@@ -404,14 +334,11 @@ describe("(16) sort-order preservation", () => {
 describe("(17) reported figures are round8-quantised", () => {
   it("holds for every numeric field of the breakdown", () => {
     // A notional chosen so the chain lands on long binary fractions.
-    const t = computeTradeTax(
-      triangle(FORWARD, PROFITABLE),
-      PROFITABLE,
-      0.00075,
-      137.77,
-      BASE,
-      { enabled: true, tdsRate: 0.01, taxRate: 0.312 },
-    )!;
+    const t = computeChainTax(FORWARD, PROFITABLE, 0.00075, 137.77, BASE, {
+      enabled: true,
+      tdsRate: 0.01,
+      taxRate: 0.312,
+    })!;
 
     const quantised = (n: number) => Math.round(n * 1e8) / 1e8;
     const fields = [
@@ -443,23 +370,12 @@ describe("(18) NO_TAX", () => {
     expect(NO_TAX).toEqual({ enabled: false, tdsRate: 0, taxRate: 0 });
 
     const t = tax100(NO_TAX)!;
-    const q = quoteTax(
-      evaluateTriangle(triangle(FORWARD, PROFITABLE), PROFITABLE, FEE)!,
-      PROFITABLE,
-      FEE,
-      BASE,
-      NO_TAX,
-    )!;
 
     expect(t.netProfit).toBe(t.grossProfit);
     expect(t.cashProfit).toBe(t.grossProfit);
     expect(t.tdsWithheld).toBe(0);
     expect(t.taxDue).toBe(0);
-
-    expect(q.tdsPct).toBe(0);
-    expect(q.indiaNetPct).toBe(
-      evaluateTriangle(triangle(FORWARD, PROFITABLE), PROFITABLE, FEE)!.netPct,
-    );
+    expect(t.legTds).toEqual([0, 0, 0]);
 
     // And it produces exactly the untaxed figures the engine already reported.
     expect(t.endAmount).toBe(END_AMOUNT);
