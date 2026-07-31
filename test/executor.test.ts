@@ -267,6 +267,24 @@ describe("runScan - no execution", () => {
       6,
     );
   });
+
+  it("demo mode fills even when the best net is below the negative threshold", async () => {
+    // UNPROFITABLE's best cycle nets about -0.63%. A user setting -0.1% has
+    // asked for demo mode per the dashboard hint ("every scan fills its best
+    // cycle"), so the fill must happen even though -0.63 < -0.1.
+    serveBook(UNPROFITABLE);
+    await updateSettings(env.DB, { min_profit_pct: -0.1 });
+
+    const result = await runScan(env, "manual");
+
+    expect(result.executed).toBe(true);
+    const [trade] = await listTrades(env.DB, 1);
+    expect(trade.profit).toBeLessThan(0);
+    await expect(getBalance(env.DB, "USDT")).resolves.toBeCloseTo(
+      DEFAULTS.initial_usdt + trade.profit,
+      6,
+    );
+  });
 });
 
 describe("runScan - overlap guard", () => {
