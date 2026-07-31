@@ -161,8 +161,11 @@
    */
   let indiaMode = false;
 
-  /** Columns in the trades table: 5 normally, 7 with the TDS and Net columns. */
-  const TRADES_COLS = () => (indiaMode ? 7 : 5);
+  /** Columns in the trades table: 6 normally, 8 with the TDS and Net columns. */
+  const TRADES_COLS = () => (indiaMode ? 8 : 6);
+  /** Columns in the opportunities and scans tables. Fixed, unlike trades. */
+  const OPPS_COLS = 7;
+  const SCANS_COLS = 10;
 
   function setIndiaMode(on) {
     indiaMode = Boolean(on);
@@ -170,6 +173,40 @@
     $("india-badge").hidden = !indiaMode;
     $("th-trades-tds").hidden = !indiaMode;
     $("th-trades-net").hidden = !indiaMode;
+  }
+
+  // -- strategy -------------------------------------------------------------
+
+  /**
+   * Which strategy the Opportunities table is showing: `""` (all),
+   * `"triangular"` or `"cross_exchange"`.
+   *
+   * Module state, and applied as the API's `?strategy=` parameter rather than
+   * by filtering the fetched rows: a client-side filter of "newest 30" would
+   * show however many spreads happened to survive in the newest 30 rows
+   * overall, which on a busy scanner is routinely zero.
+   */
+  let oppsStrategy = "";
+
+  const STRATEGY_LABELS = {
+    triangular: "tri",
+    cross_exchange: "x-chg",
+  };
+
+  /** Badge for a row's strategy; unknown values render verbatim, not blank. */
+  function strategyTag(strategy) {
+    const known = strategy === "triangular" || strategy === "cross_exchange";
+    const cls = strategy === "cross_exchange" ? "tag-xchg" : "tag-tri";
+    const text = known ? STRATEGY_LABELS[strategy] : strategy || "—";
+    return (
+      '<span class="tag ' +
+      (known ? cls : "tag-skip") +
+      '" title="' +
+      esc(strategy || "unknown") +
+      '">' +
+      esc(text) +
+      "</span>"
+    );
   }
 
   // -- rendering: portfolio -------------------------------------------------
@@ -253,6 +290,12 @@
     if (!Array.isArray(legs) || legs.length === 0) {
       return '<p class="legs-empty">No leg detail recorded.</p>';
     }
+    // A triangle's three legs all execute on one book, so a venue column there
+    // would be the same string three times. A spread's legs are the opposite
+    // case — the venue *is* the trade — so the column appears only when the
+    // legs actually carry one.
+    const withVenue = legs.some((leg) => leg && leg.venue);
+
     const rows = legs
       .map(
         (leg, i) =>
@@ -264,7 +307,9 @@
           (leg.side === "BUY" ? "buy" : "sell") +
           '">' +
           esc(leg.side) +
-          '</span></td><td class="right num">' +
+          "</span></td>" +
+          (withVenue ? '<td class="mono">' + esc(leg.venue || "—") + "</td>" : "") +
+          '<td class="right num">' +
           fmtPrice(leg.price) +
           '</td><td class="right num">' +
           fmtAmount(leg.inAmount) +
@@ -280,6 +325,7 @@
 
     return (
       '<table class="legs"><thead><tr><th>#</th><th>Pair</th><th>Side</th>' +
+      (withVenue ? "<th>Venue</th>" : "") +
       '<th class="right">Price</th><th class="right">In</th><th class="right">Out</th>' +
       "</tr></thead><tbody>" +
       rows +
@@ -290,7 +336,15 @@
   function renderOpportunities(list) {
     const body = $("opps-body");
     if (list.length === 0) {
-      placeholder(body, 6, "No opportunities yet — run a scan.");
+      placeholder(
+        body,
+        OPPS_COLS,
+        oppsStrategy
+          ? "No " +
+              (oppsStrategy === "cross_exchange" ? "cross-exchange" : "triangular") +
+              " opportunities recorded."
+          : "No opportunities yet — run a scan.",
+      );
       return;
     }
 
@@ -321,6 +375,9 @@
           '</span> <span class="ago">' +
           esc(fmtRelative(o.ts, now)) +
           "</span></td>" +
+          "<td>" +
+          strategyTag(o.strategy) +
+          "</td>" +
           '<td class="mono">' +
           esc(o.cycle) +
           "</td>" +
@@ -344,14 +401,23 @@
           esc(key) +
           '"' +
           (expanded ? "" : " hidden") +
-          '><td colspan="6">' +
+          '><td colspan="' +
+          OPPS_COLS +
+          '">' +
           legsTable(o.legs) +
           "</td></tr>"
         );
       })
       .join("");
 
-    $("opps-note").textContent = "newest " + list.length;
+    $("opps-note").textContent =
+      "newest " +
+      list.length +
+      (oppsStrategy === "cross_exchange"
+        ? " spreads"
+        : oppsStrategy === "triangular"
+          ? " cycles"
+          : "");
     $("opps-note").classList.remove("bad");
   }
 
@@ -384,6 +450,9 @@
           '</span> <span class="ago">' +
           esc(fmtRelative(t.ts, now)) +
           "</span></td>" +
+          "<td>" +
+          strategyTag(t.strategy) +
+          "</td>" +
           '<td class="mono">' +
           esc(t.cycle) +
           "</td>" +
@@ -424,7 +493,7 @@
   function renderScans(list) {
     const body = $("scans-body");
     if (list.length === 0) {
-      placeholder(body, 8, "No scans recorded yet.");
+      placeholder(body, SCANS_COLS, "No scans recorded yet.");
       return;
     }
     const now = Date.now();
@@ -458,10 +527,27 @@
           (isNum(s.best_net_pct) ? fmtPct(s.best_net_pct) : "—") +
           "</td>" +
           '<td class="right num">' +
+          (isNum(s.spreads_count) ? s.spreads_count : "—") +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(s.best_spread_net_pct) +
+          '">' +
+          (isNum(s.best_spread_net_pct) ? fmtPct(s.best_spread_net_pct) : "—") +
+          "</td>" +
+          '<td class="right num">' +
           (isNum(s.duration_ms) ? s.duration_ms + " ms" : "—") +
           "</td>" +
+          // A cross-exchange failure is a degraded scan, not a failed one, so
+          // it shares the column but stays visually muted.
           '<td class="err">' +
           (s.error ? esc(s.error) : "") +
+          (s.xchg_error
+            ? '<span class="ago">' +
+              (s.error ? " · " : "") +
+              "x-chg: " +
+              esc(s.xchg_error) +
+              "</span>"
+            : "") +
           "</td>" +
           "</tr>",
       )
@@ -507,6 +593,8 @@
     india_mode: "set-india-mode",
     tds_rate: "set-tds-rate",
     tax_rate: "set-tax-rate",
+    xchg_min_profit_pct: "set-xchg-min-profit",
+    xchg_enabled: "set-xchg-enabled",
   };
 
   function applySettings(s) {
@@ -529,6 +617,7 @@
       s.trade_size_usdt +
       " USDT · fee " +
       s.fee_rate +
+      (s.xchg_enabled ? " · x-chg min " + s.xchg_min_profit_pct + "%" : " · x-chg off") +
       (s.india_mode ? " · india " + s.tds_rate + "/" + s.tax_rate : "");
     settingsError("");
   }
@@ -605,6 +694,16 @@
             fmtNum(r.tax.tdsWithheld, 4) +
             ")"
           : "";
+        // The spread half reports separately: it has its own count, its own
+        // best, its own gate, and its own failure mode.
+        const bestSpread = isNum(r.bestSpreadNetPct) ? fmtPct(r.bestSpreadNetPct) : "n/a";
+        const spreads = r.xchgError
+          ? " · spreads unavailable (" + r.xchgError + ")"
+          : " · " +
+            (r.spreadsCount || 0) +
+            " spreads · best " +
+            bestSpread +
+            (r.xchgExecuted ? " · spread trade executed" : "");
         toast(
           "Scan " +
             (r.source || "unknown") +
@@ -614,10 +713,11 @@
             best +
             (r.executed ? " · trade executed" : "") +
             tax +
+            spreads +
             " · " +
             r.durationMs +
             "ms",
-          r.executed ? "ok" : "info",
+          r.executed || r.xchgExecuted ? "ok" : "info",
         );
       }
     } catch (err) {
@@ -665,7 +765,11 @@
     try {
       const [portfolio, opps, trades, scans] = await Promise.allSettled([
         getJson("/api/portfolio"),
-        getJson("/api/opportunities?limit=" + OPPS_LIMIT),
+        getJson(
+          "/api/opportunities?limit=" +
+            OPPS_LIMIT +
+            (oppsStrategy ? "&strategy=" + encodeURIComponent(oppsStrategy) : ""),
+        ),
         getJson("/api/trades?limit=" + TRADES_LIMIT),
         getJson("/api/scans?limit=" + SCANS_LIMIT),
       ]);
@@ -676,7 +780,12 @@
       if (opps.status === "fulfilled") {
         renderOpportunities(opps.value.opportunities || []);
       } else {
-        placeholder($("opps-body"), 6, "unavailable — " + opps.reason.message, false);
+        placeholder(
+          $("opps-body"),
+          OPPS_COLS,
+          "unavailable — " + opps.reason.message,
+          false,
+        );
       }
 
       if (trades.status === "fulfilled") {
@@ -700,7 +809,12 @@
         renderScans(list);
         renderStatus(list);
       } else {
-        placeholder($("scans-body"), 8, "unavailable — " + scans.reason.message, false);
+        placeholder(
+          $("scans-body"),
+          SCANS_COLS,
+          "unavailable — " + scans.reason.message,
+          false,
+        );
       }
     } finally {
       inFlight = false;
@@ -736,6 +850,23 @@
       row.hidden = nowHidden;
       btn.setAttribute("aria-expanded", nowHidden ? "false" : "true");
       btn.firstElementChild.textContent = nowHidden ? "▸" : "▾";
+    });
+
+    // Delegated too: the segmented control is static markup, but one listener
+    // keeps the pressed-state bookkeeping in a single place.
+    $("opps-filter").addEventListener("click", (event) => {
+      const btn = event.target.closest("button[data-strategy]");
+      if (!btn) return;
+      const next = btn.getAttribute("data-strategy") || "";
+      if (next === oppsStrategy) return;
+      oppsStrategy = next;
+      for (const other of $("opps-filter").querySelectorAll("button[data-strategy]")) {
+        other.setAttribute(
+          "aria-pressed",
+          (other.getAttribute("data-strategy") || "") === oppsStrategy ? "true" : "false",
+        );
+      }
+      refresh();
     });
 
     for (const id of Object.values(SETTING_INPUTS)) {

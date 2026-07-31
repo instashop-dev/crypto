@@ -623,6 +623,215 @@ describe("POST /api/scan - tax block", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Cross-exchange over HTTP
+// ---------------------------------------------------------------------------
+
+/** One synthetic cross-exchange opportunity + trade, at a controlled timestamp. */
+async function seedSpreadHistory(ts: number, profit: number): Promise<number> {
+  const scanId = await insertScan(env.DB, "manual", ts);
+  const cycle = `BTCUSDT binance-ws>mexc-rest#${ts}`;
+  const [opportunityId] = await insertOpportunities(
+    env.DB,
+    scanId,
+    [{ cycle, grossPct: profit, netPct: profit, legs: [] }],
+    ts,
+    "cross_exchange",
+  );
+  await commitTrade(env.DB, {
+    scanId,
+    opportunityId,
+    source: "binance-ws+mexc-rest",
+    ts,
+    strategy: "cross_exchange",
+    trade: {
+      cycle,
+      startAmount: 100,
+      endAmount: 100 + profit,
+      profit,
+      profitPct: profit,
+      legs: [],
+    },
+  });
+  return scanId;
+}
+
+describe("history listings - ?strategy filter", () => {
+  beforeEach(async () => {
+    await seedHistory(5_000, 1);
+    await seedSpreadHistory(5_001, 2);
+    await seedHistory(5_002, 3);
+  });
+
+  it("tags every row with the strategy that produced it", async () => {
+    const opps = (await (await get("/api/opportunities")).json()) as {
+      strategy: string | null;
+      opportunities: Array<{ ts: number; strategy: string }>;
+    };
+
+    // No filter asked for, so the response says so and returns everything.
+    expect(opps.strategy).toBeNull();
+    expect(opps.opportunities.map((o) => o.strategy)).toEqual([
+      "triangular",
+      "cross_exchange",
+      "triangular",
+    ]);
+
+    const trades = (await (await get("/api/trades")).json()) as {
+      trades: Array<{ strategy: string; source: string | null }>;
+    };
+    expect(trades.trades.map((t) => t.strategy)).toEqual([
+      "triangular",
+      "cross_exchange",
+      "triangular",
+    ]);
+    // A spread records both venues in `source`, not one of them.
+    expect(trades.trades[1].source).toBe("binance-ws+mexc-rest");
+  });
+
+  it("narrows both listings to one strategy", async () => {
+    for (const path of ["opportunities", "trades"]) {
+      const body = (await (
+        await get(`/api/${path}?strategy=cross_exchange`)
+      ).json()) as {
+        count: number;
+        strategy: string;
+        opportunities?: Array<{ ts: number; strategy: string }>;
+        trades?: Array<{ ts: number; strategy: string }>;
+      };
+      const rows = body.opportunities ?? body.trades ?? [];
+
+      expect(body.count, path).toBe(1);
+      expect(body.strategy, path).toBe("cross_exchange");
+      expect(rows.map((r) => r.ts), path).toEqual([5_001]);
+      expect(rows.every((r) => r.strategy === "cross_exchange"), path).toBe(true);
+    }
+
+    const tri = (await (await get("/api/trades?strategy=triangular")).json()) as {
+      count: number;
+      trades: Array<{ ts: number }>;
+    };
+    expect(tri.count).toBe(2);
+    expect(tri.trades.map((t) => t.ts)).toEqual([5_002, 5_000]);
+  });
+
+  it("applies the filter in SQL, so ?limit still means N of that strategy", async () => {
+    const body = (await (
+      await get("/api/trades?strategy=triangular&limit=1")
+    ).json()) as { count: number; trades: Array<{ ts: number }> };
+
+    // Newest overall is the spread at 5_001; asking for one triangle must not
+    // return zero rows because the newest row happened to be filtered out.
+    expect(body.count).toBe(1);
+    expect(body.trades[0].ts).toBe(5_002);
+  });
+
+  it("rejects an unknown strategy with 400 rather than silently ignoring it", async () => {
+    for (const path of ["/api/opportunities", "/api/trades"]) {
+      const res = await get(`${path}?strategy=crossexchange`);
+      expect(res.status, path).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error, path).toContain("unknown strategy");
+      expect(body.error, path).toContain("crossexchange");
+    }
+
+    // A misspelling that returns everything would look exactly like a strategy
+    // that never fires, which is the failure mode this rules out.
+    const empty = await get("/api/trades?strategy=");
+    expect(empty.status).toBe(200);
+    await expect(empty.json()).resolves.toMatchObject({ count: 3, strategy: null });
+  });
+});
+
+describe("PUT /api/settings - cross-exchange", () => {
+  it("exposes the two new tunables among the seeded defaults", async () => {
+    const body = (await (await get("/api/settings")).json()) as Record<string, number>;
+
+    expect(body).toEqual({ ...DEFAULTS });
+    expect(body.xchg_min_profit_pct).toBe(0.05);
+    expect(body.xchg_enabled).toBe(1);
+  });
+
+  it("accepts any finite xchg_min_profit_pct, negatives included", async () => {
+    for (const value of [-0.25, 0, 2.5]) {
+      const res = await send("/api/settings", "PUT", { xchg_min_profit_pct: value });
+      expect(res.status, String(value)).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({ xchg_min_profit_pct: value });
+    }
+    await expect(getSettings(env.DB)).resolves.toMatchObject({
+      xchg_min_profit_pct: 2.5,
+    });
+
+    const junk = await send("/api/settings", "PUT", { xchg_min_profit_pct: "0.1" });
+    expect(junk.status).toBe(400);
+  });
+
+  it("accepts xchg_enabled 0 and 1 and rejects anything else", async () => {
+    const off = await send("/api/settings", "PUT", { xchg_enabled: 0 });
+    expect(off.status).toBe(200);
+    await expect(getSettings(env.DB)).resolves.toMatchObject({ xchg_enabled: 0 });
+
+    for (const value of [2, 0.5, -1]) {
+      const res = await send("/api/settings", "PUT", { xchg_enabled: value });
+      expect(res.status, String(value)).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("xchg_enabled must be 0 or 1");
+    }
+    // Nothing was persisted by any of the rejected attempts.
+    await expect(getSettings(env.DB)).resolves.toMatchObject({ xchg_enabled: 0 });
+
+    const on = await send("/api/settings", "PUT", { xchg_enabled: 1 });
+    expect(on.status).toBe(200);
+    await expect(on.json()).resolves.toMatchObject({ xchg_enabled: 1 });
+  });
+});
+
+describe("POST /api/scan - cross-exchange block", () => {
+  it("reports the spread figures alongside the triangular ones", async () => {
+    // No MEXC venue is reachable here (nothing is intercepted), so the spread
+    // scanner degrades: the response still carries its fields, the scan itself
+    // still succeeds, and `error` stays clean.
+    serveProfitableBook();
+    const body = (await (await send("/api/scan", "POST")).json()) as {
+      executed: boolean;
+      error?: string;
+      spreadsCount: number;
+      bestSpreadNetPct: number | null;
+      xchgExecuted: boolean;
+      xchgError?: string;
+      opportunities: Array<{ strategy: string }>;
+    };
+
+    expect(body.error).toBeUndefined();
+    expect(body.executed).toBe(true);
+    expect(body.spreadsCount).toBe(0);
+    expect(body.bestSpreadNetPct).toBeNull();
+    expect(body.xchgExecuted).toBe(false);
+    expect(body.xchgError).toContain("mexc-rest");
+    expect(body.opportunities.every((o) => o.strategy === "triangular")).toBe(true);
+  });
+
+  it("exposes the new scan columns in the listing", async () => {
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+
+    const body = (await (await get("/api/scans")).json()) as {
+      scans: Array<{
+        spreads_count: number;
+        best_spread_net_pct: number | null;
+        xchg_error: string | null;
+        error: string | null;
+      }>;
+    };
+    const [scan] = body.scans;
+    expect(scan.spreads_count).toBe(0);
+    expect(scan.best_spread_net_pct).toBeNull();
+    // A missing second venue is recorded, but it is not a scan failure.
+    expect(scan.xchg_error).toContain("mexc-rest");
+    expect(scan.error).toBeNull();
+  });
+});
+
 describe("POST /api/admin/refresh-pairs", () => {
   it("rebuilds the pair cache from MEXC", async () => {
     fetchMock

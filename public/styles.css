@@ -631,6 +631,64 @@ table.grid tr.data-row:hover td {
   color: var(--fg-muted);
 }
 
+/*
+ * Strategy badges. Deliberately low-contrast next to .tag-exec: which strategy
+ * produced a row is context, not an outcome, and the eye should still land on
+ * the executed flag first.
+ */
+
+.tag-tri {
+  color: var(--fg-dim);
+  border-color: var(--border-strong);
+}
+
+.tag-xchg {
+  color: var(--accent);
+  border-color: rgba(77, 141, 255, 0.4);
+  background: var(--accent-soft);
+}
+
+/* Segmented control (strategy filter) */
+
+.segmented {
+  display: inline-flex;
+  align-self: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.segmented button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.7rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.segmented button + button {
+  border-left: 1px solid var(--border);
+}
+
+.segmented button:hover {
+  color: var(--fg-dim);
+}
+
+.segmented button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.segmented button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 /* Expandable leg detail */
 
 .legs-row > td {

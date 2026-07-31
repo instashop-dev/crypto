@@ -48,4 +48,14 @@ export interface ExecutedLeg {
   inAmount: number;
   outAsset: string;
   outAmount: number;
+  /**
+   * Which venue filled this leg, e.g. `"binance-ws"`.
+   *
+   * Optional and absent on triangular legs, which all execute on the one book a
+   * snapshot came from — there, a venue tag would be noise repeated three times.
+   * A cross-exchange spread is the opposite case: the venue *is* the trade, and
+   * a leg without it is unreadable. Additive, so persisted legs written before
+   * the field existed stay valid.
+   */
+  venue?: string;
 }

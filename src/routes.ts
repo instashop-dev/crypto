@@ -18,7 +18,7 @@ import {
   USER_AGENT,
   type WsCollector,
 } from "./binance";
-import { ASSET_UNIVERSE, BASE_ASSET } from "./config";
+import { ASSET_UNIVERSE, BASE_ASSET, STRATEGIES, type Strategy } from "./config";
 import {
   ensureSeeded,
   getBalances,
@@ -67,6 +67,8 @@ const MUTABLE_SETTINGS = [
   "india_mode",
   "tds_rate",
   "tax_rate",
+  "xchg_min_profit_pct",
+  "xchg_enabled",
 ] as const;
 type MutableSetting = (typeof MUTABLE_SETTINGS)[number];
 
@@ -151,6 +153,27 @@ function parseLimit(raw: string | undefined, fallback: number, max: number): num
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(Math.max(Math.trunc(n), 1), max);
+}
+
+/**
+ * Parse a `?strategy=` filter. Absent (or empty) means "every strategy".
+ *
+ * Unlike {@link parseLimit} this **rejects** an unrecognised value rather than
+ * falling back: a bad limit still answers the question that was asked, but
+ * `?strategy=crossexchange` silently returning triangles too would look exactly
+ * like a strategy that never fires. A misspelling has to be visible.
+ */
+function parseStrategy(
+  raw: string | undefined,
+): { ok: true; strategy?: Strategy } | { ok: false; error: string } {
+  if (raw === undefined || raw === "") return { ok: true };
+  if ((STRATEGIES as readonly string[]).includes(raw)) {
+    return { ok: true, strategy: raw as Strategy };
+  }
+  return {
+    ok: false,
+    error: `unknown strategy: ${raw} (expected ${STRATEGIES.join(" or ")})`,
+  };
 }
 
 /** Parse a JSON body, treating an absent or malformed body as `{}`. */
@@ -292,6 +315,12 @@ export function validateSettingsPatch(
     if (key === "tax_rate" && (value < 0 || value > MAX_TAX_RATE)) {
       return { ok: false, error: `tax_rate must be between 0 and ${MAX_TAX_RATE}` };
     }
+    // `xchg_min_profit_pct` needs no range check at all: like `min_profit_pct`
+    // it is a threshold in percent, and a negative value is the documented way
+    // to force demo fills. Any finite number is meaningful.
+    if (key === "xchg_enabled" && value !== 0 && value !== 1) {
+      return { ok: false, error: "xchg_enabled must be 0 or 1" };
+    }
     patch[key as MutableSetting] = value;
   }
 
@@ -381,8 +410,16 @@ export function createApp(): Hono<{ Bindings: Env }> {
     try {
       const [fallback, max] = LIMITS.opportunities;
       const limit = parseLimit(c.req.query("limit"), fallback, max);
-      const opportunities = await listOpportunities(c.env.DB, limit);
-      return c.json({ count: opportunities.length, limit, opportunities });
+      const filter = parseStrategy(c.req.query("strategy"));
+      if (!filter.ok) return c.json({ error: filter.error }, 400);
+
+      const opportunities = await listOpportunities(c.env.DB, limit, filter.strategy);
+      return c.json({
+        count: opportunities.length,
+        limit,
+        strategy: filter.strategy ?? null,
+        opportunities,
+      });
     } catch (err) {
       return c.json({ error: message(err) }, 500);
     }
@@ -392,8 +429,16 @@ export function createApp(): Hono<{ Bindings: Env }> {
     try {
       const [fallback, max] = LIMITS.trades;
       const limit = parseLimit(c.req.query("limit"), fallback, max);
-      const trades = await listTrades(c.env.DB, limit);
-      return c.json({ count: trades.length, limit, trades });
+      const filter = parseStrategy(c.req.query("strategy"));
+      if (!filter.ok) return c.json({ error: filter.error }, 400);
+
+      const trades = await listTrades(c.env.DB, limit, filter.strategy);
+      return c.json({
+        count: trades.length,
+        limit,
+        strategy: filter.strategy ?? null,
+        trades,
+      });
     } catch (err) {
       return c.json({ error: message(err) }, 500);
     }
