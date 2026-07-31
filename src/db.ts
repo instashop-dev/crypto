@@ -488,6 +488,16 @@ export interface OpportunityRow {
   tds_pct: number | null;
   /** `'triangular'` or `'cross_exchange'`; defaulted, never NULL. */
   strategy: string;
+  /**
+   * Phase 16 instrumentation; `NULL` is **not measured** throughout (migration
+   * 0006). `skew_ms` is the distance between the two books the row was priced
+   * from; `persist_net_pct` is the same trade re-priced against the next scan's
+   * snapshot, and is `NULL` even after `persist_checked_ts` when the row expired
+   * before any fresh snapshot could price it.
+   */
+  skew_ms: number | null;
+  persist_net_pct: number | null;
+  persist_checked_ts: number | null;
 }
 
 /** The shape the API hands out: `legs_json` parsed, `executed` as a boolean. */
@@ -504,6 +514,14 @@ export interface Opportunity {
   indiaNetPct: number | null;
   tdsPct: number | null;
   strategy: string;
+  /** Milliseconds between the two books this row was priced from; `null` when
+   *  the row predates the measurement or only one venue answered. */
+  skewMs: number | null;
+  /** This spread re-priced against the next scan's books; `null` when it was
+   *  never re-priced *or* expired unmeasured. `persistCheckedTs` tells the two
+   *  apart: set-with-null is expired, null is not yet looked at. */
+  persistNetPct: number | null;
+  persistCheckedTs: number | null;
 }
 
 /** Tolerant parse: a corrupt `legs_json` degrades to `[]` rather than a 500. */
@@ -531,6 +549,9 @@ export function toOpportunity(row: OpportunityRow): Opportunity {
     // A row written before migration 0003 has no column at all; it was a
     // triangle, so that is what it reads back as rather than an empty string.
     strategy: row.strategy ?? STRATEGY_TRIANGULAR,
+    skewMs: row.skew_ms ?? null,
+    persistNetPct: row.persist_net_pct ?? null,
+    persistCheckedTs: row.persist_checked_ts ?? null,
   };
 }
 
@@ -543,6 +564,13 @@ export interface OpportunityInput {
   /** Omitted (or null) when india mode is off; persisted as SQL NULL. */
   indiaNetPct?: number | null;
   tdsPct?: number | null;
+  /**
+   * Distance in ms between the two books this quote was priced from. Omitted
+   * (or null) when only one venue answered, or for a strategy that is not
+   * priced from two snapshots at all — SQL NULL then means "not measured",
+   * exactly as it does for the india columns above.
+   */
+  skewMs?: number | null;
 }
 
 /**
@@ -570,8 +598,8 @@ export async function insertOpportunities(
       db
         .prepare(
           "INSERT INTO opportunities (scan_id, ts, cycle, gross_pct, net_pct, executed," +
-            " legs_json, india_net_pct, tds_pct, strategy)" +
-            " VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9) RETURNING id",
+            " legs_json, india_net_pct, tds_pct, strategy, skew_ms)" +
+            " VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10) RETURNING id",
         )
         .bind(
           scanId,
@@ -583,6 +611,7 @@ export async function insertOpportunities(
           q.indiaNetPct ?? null,
           q.tdsPct ?? null,
           strategy,
+          q.skewMs ?? null,
         ),
     ),
   );
@@ -626,6 +655,84 @@ export async function listOpportunitiesForScan(
     .bind(scanId)
     .all<OpportunityRow>();
   return (results ?? []).map(toOpportunity);
+}
+
+/**
+ * Rows of one strategy that have never been re-priced, newest first, no older
+ * than `sinceTs`.
+ *
+ * The age floor is not an optimisation. Without it the first scan after
+ * migration 0006 would find every spread row ever written — none of them has a
+ * `persist_checked_ts` — and would mark each one "expired, unmeasured" a
+ * batch at a time for as long as the backlog lasted. Those rows are unmeasured,
+ * and NULL already says so; stamping them would replace a true statement with a
+ * noisier one. So the window is bounded and anything outside it keeps its
+ * honest NULL for ever. See {@link import("./scan").SPREAD_PERSIST_LOOKBACK_MS}.
+ *
+ * `strategy` is required rather than defaulted for the reason
+ * {@link insertOpportunities}'s is: this measurement is meaningful only for a
+ * two-venue spread, and letting it default would let it walk the pre-Phase-12
+ * triangular history.
+ *
+ * Newest first, so a `limit` smaller than the backlog spends itself on the rows
+ * that can still be *priced* rather than on the ones already past their
+ * measurement window. The starved older rows fall out of `sinceTs` in due
+ * course and keep the NULL that has been true of them all along.
+ */
+export async function listUnmeasuredOpportunities(
+  db: D1Database,
+  strategy: Strategy,
+  sinceTs: number,
+  limit: number,
+): Promise<Opportunity[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM opportunities WHERE strategy = ?1 AND persist_checked_ts IS NULL" +
+        " AND ts >= ?2 ORDER BY ts DESC, id DESC LIMIT ?3",
+    )
+    .bind(strategy, sinceTs, limit)
+    .all<OpportunityRow>();
+  return (results ?? []).map(toOpportunity);
+}
+
+/** One row's survival measurement: the re-priced net, or `null` for expired. */
+export interface OpportunityPersistence {
+  id: number;
+  /** The same trade's net % on a later snapshot; `null` = never priced. */
+  persistNetPct: number | null;
+  checkedTs: number;
+}
+
+/**
+ * Stamp the survival measurement onto rows, in one batch.
+ *
+ * `WHERE persist_checked_ts IS NULL` makes the write **idempotent per row**: a
+ * second scan racing the first (a manual scan against the cron tick) cannot
+ * overwrite a figure with its own, so a row is measured exactly once and the
+ * distribution the report reads is not silently weighted towards whichever rows
+ * happened to be re-priced twice.
+ *
+ * Returns how many rows this call actually stamped, which is what the caller
+ * reports — never the length of the input.
+ */
+export async function markOpportunityPersistence(
+  db: D1Database,
+  marks: OpportunityPersistence[],
+): Promise<number> {
+  if (marks.length === 0) return 0;
+
+  const results = await db.batch(
+    marks.map((m) =>
+      db
+        .prepare(
+          "UPDATE opportunities SET persist_net_pct = ?2, persist_checked_ts = ?3" +
+            " WHERE id = ?1 AND persist_checked_ts IS NULL",
+        )
+        .bind(m.id, m.persistNetPct, m.checkedTs),
+    ),
+  );
+
+  return results.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 }
 
 // ---------------------------------------------------------------------------

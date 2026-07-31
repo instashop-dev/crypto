@@ -17,6 +17,13 @@
  * writes no trade. It is a ledger of what the funding board would have paid,
  * kept so the extrapolation the board reports can be checked against an
  * outcome. See {@link runCarryCycle}.
+ *
+ * Phase 16 adds one more pass, and it changes even less: before the new spread
+ * board is written, the *previous* scan's rows are re-priced against the
+ * snapshot already in hand, so the repo finally measures whether a reported
+ * spread outlives the timing skew that may have invented it. It fetches nothing
+ * and writes only to columns that were NULL. See
+ * {@link measureSpreadPersistence}.
  */
 import { getDualSnapshot, discoverPairs, type DualSnapshot } from "./binance";
 import {
@@ -47,6 +54,8 @@ import {
   insertScan,
   listLatestFundingRates,
   listOpenFundingPositions,
+  listUnmeasuredOpportunities,
+  markOpportunityPersistence,
   replacePairs,
   SCAN_LOCK_KEY,
   setFundingIntervals,
@@ -57,12 +66,15 @@ import {
   type FundingRate,
   type FundingRateInput,
   type OpportunityInput,
+  type OpportunityPersistence,
   type PairRow,
   type Settings,
 } from "./db";
 import {
   accrueAmount,
   CARRY_STALE_CLOSE_MS,
+  evaluateSpread,
+  parseSpreadLabel,
   rankFundingOpportunities,
   rankSpreads,
   realizedFigures,
@@ -71,6 +83,7 @@ import {
   shouldClose,
   spreadQuoteTax,
   type CarryCloseReason,
+  type SpreadMarket,
   type VenueBook,
 } from "./engine";
 import {
@@ -100,6 +113,57 @@ export const SPREADS_PER_SCAN = 10;
  */
 export const SCAN_LOCK_TTL_MS = 45_000;
 
+/**
+ * How old a spread row may be and still be re-priced: two minutes.
+ *
+ * The question the measurement asks is "did this edge outlive the ~4s skew that
+ * may have invented it", so the answer has to be taken while the row is still
+ * about the same market state. Two minutes is one or two cron ticks — long
+ * enough that an ordinary skipped scan does not orphan the row, short enough
+ * that a "surviving" spread is not just the same asset at a different price an
+ * hour later. Past it the row is stamped checked with a NULL figure: expired
+ * unmeasured, which is a fact worth being able to count.
+ */
+export const SPREAD_PERSIST_MAX_AGE_MS = 120_000;
+
+/**
+ * How *young* a spread row may be and still be re-priced: 30 seconds.
+ *
+ * The floor at the other end of {@link SPREAD_PERSIST_MAX_AGE_MS}, and it exists
+ * because scans are not evenly spaced. The cron ticks minutely, but a manual
+ * `POST /api/scan` can land seconds after one — and would then measure rows at a
+ * survival horizon of near zero, where nothing has had time to move and almost
+ * everything "survives". Those measurements are not wrong so much as answering a
+ * different question, and mixed into the same column they bias the survival
+ * distribution upward.
+ *
+ * A row younger than this is therefore left completely untouched — NULL
+ * `persist_checked_ts`, still eligible — for whichever later scan finds it
+ * inside the window. Since the window runs to two minutes, an ordinary minutely
+ * cadence still gives every row at least one qualifying scan.
+ */
+export const SPREAD_PERSIST_MIN_AGE_MS = 30_000;
+
+/**
+ * How far back the survival pass will look for unmeasured rows: one hour.
+ *
+ * Rows older than this are never even selected, so they keep the NULL that
+ * truthfully says "not measured" — see {@link listUnmeasuredOpportunities}. It
+ * bounds two things at once: the backlog the first scan after migration 0006
+ * would otherwise walk (every spread row ever written), and the catch-up after
+ * an outage. Comfortably more than {@link SPREAD_PERSIST_MAX_AGE_MS}, so a row
+ * that expired unmeasured still gets stamped as such rather than being
+ * abandoned in the same state as the pre-feature history.
+ */
+export const SPREAD_PERSIST_LOOKBACK_MS = 60 * 60 * 1000;
+
+/**
+ * Most rows one scan will measure. A scan writes {@link SPREADS_PER_SCAN}, so
+ * this is several scans of backlog and still a bounded D1 batch — the pass must
+ * never be able to grow into the write budget of the scan it rides on.
+ */
+export const SPREAD_PERSIST_LIMIT = 50;
+
 /** Source recorded for the pairs discovered during first-run bootstrap. */
 const DISCOVERY_SOURCE = "mexc-rest";
 
@@ -119,6 +183,19 @@ export interface ScanResult {
   bestSpreadNetPct: number | null;
   /** Why cross-exchange produced nothing. Never sets {@link error}. */
   xchgError?: string;
+  /**
+   * Earlier spread rows whose survival was stamped this scan — re-priced
+   * against this snapshot, or marked expired unmeasured. `0` when there was
+   * nothing to measure, which is the steady state of a fresh deployment.
+   */
+  spreadsRechecked: number;
+  /**
+   * Why the survival pass produced nothing. Its own field, never
+   * {@link error} and never {@link xchgError}: this is instrumentation *about*
+   * the spread board, and a bug in it must not read as the spread scanner being
+   * degraded — the board it is measuring was written perfectly well.
+   */
+  persistError?: string;
   /**
    * The best-paying venue that answered this scan's funding poll; `null` if
    * none did.
@@ -217,6 +294,95 @@ async function acquireLock(db: D1Database, now: number): Promise<boolean> {
   }
   await setRawSetting(db, SCAN_LOCK_KEY, String(now));
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-exchange spread survival
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-price earlier spread rows against **this** scan's books and record what
+ * was left of them.
+ *
+ * This is the measurement `src/engine/crossExchange.ts` has been asking for
+ * since Phase 9. Its module header names the ~4s Binance-WS/MEXC-REST timing
+ * skew as the dominant false positive — a market that moved during the
+ * collection window shows up as a spread that never existed — and nothing in
+ * the repo has ever checked. A spread that was real is still there a minute
+ * later; one that was an artefact of two non-simultaneous books is not. So each
+ * scan asks the previous scan's rows that question, and `persist_net_pct`
+ * accumulates the distribution a later report reads.
+ *
+ * Three rules:
+ *
+ * - **Zero new subrequests.** It prices against the snapshot the scan already
+ *   fetched, and reads only D1. That is why it takes books rather than an `Env`.
+ * - **Same trade, same direction.** The direction lives only in the row's label,
+ *   so it is parsed back out ({@link parseSpreadLabel}); re-pricing the mirror
+ *   would report a provable loss as the survival of the trade that was
+ *   recorded. A row whose label, market or venue cannot be resolved is left
+ *   untouched for a later scan rather than guessed at — and expires on its own
+ *   if no scan ever manages it.
+ * - **Priced at the caller's current `feeRate`**, not the rate in force when the
+ *   row was written. The question is "what is this trade worth now", and the
+ *   answer has to be quoted at today's fees to be comparable with today's board.
+ *
+ * Runs **before** the new board is persisted, so a scan can never measure its
+ * own rows: a survival horizon of zero seconds would be a tautology, not a
+ * measurement. {@link SPREAD_PERSIST_MIN_AGE_MS} extends the same argument to
+ * rows the *previous* scan wrote seconds ago — a manual scan chasing a cron
+ * tick — which are skipped rather than stamped, and taken by a later scan.
+ *
+ * Returns how many rows were actually stamped.
+ */
+export async function measureSpreadPersistence(
+  db: D1Database,
+  venues: readonly VenueBook[],
+  markets: readonly SpreadMarket[],
+  feeRate: number,
+  nowTs: number,
+): Promise<number> {
+  const rows = await listUnmeasuredOpportunities(
+    db,
+    STRATEGY_CROSS_EXCHANGE,
+    nowTs - SPREAD_PERSIST_LOOKBACK_MS,
+    SPREAD_PERSIST_LIMIT,
+  );
+  if (rows.length === 0) return 0;
+
+  const byVenue = new Map(venues.map((v) => [v.venue, v]));
+  const bySymbol = new Map(markets.map((m) => [m.symbol, m]));
+  const marks: OpportunityPersistence[] = [];
+
+  for (const row of rows) {
+    // Expiry is decided first and unconditionally: a two-minute-old row is out
+    // of scope even on a scan that could have priced it, or the horizon of the
+    // measurement would vary with how lucky the row got.
+    if (nowTs - row.ts >= SPREAD_PERSIST_MAX_AGE_MS) {
+      marks.push({ id: row.id, persistNetPct: null, checkedTs: nowTs });
+      continue;
+    }
+
+    // ...and rows that are too *young* are not stamped at all, only skipped:
+    // measuring one now would quote a near-zero survival horizon into a column
+    // whose whole meaning is "~1 minute later". It stays eligible, and a later
+    // scan inside the window takes it.
+    if (nowTs - row.ts < SPREAD_PERSIST_MIN_AGE_MS) continue;
+
+    const label = parseSpreadLabel(row.cycle);
+    if (!label) continue;
+    const market = bySymbol.get(label.symbol);
+    const buy = byVenue.get(label.buyVenue);
+    const sell = byVenue.get(label.sellVenue);
+    if (!market || !buy || !sell) continue;
+
+    const quote = evaluateSpread(market, buy, sell, feeRate, BASE_ASSET);
+    if (!quote) continue;
+
+    marks.push({ id: row.id, persistNetPct: quote.netPct, checkedTs: nowTs });
+  }
+
+  return markOpportunityPersistence(db, marks);
 }
 
 /**
@@ -746,6 +912,7 @@ export async function runScan(
       error: "scan already in progress",
       spreadsCount: 0,
       bestSpreadNetPct: null,
+      spreadsRechecked: 0,
       fundingVenue: null,
       fundingVenues: [],
       fundingCount: 0,
@@ -764,6 +931,8 @@ export async function runScan(
   let spreadsCount = 0;
   let bestSpreadNetPct: number | null = null;
   let xchgError: string | null = null;
+  let spreadsRechecked = 0;
+  let persistError: string | null = null;
   let fundingVenue: FundingVenue | null = null;
   let fundingVenues: FundingVenue[] = [];
   let fundingVenueErrors: string[] = [];
@@ -815,6 +984,28 @@ export async function runScan(
           // comparable with the rest of the board.
           const markets = pairs.filter((p) => p.quote === BASE_ASSET);
 
+          // Instrumentation, in a `catch` of its own *inside* the
+          // cross-exchange one, and deliberately ahead of this scan's own
+          // writes. The nesting is the contract: a bug in the survival
+          // measurement costs the measurement, and the board it measures is
+          // still priced and persisted below. Ahead, because a row must never
+          // be re-priced by the scan that wrote it.
+          try {
+            spreadsRechecked = await measureSpreadPersistence(
+              db,
+              venues,
+              markets,
+              settings.fee_rate,
+              // The books' own clock, so a row's age is measured against the
+              // snapshot it is being re-priced with rather than against the
+              // wall clock of the worker.
+              dual.primary.ts,
+            );
+          } catch (err) {
+            persistError = errorMessage(err);
+            console.warn(`spread persistence pass failed: ${persistError}`);
+          }
+
           const spreads = rankSpreads(
             markets,
             venues[0],
@@ -843,6 +1034,12 @@ export async function runScan(
               legs: q.legs,
               indiaNetPct: figures?.indiaNetPct ?? null,
               tdsPct: figures?.tdsPct ?? null,
+              // The same figure on every row of a scan — they were all priced
+              // from the same pair of books — and stored per row anyway,
+              // because the row is what a later report reads and a join back to
+              // a scan-level column would break the moment a scan ever priced
+              // two snapshots.
+              skewMs: dual.skewMs,
             };
           });
           await insertOpportunities(
@@ -987,6 +1184,8 @@ export async function runScan(
     spreadsCount,
     bestSpreadNetPct,
     ...(xchgError != null ? { xchgError } : {}),
+    spreadsRechecked,
+    ...(persistError != null ? { persistError } : {}),
     fundingVenue,
     fundingVenues,
     ...(fundingVenueErrors.length > 0 ? { fundingVenueErrors } : {}),

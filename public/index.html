@@ -373,12 +373,14 @@
                 <th scope="col">Market</th>
                 <th scope="col" class="right">Gross %</th>
                 <th scope="col" class="right">Net %</th>
+                <th scope="col" class="right">Skew</th>
+                <th scope="col" class="right">Survived</th>
                 <th scope="col">Status</th>
               </tr>
             </thead>
             <tbody id="opps-body">
               <tr class="placeholder-row">
-                <td colspan="7">Loading&hellip;</td>
+                <td colspan="9">Loading&hellip;</td>
               </tr>
             </tbody>
           </table>
@@ -389,6 +391,16 @@
           <code>xchg_min_profit_pct</code>, judged fresh on every read. The two snapshots
           are not simultaneous, so a qualifying row is a candidate for investigation, not a
           trade that was available.
+        </p>
+        <p class="hint">
+          <strong>Skew</strong> is how far apart in time the two books were — the gap
+          between the end of the Binance WebSocket window and the MEXC response. It is a
+          lower bound: quotes inside the window can be seconds older still.
+          <strong>Survived</strong> is the same trade, same direction, re-priced against
+          the next scan’s books; “—” means not measured (too old to re-price, or waiting
+          for the next scan). A spread that was real is still there a minute later; one
+          the skew invented is not. If surviving nets never clear the
+          <strong>0.2002%</strong> two-leg fee break-even, this strategy is display-only.
         </p>
       </section>
 
@@ -433,6 +445,52 @@
           once and the two full-board venues each contribute the 11 majors plus
           their own best 20 and worst 5 contracts &mdash; a deeply negative rate
           is a result, not noise.
+        </p>
+      </section>
+
+      <!-- ── Cross-venue funding spreads ──────────────────────────────── -->
+      <section class="panel" aria-labelledby="vspread-heading">
+        <div class="panel-head">
+          <h2 id="vspread-heading">Cross-venue funding spreads</h2>
+          <span class="panel-note" id="vspread-note">&mdash;</span>
+        </div>
+        <div class="table-wrap">
+          <table class="grid" id="vspread-table">
+            <thead>
+              <tr>
+                <th scope="col">Symbol</th>
+                <th scope="col">Long (pays less)</th>
+                <th scope="col">Short (pays most)</th>
+                <th scope="col" class="right">Gross annual %</th>
+                <th scope="col" class="right">Net annual %</th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody id="vspread-body">
+              <tr class="placeholder-row">
+                <td colspan="6">Loading&hellip;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">
+          <strong>All perps, no spot leg.</strong> Long the venue paying least and short
+          the venue paying most on the same asset: delta-neutral, and the income is the
+          <em>difference</em> between the two funding streams, which is often steadier
+          than either rate. Each side is annualised on <em>its own</em> settlement
+          cadence before the subtraction — venues do not share a clock. Net annual % is
+          that differential less four perp legs at <code>perp_fee_rate</code>, spread
+          over <code>funding_hold_days</code>.
+        </p>
+        <p class="hint">
+          Derived from the board above on every read, never stored, and
+          <strong>never traded</strong> &mdash; the paper carry book below stays
+          single-venue. A row marked <span class="tag tag-skip">unverified</span> is a
+          symbol outside the 11 majors: the same ticker can be two different projects on
+          two venues, and the differential would then be between unrelated assets.
+          Multiplier contracts (<code>1000PEPE</code>) are never matched against their
+          unprefixed namesakes. Margin lives on two venues at once and is not modelled;
+          neither is a one-sided liquidation, which is how this trade actually breaks.
         </p>
       </section>
 

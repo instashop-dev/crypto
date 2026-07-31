@@ -26,6 +26,7 @@ import {
   crossVenueBook,
   evaluateSpread,
   NO_TAX,
+  parseSpreadLabel,
   rankSpreads,
   spreadHops,
   spreadLabel,
@@ -445,5 +446,58 @@ describe("spreadQuoteTax", () => {
       indiaNetPct: q.netPct,
       tdsPct: 0,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Label round trip (Phase 16)
+// ---------------------------------------------------------------------------
+
+describe("parseSpreadLabel", () => {
+  it("round-trips every label the engine writes", () => {
+    // A persisted row stores its direction *only* in this string, so the
+    // survival re-price in `src/scan.ts` is exactly as correct as this is.
+    for (const [symbol, buy, sell] of [
+      ["BTCUSDT", "binance-ws", "mexc-rest"],
+      ["ETHUSDT", "mexc-rest", "binance-ws"],
+      ["1000PEPEUSDT", "a", "b"],
+    ] as const) {
+      const label = spreadLabel(symbol, buy, sell);
+      expect(parseSpreadLabel(label)).toEqual({
+        symbol,
+        buyVenue: buy,
+        sellVenue: sell,
+      });
+    }
+  });
+
+  it("keeps the direction the row recorded, not its mirror", () => {
+    const quote = workedQuote();
+    const parsed = parseSpreadLabel(quote.label)!;
+    expect(parsed.buyVenue).toBe(quote.buyVenue);
+    expect(parsed.sellVenue).toBe(quote.sellVenue);
+    // Re-pricing the parsed direction reproduces the row it came from.
+    const again = evaluateSpread(BTC, BINANCE, MEXC, FEE, BASE)!;
+    expect(again.netPct).toBe(quote.netPct);
+  });
+
+  it("rejects anything that is not one, rather than guessing", () => {
+    for (const bad of [
+      "",
+      "BTCUSDT",
+      "BTCUSDT binance-ws",
+      "BTCUSDT >mexc-rest",
+      "BTCUSDT binance-ws>",
+      " binance-ws>mexc-rest",
+      "BTC USDT binance-ws>mexc-rest",
+      "BTCUSDT binance-ws>mexc>rest",
+      // A pre-Phase-9 triangular cycle, which is not a spread at all.
+      "USDT->BTC->ETH->USDT",
+    ]) {
+      expect(parseSpreadLabel(bad), JSON.stringify(bad)).toBeNull();
+    }
+    // A mis-parsed direction is worse than a missing one: the mirror is a
+    // provable loss, and reporting it as survival would invert the finding.
+    expect(parseSpreadLabel(null as unknown as string)).toBeNull();
   });
 });

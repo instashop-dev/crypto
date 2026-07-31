@@ -30,6 +30,7 @@ import {
 } from "../src/binance";
 import {
   ensureSeeded,
+  insertOpportunities,
   listOpportunities,
   listScans,
   listTrades,
@@ -38,7 +39,7 @@ import {
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { serveFlatBoard } from "./funding-stub";
-import { runScan } from "../src/scan";
+import { runScan, SPREAD_PERSIST_MIN_AGE_MS } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
 beforeAll(() => {
@@ -361,12 +362,223 @@ describe("runScan - xchg_enabled kill switch", () => {
         const mexc = { source: "mexc-rest" as const, ts: 1, book: MEXC };
         expect(symbols.sort()).toEqual(["BTCUSDT", "ETHBTC", "ETHUSDT"]);
         expect(e.DB).toBeDefined();
-        return { binance, mexc, primary: binance, failures: [] };
+        return { binance, mexc, primary: binance, failures: [], skewMs: 0 };
       },
     });
 
     expect(dualCalls).toBe(1);
     expect(result.spreadsCount).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Skew and survival instrumentation (Phase 16)
+// ---------------------------------------------------------------------------
+//
+// The dual snapshot is stubbed wholesale here rather than through the two venue
+// seams, because every assertion below is about *timestamps*: the age of a row
+// against the snapshot re-pricing it, and the distance between the two books.
+// A real clock would make them either slow or flaky, and the seam takes the two
+// venue timestamps as data, which is exactly what needs controlling.
+
+/** Anchored to the real clock so rows land inside the one-hour lookback. */
+const T0 = Date.now();
+
+/**
+ * A dual snapshot at a chosen instant, with a chosen skew and chosen books.
+ * `primary` is the Binance side, so persisted rows carry `ts`.
+ */
+function dualAt(
+  ts: number,
+  skewMs: number,
+  wsBook: Map<string, BookTickerEntry> = BINANCE,
+  restBook: Map<string, BookTickerEntry> = MEXC,
+) {
+  return async () => ({
+    binance: { source: "binance-ws" as const, ts, book: wsBook },
+    mexc: { source: "mexc-rest" as const, ts: ts + skewMs, book: restBook },
+    primary: { source: "binance-ws" as const, ts, book: wsBook },
+    failures: [],
+    skewMs: Math.abs(skewMs),
+  });
+}
+
+/** Rows of one scan, by the label that names their direction. */
+async function rowsOfScan(scanId: number | null) {
+  return (await spreadRows()).filter((o) => o.scanId === scanId);
+}
+
+describe("runScan - skew and spread survival", () => {
+  it("stamps the snapshot skew on every spread row, unmeasured otherwise", async () => {
+    const result = await runScan(env, "manual", { getSnapshots: dualAt(T0, 37) });
+
+    const rows = await spreadRows();
+    expect(rows).toHaveLength(2);
+    // The two books were 37ms apart, and every row of the scan was priced from
+    // that same pair — so every row carries it.
+    expect(rows.every((o) => o.skewMs === 37)).toBe(true);
+    // Nothing has re-priced them yet, and NULL says exactly that. A scan must
+    // never measure its own rows: a zero-second survival horizon is a
+    // tautology, not a measurement.
+    expect(rows.every((o) => o.persistCheckedTs === null)).toBe(true);
+    expect(rows.every((o) => o.persistNetPct === null)).toBe(true);
+    expect(result.spreadsRechecked).toBe(0);
+    expect(result.persistError).toBeUndefined();
+  });
+
+  it("re-prices the previous scan's rows once, and never again", async () => {
+    const first = await runScan(env, "manual", { getSnapshots: dualAt(T0, 5) });
+    expect(first.spreadsRechecked).toBe(0);
+
+    // A minute later, with MEXC now quoting inside Binance's spread: whatever
+    // the first scan saw is gone.
+    const second = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 60_000, 5, BINANCE, MEXC_NO_EDGE),
+    });
+    expect(second.spreadsRechecked).toBe(2);
+
+    const measured = await rowsOfScan(first.scanId);
+    expect(measured).toHaveLength(2);
+    expect(measured.every((o) => o.persistCheckedTs === T0 + 60_000)).toBe(true);
+
+    const btc = measured.find((o) => o.cycle === SPREAD_LABEL)!;
+    // The row keeps the figure it was written with...
+    expect(btc.netPct).toBeCloseTo(SPREAD_NET_PCT, 8);
+    // ...and gains what was left of it a minute later, which is nothing.
+    expect(btc.persistNetPct).toBeLessThan(0);
+    expect(btc.persistNetPct).toBeLessThan(btc.netPct);
+    const persisted = btc.persistNetPct;
+
+    // A third scan measures the *second* scan's rows and leaves the first
+    // scan's alone: the write is guarded on `persist_checked_ts IS NULL`, so a
+    // row is measured exactly once and the distribution is not double-weighted.
+    const third = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 110_000, 5),
+    });
+    expect(third.spreadsRechecked).toBe(2);
+
+    const again = await rowsOfScan(first.scanId);
+    expect(again.every((o) => o.persistCheckedTs === T0 + 60_000)).toBe(true);
+    expect(again.find((o) => o.cycle === SPREAD_LABEL)!.persistNetPct).toBe(persisted);
+    expect(
+      (await rowsOfScan(second.scanId)).every(
+        (o) => o.persistCheckedTs === T0 + 110_000 && o.persistNetPct !== null,
+      ),
+    ).toBe(true);
+  });
+
+  it("marks a row older than two minutes checked, with a NULL figure", async () => {
+    const first = await runScan(env, "manual", { getSnapshots: dualAt(T0, 5) });
+
+    // Three minutes on: still perfectly priceable against these books, and
+    // deliberately not priced. The horizon must not vary with how lucky a row
+    // got — "expired unmeasured" is its own fact, and countable.
+    const second = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 180_000, 5),
+    });
+    expect(second.spreadsRechecked).toBe(2);
+
+    const expired = await rowsOfScan(first.scanId);
+    expect(expired).toHaveLength(2);
+    expect(expired.every((o) => o.persistCheckedTs === T0 + 180_000)).toBe(true);
+    expect(expired.every((o) => o.persistNetPct === null)).toBe(true);
+  });
+
+  it("leaves a row younger than the horizon floor alone, and takes it next scan", async () => {
+    const first = await runScan(env, "manual", { getSnapshots: dualAt(T0, 5) });
+
+    // A manual scan chasing the cron tick by 10 seconds. Re-pricing here would
+    // quote a ~0s survival horizon into a column that means "~1 minute later",
+    // and near-zero horizons survive almost by construction — so the pass must
+    // skip the row entirely rather than stamp a flattering number on it.
+    const second = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 10_000, 5),
+    });
+    expect(second.spreadsRechecked).toBe(0);
+
+    // Skipped, not stamped: NULL still says "not measured", and the row stays
+    // eligible instead of being burned at the wrong horizon.
+    const young = await rowsOfScan(first.scanId);
+    expect(young).toHaveLength(2);
+    expect(young.every((o) => o.persistCheckedTs === null)).toBe(true);
+    expect(young.every((o) => o.persistNetPct === null)).toBe(true);
+
+    // A scan past the floor takes both scans' rows — the first at 45s, the
+    // second at 35s — so nothing was lost by waiting.
+    const third = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 45_000, 5),
+    });
+    expect(third.spreadsRechecked).toBe(4);
+
+    const measured = await rowsOfScan(first.scanId);
+    expect(measured.every((o) => o.persistCheckedTs === T0 + 45_000)).toBe(true);
+    expect(measured.every((o) => o.persistNetPct !== null)).toBe(true);
+    // And the horizon a reader recovers from the row is the real one, floored.
+    for (const row of measured) {
+      expect(row.persistCheckedTs! - row.ts).toBeGreaterThanOrEqual(
+        SPREAD_PERSIST_MIN_AGE_MS,
+      );
+    }
+  });
+
+  it("skips the pass silently when the fresh snapshot lost a venue", async () => {
+    const first = await runScan(env, "manual", { getSnapshots: dualAt(T0, 5) });
+
+    // The real dual path with MEXC down: one book cannot price a spread, so
+    // there is nothing to re-price *with*.
+    serveWs(BINANCE);
+    failRest("HTTP 451");
+    const second = await runScan(env, "manual");
+
+    expect(second.xchgError).toContain("mexc-rest");
+    expect(second.error).toBeUndefined();
+    expect(second.spreadsRechecked).toBe(0);
+    expect(second.persistError).toBeUndefined();
+
+    // Left unmeasured rather than stamped: a degraded scan produces no
+    // measurement, and must not produce a false one either.
+    const untouched = await rowsOfScan(first.scanId);
+    expect(untouched).toHaveLength(2);
+    expect(untouched.every((o) => o.persistCheckedTs === null)).toBe(true);
+    // ...and nothing about the failure reached the scan row itself.
+    const [scan] = await listScans(env.DB, 1);
+    expect(scan.error).toBeNull();
+  });
+
+  it("leaves a row it cannot re-price alone until it expires", async () => {
+    const first = await runScan(env, "manual", { getSnapshots: dualAt(T0, 5) });
+    // A row whose label does not round-trip: no direction can be recovered from
+    // it, and guessing one would report the mirror trade — a provable loss — as
+    // the survival of the trade that was recorded.
+    await insertOpportunities(
+      env.DB,
+      first.scanId!,
+      [{ cycle: "NOT-A-SPREAD-LABEL", grossPct: 1, netPct: 1, legs: [] }],
+      T0,
+      "cross_exchange",
+    );
+
+    const second = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 60_000, 5),
+    });
+    // Only the two priceable rows were stamped.
+    expect(second.spreadsRechecked).toBe(2);
+    const garbage = async () =>
+      (await spreadRows()).find((o) => o.cycle === "NOT-A-SPREAD-LABEL")!;
+    expect((await garbage()).persistCheckedTs).toBeNull();
+
+    // ...and once it is out of the window it is stamped checked-but-NULL, so it
+    // cannot sit in the backlog for ever.
+    const third = await runScan(env, "manual", {
+      getSnapshots: dualAt(T0 + 170_000, 5),
+    });
+    expect(third.spreadsRechecked).toBe(3);
+    expect((await garbage()).persistCheckedTs).toBe(T0 + 170_000);
+    expect((await garbage()).persistNetPct).toBeNull();
+    // The second scan's own rows, at 110s, were still inside the window.
+    expect(
+      (await rowsOfScan(second.scanId)).every((o) => o.persistNetPct !== null),
+    ).toBe(true);
   });
 });
 

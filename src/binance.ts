@@ -384,6 +384,32 @@ export interface DualSnapshot {
   primary: Snapshot;
   /** One human-readable line per source that did not qualify. Possibly empty. */
   failures: string[];
+  /**
+   * How far apart the two books are in time, in milliseconds:
+   * `|mexc.ts - binance.ts|`. `null` when either venue is missing, because a
+   * skew against a book that does not exist is not zero — it is unmeasured.
+   *
+   * The two timestamps this is built from are each taken **when that source
+   * finished**, not when the pair did. That distinction is the whole
+   * measurement: `Promise.allSettled` resolves both at once, so a `Date.now()`
+   * read after the await would have made every skew exactly 0 and quietly
+   * "proved" the two books simultaneous.
+   *
+   * What it measures is the gap between the *end* of the WebSocket collection
+   * window and the completion of the MEXC response — not the age of the oldest
+   * quote in the WebSocket book, which can be a further ~4s older still (see
+   * {@link WS_DEADLINE_MS}). So this is a **lower bound** on the true
+   * non-simultaneity, and the reported spread is an upper bound on an upper
+   * bound. Persisted per spread row as `opportunities.skew_ms`.
+   */
+  skewMs: number | null;
+}
+
+/** A source's book together with the moment that source finished producing it. */
+interface TimedBook {
+  book: Map<string, BookTickerEntry>;
+  /** `Date.now()` at completion, taken inside the branch that produced it. */
+  ts: number;
 }
 
 /**
@@ -418,23 +444,28 @@ export async function getDualSnapshot(
   const fetchRest = deps.fetchRest ?? getRestFetcher();
   const failures: string[] = [];
 
-  const [wsResult, restResult] = await Promise.allSettled([
+  // Each branch stamps its own completion time *before* the join, so the two
+  // timestamps describe the two sources rather than the moment they were both
+  // done. See {@link DualSnapshot.skewMs}.
+  const [wsResult, restResult] = await Promise.allSettled<TimedBook>([
     // An empty request has nothing to stream, and opening a socket for zero
     // symbols would be a guaranteed timeout — `getSnapshot` skips it for the
     // same reason.
     wanted.length > 0
-      ? collectWs(wanted, { deadlineMs: deps.wsDeadlineMs ?? WS_DEADLINE_MS, env })
-      : Promise.resolve(new Map<string, BookTickerEntry>()),
-    fetchRest(wanted, env),
+      ? collectWs(wanted, { deadlineMs: deps.wsDeadlineMs ?? WS_DEADLINE_MS, env }).then(
+          (book) => ({ book, ts: Date.now() }),
+        )
+      : Promise.resolve({ book: new Map<string, BookTickerEntry>(), ts: Date.now() }),
+    fetchRest(wanted, env).then((book) => ({ book, ts: Date.now() })),
   ]);
 
   let binance: Snapshot | null = null;
   if (wanted.length === 0) {
     failures.push("binance-ws: no symbols requested");
   } else if (wsResult.status === "fulfilled") {
-    const book = wsResult.value;
+    const { book, ts } = wsResult.value;
     if (book.size / wanted.length >= WS_COVERAGE_THRESHOLD) {
-      binance = { source: "binance-ws", ts: Date.now(), book };
+      binance = { source: "binance-ws", ts, book };
     } else {
       failures.push(`binance-ws: covered only ${book.size}/${wanted.length} symbols`);
     }
@@ -444,9 +475,9 @@ export async function getDualSnapshot(
 
   let mexc: Snapshot | null = null;
   if (restResult.status === "fulfilled") {
-    const book = restResult.value;
+    const { book, ts } = restResult.value;
     if (book.size > 0 || wanted.length === 0) {
-      mexc = { source: "mexc-rest", ts: Date.now(), book };
+      mexc = { source: "mexc-rest", ts, book };
     } else {
       failures.push("mexc-rest: none of the requested symbols were listed");
     }
@@ -459,7 +490,15 @@ export async function getDualSnapshot(
     throw new Error(`no market-data source available (${failures.join("; ")})`);
   }
 
-  return { binance, mexc, primary, failures };
+  return {
+    binance,
+    mexc,
+    primary,
+    failures,
+    // Absolute: which side finished first is an artefact of scheduling, and a
+    // signed value would invite averaging two ordering accidents to zero.
+    skewMs: binance && mexc ? Math.abs(mexc.ts - binance.ts) : null,
+  };
 }
 
 /**

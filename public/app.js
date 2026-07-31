@@ -208,11 +208,40 @@
   /** Columns in the trades table: 6 normally, 8 with the TDS and Net columns. */
   const TRADES_COLS = () => (indiaMode ? 8 : 6);
   /** Columns in the spreads and scans tables. Fixed, unlike trades. */
-  const OPPS_COLS = 7;
+  const OPPS_COLS = 9;
   const SCANS_COLS = 8;
   const FUNDING_COLS = 8;
+  const VENUE_SPREAD_COLS = 6;
   const CARRY_OPEN_COLS = 8;
   const CARRY_CLOSED_COLS = 9;
+
+  /**
+   * Two-leg break-even at the **default** 0.1%/leg taker fee: ~0.2% of notional,
+   * the figure the README's decision rule quotes. Used only when
+   * `/api/opportunities` reports no `feeRate` — an older Worker against a newer
+   * dashboard — so the marker degrades to the default bar rather than vanishing.
+   */
+  const SPREAD_BREAK_EVEN_FALLBACK_PCT = 0.2002;
+
+  /**
+   * The bar surviving nets are marked against, in percent: the round-trip cost
+   * of buying and selling once at the taker fee `f`, `(1 / (1 - f)^2 - 1) x 100`.
+   *
+   * Tracked from `/api/opportunities` rather than hard-coded, because the real
+   * break-even moves with `fee_rate` and a display marker that stayed at the
+   * default would quietly mis-flag every row once an operator retuned it. It is
+   * still a marker only: the stored `netPct` figures are already net of the fees
+   * in force when they were priced.
+   */
+  let spreadBreakEvenPct = SPREAD_BREAK_EVEN_FALLBACK_PCT;
+
+  /** Break-even for a taker fee rate; the fallback for anything unusable. */
+  function breakEvenPct(feeRate) {
+    if (!isNum(feeRate) || feeRate < 0 || feeRate >= 1) {
+      return SPREAD_BREAK_EVEN_FALLBACK_PCT;
+    }
+    return (1 / ((1 - feeRate) * (1 - feeRate)) - 1) * 100;
+  }
 
   function setIndiaMode(on) {
     indiaMode = Boolean(on);
@@ -374,6 +403,60 @@
   }
 
   /**
+   * How far apart the two books were, in ms. `—` for a row written before the
+   * measurement existed, or for a scan where only one venue answered — and
+   * "unmeasured" is not "simultaneous", so it must not render as `0`.
+   */
+  function skewCell(skewMs) {
+    if (!isNum(skewMs)) {
+      return '<td class="right num"><span class="ago" title="Not measured.">—</span></td>';
+    }
+    return (
+      '<td class="right num nowrap"><span title="Gap between the end of the' +
+      ' WebSocket collection window and the MEXC response — a lower bound on how' +
+      ' non-simultaneous the two books were.">' +
+      skewMs +
+      " ms</span></td>"
+    );
+  }
+
+  /**
+   * What the same trade was worth on the next scan's books.
+   *
+   * Three distinct states, and collapsing any two of them would be the whole
+   * point of the column lost: not yet checked (`—`), checked but never priceable
+   * (`expired`), and a real re-priced figure — which is rendered with its sign
+   * and flagged when it still clears the two-leg break-even.
+   */
+  function survivalCell(netPct, checkedTs) {
+    if (isNum(netPct)) {
+      const survives = netPct >= spreadBreakEvenPct;
+      return (
+        '<td class="right num nowrap ' +
+        signClass(netPct) +
+        '"><span title="Re-priced on a later snapshot' +
+        (isNum(checkedTs) ? " at " + esc(new Date(checkedTs).toISOString()) : "") +
+        '.">' +
+        fmtPct(netPct) +
+        "</span>" +
+        (survives ? ' <span class="tag tag-exec">clears</span>' : "") +
+        "</td>"
+      );
+    }
+    if (isNum(checkedTs)) {
+      return (
+        '<td class="right num"><span class="ago" title="Checked, but the row was' +
+        ' already too old to re-price — no fresh snapshot reached it in time.">' +
+        "expired</span></td>"
+      );
+    }
+    return (
+      '<td class="right num"><span class="ago" title="Not measured yet — the next' +
+      ' scan re-prices this row.">—</span></td>'
+    );
+  }
+
+  /**
    * The spreads table.
    *
    * `qualifies` arrives from the server, already judged against the *current*
@@ -381,7 +464,11 @@
    * — exactly as the funding board does with its own threshold. It replaced an
    * "executed" column when Phase 12 removed the fill paths.
    */
-  function renderOpportunities(list, minProfitPct) {
+  function renderOpportunities(list, minProfitPct, feeRate) {
+    // Before any row is drawn: the "clears" flag in `survivalCell` is judged
+    // against the fee the server is pricing at right now.
+    spreadBreakEvenPct = breakEvenPct(feeRate);
+
     const body = $("opps-body");
     if (list.length === 0) {
       placeholder(body, OPPS_COLS, "No spreads recorded yet — run a scan.");
@@ -431,6 +518,8 @@
           '">' +
           fmtPct(o.netPct) +
           "</td>" +
+          skewCell(o.skewMs) +
+          survivalCell(o.persistNetPct, o.persistCheckedTs) +
           "<td>" +
           (o.qualifies
             ? '<span class="tag tag-exec">qualifies</span>'
@@ -684,6 +773,99 @@
       age +
       (data.stale ? " (stale)" : "");
     note.classList.toggle("bad", Boolean(data.stale));
+  }
+
+  /**
+   * The cross-venue funding spreads panel.
+   *
+   * Fed by the same `/api/funding` response as the board above — the spreads are
+   * derived from those very rows, server-side, so the two panels can never
+   * disagree about what the board said. Nothing here is ever traded; the panel
+   * is a second reading of one observation.
+   */
+  function renderVenueSpreads(data) {
+    const body = $("vspread-body");
+    const note = $("vspread-note");
+    const spreads = Array.isArray(data.spreads) ? data.spreads : [];
+
+    if (spreads.length === 0) {
+      placeholder(
+        body,
+        VENUE_SPREAD_COLS,
+        Array.isArray(data.rates) && data.rates.length > 0
+          ? "No symbol on this board is quoted by two venues."
+          : "No funding board yet — run a scan.",
+      );
+      note.textContent = "—";
+      note.classList.remove("bad");
+      return;
+    }
+
+    body.innerHTML = spreads
+      .map((s) => {
+        const leg = (side) =>
+          '<span class="mono" title="' +
+          esc(side.instrument || "") +
+          (side.intervalSource === "api" ? "" : " — assumed settlement interval") +
+          '">' +
+          esc(side.venue) +
+          '</span> <span class="ago">' +
+          fmtPct(isNum(side.annualizedPct) ? side.annualizedPct : NaN, 2) +
+          (side.intervalSource === "api" ? "" : " *") +
+          "</span>";
+
+        return (
+          '<tr class="data-row">' +
+          '<td class="mono">' +
+          esc(s.symbol) +
+          (s.verifiedPair
+            ? ""
+            : ' <span class="tag tag-skip" title="Outside the 11 majors: the same' +
+              ' ticker can be a different project on each venue, so this pair’s' +
+              ' identity is unverified.">unverified</span>') +
+          "</td>" +
+          "<td>" +
+          leg(s.long) +
+          "</td>" +
+          "<td>" +
+          leg(s.short) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(s.grossAnnualPct) +
+          '">' +
+          fmtPct(s.grossAnnualPct, 2) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(s.netAnnualPct) +
+          '">' +
+          fmtPct(s.netAnnualPct, 2) +
+          "</td>" +
+          "<td>" +
+          (s.qualifies
+            ? '<span class="tag tag-exec">qualifies</span>'
+            : '<span class="tag tag-skip">—</span>') +
+          "</td>" +
+          "</tr>"
+        );
+      })
+      .join("");
+
+    const verified = spreads.filter((s) => s.verifiedPair).length;
+    const drag = spreads[0] && isNum(spreads[0].feeDragAnnualPct)
+      ? spreads[0].feeDragAnnualPct
+      : NaN;
+    note.textContent =
+      spreads.length +
+      " pair" +
+      (spreads.length === 1 ? "" : "s") +
+      " · " +
+      verified +
+      " verified · drag " +
+      (isNum(drag) ? fmtNum(drag, 2) + "%" : "—") +
+      "/yr · min " +
+      (isNum(data.minAnnualPct) ? data.minAnnualPct : "—") +
+      "%";
+    note.classList.remove("bad");
   }
 
   /** Close reasons, shortened for the table. Unknown values render verbatim. */
@@ -1139,7 +1321,11 @@
       else portfolioUnavailable(portfolio.reason.message);
 
       if (opps.status === "fulfilled") {
-        renderOpportunities(opps.value.opportunities || [], opps.value.minProfitPct);
+        renderOpportunities(
+          opps.value.opportunities || [],
+          opps.value.minProfitPct,
+          opps.value.feeRate,
+        );
       } else {
         placeholder(
           $("opps-body"),
@@ -1153,6 +1339,9 @@
       // separate upstream from the spot venues and fails independently of them.
       if (funding.status === "fulfilled") {
         renderFunding(funding.value || {});
+        // Same response, second reading: the spreads are derived from the very
+        // rows above, so they live and die with that one request.
+        renderVenueSpreads(funding.value || {});
       } else {
         placeholder(
           $("funding-body"),
@@ -1162,6 +1351,14 @@
         );
         $("funding-note").textContent = "unavailable";
         $("funding-note").classList.add("bad");
+        placeholder(
+          $("vspread-body"),
+          VENUE_SPREAD_COLS,
+          "unavailable — " + funding.reason.message,
+          false,
+        );
+        $("vspread-note").textContent = "unavailable";
+        $("vspread-note").classList.add("bad");
       }
 
       if (carry.status === "fulfilled") {
