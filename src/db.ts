@@ -1169,6 +1169,191 @@ export async function getFundingRateAt(
 }
 
 // ---------------------------------------------------------------------------
+// Basis rates (OKX dated futures)
+// ---------------------------------------------------------------------------
+
+/**
+ * Key of the scan's own basis-poll marker, exactly parallel to
+ * {@link FUNDING_POLL_TS_KEY} and for the same reasons: a single mutable scalar
+ * with no history worth keeping, written only *after* a poll returns so a poll
+ * that threw part-way is retried by the next scan rather than holding the gate
+ * shut for a full interval.
+ *
+ * Its own key rather than sharing the funding one, because the two polls fail
+ * independently by design: a basis outage must not stop the funding board being
+ * polled on its own cadence, nor the reverse.
+ */
+export const BASIS_POLL_TS_KEY = "basis_last_poll_ts";
+
+/**
+ * How long a basis row is kept: 7 days, the same window
+ * {@link FUNDING_RETENTION_MS} gives a funding row.
+ *
+ * Deliberately identical rather than merely similar. `GET /api/report` reports
+ * both strategies over one window and clamps its `?days=` to this retention, so
+ * two different windows would mean the report's own header could only ever
+ * describe one of the two tables honestly.
+ */
+export const BASIS_RETENTION_MS = FUNDING_RETENTION_MS;
+
+/** Statements per `batch()` when writing a basis board. See
+ *  {@link FUNDING_INSERT_CHUNK}; a live OKX board is ~20 rows, so this has
+ *  headroom of an order of magnitude and chunks anyway. */
+export const BASIS_INSERT_CHUNK = FUNDING_INSERT_CHUNK;
+
+export interface BasisRateRow {
+  id: number;
+  /** `NULL` for a poll that belongs to no scan. */
+  scan_id: number | null;
+  ts: number;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  expiry_ts: number;
+  days_to_expiry: number;
+  spot_price: number;
+  future_price: number;
+  price_source: string;
+  basis_pct: number;
+  annualized_pct: number;
+  net_annual_pct: number;
+}
+
+/** The shape the API hands out: camel-cased, nulls preserved. */
+export interface BasisRate {
+  id: number;
+  scanId: number | null;
+  ts: number;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  expiryTs: number;
+  daysToExpiry: number;
+  spotPrice: number;
+  futurePrice: number;
+  /** `'mid'` or `'last'`; a row is only as live as its weaker leg. */
+  priceSource: string;
+  basisPct: number;
+  annualizedPct: number;
+  netAnnualPct: number;
+}
+
+export function toBasisRate(row: BasisRateRow): BasisRate {
+  return {
+    id: row.id,
+    scanId: row.scan_id ?? null,
+    ts: row.ts,
+    venue: row.venue,
+    symbol: row.symbol,
+    instrument: row.instrument,
+    expiryTs: row.expiry_ts,
+    daysToExpiry: row.days_to_expiry,
+    spotPrice: row.spot_price,
+    futurePrice: row.future_price,
+    priceSource: row.price_source,
+    basisPct: row.basis_pct,
+    annualizedPct: row.annualized_pct,
+    netAnnualPct: row.net_annual_pct,
+  };
+}
+
+/** What the scanner hands us, narrowed to just what is persisted. */
+export interface BasisRateInput {
+  venue: string;
+  symbol: string;
+  instrument: string;
+  expiryTs: number;
+  daysToExpiry: number;
+  spotPrice: number;
+  futurePrice: number;
+  priceSource: string;
+  basisPct: number;
+  annualizedPct: number;
+  netAnnualPct: number;
+}
+
+/**
+ * Persist one poll's basis board and prune past the retention window.
+ *
+ * A structural copy of {@link insertFundingRates}, chunking and all, and the
+ * duplication is on purpose: the two tables have different columns and sharing
+ * an insert path would mean a generic row-shape abstraction sitting between the
+ * scanner and its SQL. The `DELETE` is relative to *this poll's* `ts` rather
+ * than to `Date.now()` so a back-dated poll prunes against its own clock, and it
+ * rides in the **last** chunk, so a failure part-way costs rows nobody had yet
+ * rather than rows somebody already had.
+ */
+export async function insertBasisRates(
+  db: D1Database,
+  scanId: number | null,
+  rows: BasisRateInput[],
+  ts: number = Date.now(),
+): Promise<number> {
+  if (rows.length === 0) return 0;
+
+  const inserts: D1PreparedStatement[] = rows.map((r) =>
+    db
+      .prepare(
+        "INSERT INTO basis_rates (scan_id, ts, venue, symbol, instrument, expiry_ts," +
+          " days_to_expiry, spot_price, future_price, price_source, basis_pct," +
+          " annualized_pct, net_annual_pct)" +
+          " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+      )
+      .bind(
+        scanId,
+        ts,
+        r.venue,
+        r.symbol,
+        r.instrument,
+        r.expiryTs,
+        r.daysToExpiry,
+        r.spotPrice,
+        r.futurePrice,
+        r.priceSource,
+        r.basisPct,
+        r.annualizedPct,
+        r.netAnnualPct,
+      ),
+  );
+
+  const chunks: D1PreparedStatement[][] = [];
+  for (let i = 0; i < inserts.length; i += BASIS_INSERT_CHUNK) {
+    chunks.push(inserts.slice(i, i + BASIS_INSERT_CHUNK));
+  }
+
+  const prune = db
+    .prepare("DELETE FROM basis_rates WHERE ts < ?1")
+    .bind(ts - BASIS_RETENTION_MS);
+  const last = chunks[chunks.length - 1];
+  if (last.length < BASIS_INSERT_CHUNK) last.push(prune);
+  else chunks.push([prune]);
+
+  for (const chunk of chunks) {
+    await db.batch(chunk);
+  }
+  return rows.length;
+}
+
+/**
+ * The newest complete basis board, best net annual first.
+ *
+ * Selected by `ts = (SELECT MAX(ts) …)` for the reason
+ * {@link listLatestFundingRates} is: one poll writes one timestamp for all of
+ * its rows, so this returns exactly one board and never a mixture of two.
+ * `instrument` joins the tie-break — one symbol has several contracts on this
+ * board at once, so the symbol alone is not a stable ordering key here.
+ */
+export async function listLatestBasisRates(db: D1Database): Promise<BasisRate[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM basis_rates WHERE ts = (SELECT MAX(ts) FROM basis_rates)" +
+        " ORDER BY net_annual_pct DESC, symbol ASC, instrument ASC",
+    )
+    .all<BasisRateRow>();
+  return (results ?? []).map(toBasisRate);
+}
+
+// ---------------------------------------------------------------------------
 // Funding positions (paper carry)
 // ---------------------------------------------------------------------------
 
@@ -1492,6 +1677,563 @@ export async function getCarryTotals(db: D1Database): Promise<CarryTotals> {
 }
 
 // ---------------------------------------------------------------------------
+// Report aggregates (GET /api/report)
+// ---------------------------------------------------------------------------
+//
+// Every query below is an **aggregate over a bounded time window**, and that is
+// the whole design rule of this section. A week of funding rows is ~150k and a
+// week of spread rows is ~100k; a report that pulled either into JS to reduce it
+// would be the one read in this app able to exhaust a Worker's memory and its
+// D1 row budget at once. So the reduction happens in SQL and what crosses the
+// boundary is one row per group.
+//
+// The figures are deliberately *not* the stored `net_annual_pct` columns. Those
+// were computed against whatever fee settings were in force at poll time, and
+// rows written before Phase 13 used a materially different fee model (the spot
+// taker rate on all four legs, which overstated the drag by a third). Averaging
+// across that boundary would produce a number describing no fee schedule that
+// ever existed. So the report reads the *gross* `annualized_pct` — which no fee
+// change has ever touched — and subtracts the drag implied by today's settings,
+// passed in by the caller. One fee basis across the whole window, stated in the
+// response's `meta.settings`. `basis_rates` is recomputed the same way, per row
+// rather than per board, because a dated contract amortises the round trip over
+// its own remaining life; see {@link reportBasis}.
+//
+// The one column that is read as stored is `opportunities.persist_net_pct`, and
+// that is the same rule rather than an exception to it: it is not a gross figure
+// awaiting a drag, it is `evaluateSpread`'s output *after* the drag, so the
+// honest thing to do with it is nothing. See {@link reportXchg}.
+//
+// A drag that cannot be priced from the stored fee rates is passed as `null`,
+// never as `0`: zero is the claim that trading is free, and every count taken
+// against it would be inflated by rows that only clear a bar nobody charged
+// them for. The affected counts come back `null` — "not measured".
+
+/** A helper's view of how much of a window a table actually covers. */
+export interface ReportWindow {
+  /** Oldest and newest row inside the window; `null` when there are none. */
+  firstTs: number | null;
+  lastTs: number | null;
+  rows: number;
+}
+
+/**
+ * How much of `[fromTs, toTs]` one table actually has rows for.
+ *
+ * `table` and `tsColumn` are never caller-supplied — every call site passes a
+ * literal, exactly as {@link countRows} requires — because they are interpolated
+ * rather than bound. SQLite will not bind an identifier, and the alternative
+ * (four near-identical copies of this query) hides the one thing that differs.
+ * `strategy`, which *is* data, is bound like everything else.
+ */
+export async function reportWindow(
+  db: D1Database,
+  table: string,
+  tsColumn: string,
+  fromTs: number,
+  toTs: number,
+  strategy?: Strategy,
+): Promise<ReportWindow> {
+  const statement = db
+    .prepare(
+      `SELECT COUNT(*) AS rows_in, MIN(${tsColumn}) AS first_ts, MAX(${tsColumn}) AS last_ts` +
+        ` FROM ${table} WHERE ${tsColumn} >= ?1 AND ${tsColumn} <= ?2` +
+        (strategy === undefined ? "" : " AND strategy = ?3"),
+    );
+  const row = await (strategy === undefined
+    ? statement.bind(fromTs, toTs)
+    : statement.bind(fromTs, toTs, strategy)
+  ).first<{ rows_in: number; first_ts: number | null; last_ts: number | null }>();
+
+  return {
+    firstTs: row?.first_ts ?? null,
+    lastTs: row?.last_ts ?? null,
+    rows: row?.rows_in ?? 0,
+  };
+}
+
+/** One venue's funding record over the window. Percentages are **gross**. */
+export interface ReportFundingVenue {
+  venue: string;
+  /** Rows this venue wrote in the window. */
+  observations: number;
+  /** Distinct polls it contributed to. */
+  polls: number;
+  /** Mean, over polls, of this venue's best annualised rate that poll. */
+  avgBestAnnualPct: number | null;
+  /** The single best annualised rate this venue quoted in the window. */
+  maxBestAnnualPct: number | null;
+  /**
+   * Polls whose best row cleared the bar *net of the current drag*.
+   *
+   * `null` — not `0` — when the drag itself could not be priced from the stored
+   * fee settings: the comparison was never made, and a zero would read as "no
+   * poll cleared" against a fee schedule of nothing.
+   */
+  qualifyingPolls: number | null;
+}
+
+/**
+ * Per venue: how much it observed, and what its best row was worth per poll.
+ *
+ * "Best row per poll" rather than "average row per poll" on purpose. The board
+ * is capped at each venue's best 20 and worst 5 non-majors, so its *mean* is an
+ * artefact of that cap — widen the budget and the mean moves without the market
+ * having done anything. The best row is the figure a reader would have acted on,
+ * and it is invariant to how much of the tail was kept.
+ *
+ * `dragAnnualPct` is the current fee drag over `funding_hold_days`, subtracted
+ * only in the `qualifyingPolls` comparison; the returned percentages stay gross
+ * so the caller can show both, and so the one place the fee basis is applied is
+ * visible. See the section header for why the stored net column is not used.
+ *
+ * Pass `null` for a drag that cannot be priced from the stored fee rates, and
+ * the comparison is skipped: `qualifyingPolls` comes back `null` rather than
+ * counting rows against a drag of zero, which would inflate the count with polls
+ * that only clear the bar because their fees went unpaid. Same discipline as
+ * {@link reportXchg}'s unpriceable bar, and the same reason.
+ */
+export async function reportFundingByVenue(
+  db: D1Database,
+  fromTs: number,
+  toTs: number,
+  dragAnnualPct: number | null,
+  minAnnualPct: number,
+): Promise<ReportFundingVenue[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT venue, SUM(n) AS observations, COUNT(*) AS polls," +
+        " AVG(best) AS avg_best, MAX(best) AS max_best," +
+        // `?3` is NULL for an unpriceable drag, and `best - NULL` is NULL, which
+        // is never `>=` anything — so the CASE falls to its ELSE and the count
+        // comes back 0 for every venue. That 0 is discarded below in favour of
+        // `null`; the branch is here so one query serves both cases.
+        " SUM(CASE WHEN best - ?3 >= ?4 THEN 1 ELSE 0 END) AS qualifying_polls" +
+        " FROM (SELECT venue, ts, COUNT(*) AS n, MAX(annualized_pct) AS best" +
+        "       FROM funding_rates WHERE ts >= ?1 AND ts <= ?2 GROUP BY venue, ts)" +
+        " GROUP BY venue ORDER BY venue ASC",
+    )
+    .bind(fromTs, toTs, dragAnnualPct, minAnnualPct)
+    .all<{
+      venue: string;
+      observations: number;
+      polls: number;
+      avg_best: number | null;
+      max_best: number | null;
+      qualifying_polls: number;
+    }>();
+
+  return (results ?? []).map((r) => ({
+    venue: r.venue,
+    observations: r.observations ?? 0,
+    polls: r.polls ?? 0,
+    avgBestAnnualPct: finiteOrNull(r.avg_best),
+    maxBestAnnualPct: finiteOrNull(r.max_best),
+    qualifyingPolls: dragAnnualPct === null ? null : (r.qualifying_polls ?? 0),
+  }));
+}
+
+/** `AVG`/`MAX` over zero rows is SQL NULL; so is a column that was all NULL. */
+function finiteOrNull(value: number | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  return Number.isFinite(value) ? round8(value) : null;
+}
+
+/** The paper carry book's record over the window. */
+export interface ReportCarry {
+  /** Positions open **now** — a position is not "in" a window, it is running. */
+  openCount: number;
+  openNotionalUsdt: number;
+  openAccruedUsdt: number;
+  /** Positions whose `close_ts` fell inside the window. */
+  closedCount: number;
+  realizedPnlUsdt: number;
+  /** Mean realised annual %, over the closed positions that have one. */
+  avgRealizedAnnualPct: number | null;
+  /** Mean of `realized − predicted`; negative means entry over-promised. */
+  avgPredictionErrorPct: number | null;
+  best: FundingPosition | null;
+  worst: FundingPosition | null;
+}
+
+/**
+ * Carry aggregates for the window.
+ *
+ * **Open positions are not windowed, and closed ones are.** A closed position
+ * has an event in time (`close_ts`) that either falls inside the window or does
+ * not; an open one has no such event — it is simply running, and reporting "the
+ * positions that were open during this window" would mean reconstructing a book
+ * from an entry timestamp and a close that has not happened. So the open half is
+ * the book as it stands, and the response labels it that way.
+ */
+export async function reportCarry(
+  db: D1Database,
+  fromTs: number,
+  toTs: number,
+): Promise<ReportCarry> {
+  const open = await db
+    .prepare(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(notional_usdt), 0) AS notional," +
+        " COALESCE(SUM(accrued_funding_usdt), 0) AS accrued" +
+        " FROM funding_positions WHERE status = ?1",
+    )
+    .bind(CARRY_STATUS_OPEN)
+    .first<{ n: number; notional: number; accrued: number }>();
+
+  const closed = await db
+    .prepare(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(realized_pnl_usdt), 0) AS realized," +
+        " AVG(realized_annual_pct) AS avg_realized," +
+        " AVG(realized_annual_pct - predicted_net_annual_pct) AS avg_err" +
+        " FROM funding_positions WHERE status = ?1 AND close_ts >= ?2 AND close_ts <= ?3",
+    )
+    .bind(CARRY_STATUS_CLOSED, fromTs, toTs)
+    .first<{ n: number; realized: number; avg_realized: number | null; avg_err: number | null }>();
+
+  const extreme = async (direction: "DESC" | "ASC") => {
+    const row = await db
+      .prepare(
+        "SELECT * FROM funding_positions WHERE status = ?1 AND close_ts >= ?2" +
+          " AND close_ts <= ?3 AND realized_annual_pct IS NOT NULL" +
+          ` ORDER BY realized_annual_pct ${direction}, id ASC LIMIT 1`,
+      )
+      .bind(CARRY_STATUS_CLOSED, fromTs, toTs)
+      .first<FundingPositionRow>();
+    return row ? toFundingPosition(row) : null;
+  };
+
+  return {
+    openCount: open?.n ?? 0,
+    openNotionalUsdt: round8(open?.notional ?? 0),
+    openAccruedUsdt: round8(open?.accrued ?? 0),
+    closedCount: closed?.n ?? 0,
+    realizedPnlUsdt: round8(closed?.realized ?? 0),
+    avgRealizedAnnualPct: finiteOrNull(closed?.avg_realized),
+    avgPredictionErrorPct: finiteOrNull(closed?.avg_err),
+    best: await extreme("DESC"),
+    worst: await extreme("ASC"),
+  };
+}
+
+/** The cross-exchange survival record over the window. */
+export interface ReportXchg {
+  /** Spread rows written in the window, measured or not. */
+  rows: number;
+  /** Rows re-priced against a later snapshot and given a figure. */
+  measured: number;
+  /** Rows stamped as checked but with no figure — expired before re-pricing. */
+  expiredUnmeasured: number;
+  /**
+   * Measured rows whose re-priced net was above zero.
+   *
+   * **This is the break-even count**, not a softer version of one.
+   * `persist_net_pct` is what `evaluateSpread` returned for the same trade on a
+   * later book, and that figure is already net of both legs' taker fees — so
+   * zero is the point at which the round trip paid for itself, and comparing it
+   * against the *gross* two-leg bar would charge the same fees twice.
+   */
+  survived: number;
+  /**
+   * Measured rows whose re-priced net cleared `xchg_min_profit_pct`.
+   *
+   * A strictly higher bar than {@link survived}, and a display preference rather
+   * than an economic one: it is the same threshold the dashboard's `qualifies`
+   * badge uses, so the report and the board agree about which rows are worth
+   * looking at.
+   */
+  qualifying: number;
+  avgPersistNetPct: number | null;
+  maxPersistNetPct: number | null;
+  avgSkewMs: number | null;
+  maxSkewMs: number | null;
+}
+
+/**
+ * Cross-exchange aggregates in one pass over `idx_opportunities_strategy_ts`.
+ *
+ * **Both counts are taken against `persist_net_pct`, which is already net of
+ * both legs' fees.** This section is the one that does *not* recompute anything
+ * against current settings, and it is not an oversight: `persist_net_pct` is not
+ * a gross edge waiting to have a drag subtracted from it, it is what
+ * `evaluateSpread` returned after charging the round trip. Subtracting a fee bar
+ * from it — or comparing it against the gross `(1/(1−fee)² − 1) × 100` figure —
+ * charges the same two legs a second time, and would understate survival by
+ * roughly a whole break-even.
+ *
+ * So the two bars are:
+ *
+ * - **zero** ({@link ReportXchg.survived}) — the trade paid for itself. The
+ *   economic question, and the one `answers.anyStrategyClearedBreakEven.xchg`
+ *   is derived from.
+ * - **`minProfitPct`** ({@link ReportXchg.qualifying}) — the same
+ *   `xchg_min_profit_pct` the dashboard flags rows against. A display
+ *   preference, reported beside the first so the two are never confused.
+ */
+export async function reportXchg(
+  db: D1Database,
+  strategy: Strategy,
+  fromTs: number,
+  toTs: number,
+  minProfitPct: number,
+): Promise<ReportXchg> {
+  const row = await db
+    .prepare(
+      "SELECT COUNT(*) AS rows_in," +
+        " SUM(CASE WHEN persist_net_pct IS NOT NULL THEN 1 ELSE 0 END) AS measured," +
+        " SUM(CASE WHEN persist_checked_ts IS NOT NULL AND persist_net_pct IS NULL" +
+        "          THEN 1 ELSE 0 END) AS expired," +
+        " SUM(CASE WHEN persist_net_pct > 0 THEN 1 ELSE 0 END) AS survived," +
+        " SUM(CASE WHEN persist_net_pct >= ?4 THEN 1 ELSE 0 END) AS qualifying," +
+        " AVG(persist_net_pct) AS avg_persist, MAX(persist_net_pct) AS max_persist," +
+        " AVG(skew_ms) AS avg_skew, MAX(skew_ms) AS max_skew" +
+        " FROM opportunities WHERE strategy = ?1 AND ts >= ?2 AND ts <= ?3",
+    )
+    .bind(strategy, fromTs, toTs, minProfitPct)
+    .first<{
+      rows_in: number;
+      measured: number | null;
+      expired: number | null;
+      survived: number | null;
+      qualifying: number | null;
+      avg_persist: number | null;
+      max_persist: number | null;
+      avg_skew: number | null;
+      max_skew: number | null;
+    }>();
+
+  return {
+    rows: row?.rows_in ?? 0,
+    measured: row?.measured ?? 0,
+    expiredUnmeasured: row?.expired ?? 0,
+    survived: row?.survived ?? 0,
+    qualifying: row?.qualifying ?? 0,
+    avgPersistNetPct: finiteOrNull(row?.avg_persist),
+    maxPersistNetPct: finiteOrNull(row?.max_persist),
+    avgSkewMs: finiteOrNull(row?.avg_skew),
+    maxSkewMs: finiteOrNull(row?.max_skew),
+  };
+}
+
+/**
+ * The median measured `persist_net_pct` over the window.
+ *
+ * Computed with an `OFFSET`, not by fetching the distribution: at ~10 measured
+ * rows a scan a week is ~100k values, and the median is the one order statistic
+ * that says more about a skewed distribution than its mean — so it is worth a
+ * query rather than worth skipping. One row comes back for an odd `count`, two
+ * for an even one, and the even case is averaged, which is the textbook
+ * definition rather than a convenient approximation.
+ *
+ * `count` is the measured-row count the caller already has from
+ * {@link reportXchg}; passing it avoids a second `COUNT(*)` over the same
+ * window. It does **not** guarantee the two queries see the same rows: they are
+ * two statements, and a scan committing a measurement between them changes the
+ * set under this one. The consequence is bounded and benign — the offset is off
+ * by one against a set that grew by one, so the "median" is the value beside the
+ * true one — and the alternative (a transaction, or the distribution in JS) buys
+ * a precision this figure does not have. `null` for an empty set: the median of
+ * nothing is not zero.
+ */
+export async function reportXchgMedianPersist(
+  db: D1Database,
+  strategy: Strategy,
+  fromTs: number,
+  toTs: number,
+  count: number,
+): Promise<number | null> {
+  if (!Number.isInteger(count) || count <= 0) return null;
+
+  const offset = Math.floor((count - 1) / 2);
+  const limit = count % 2 === 1 ? 1 : 2;
+  const { results } = await db
+    .prepare(
+      "SELECT persist_net_pct AS v FROM opportunities" +
+        " WHERE strategy = ?1 AND ts >= ?2 AND ts <= ?3 AND persist_net_pct IS NOT NULL" +
+        " ORDER BY persist_net_pct ASC LIMIT ?4 OFFSET ?5",
+    )
+    .bind(strategy, fromTs, toTs, limit, offset)
+    .all<{ v: number }>();
+
+  const values = (results ?? []).map((r) => r.v).filter((v) => Number.isFinite(v));
+  if (values.length === 0) return null;
+  return round8(values.reduce((a, b) => a + b, 0) / values.length);
+}
+
+/** The cross-venue funding differential's record over the window. */
+export interface ReportVenueSpreads {
+  /** Polls that had at least one symbol quoted by two or more venues. */
+  polls: number;
+  /** Mean, over those polls, of the widest differential available that poll. */
+  avgGrossAnnualPct: number | null;
+  maxGrossAnnualPct: number | null;
+  /**
+   * Polls whose widest differential cleared the bar net of the current drag.
+   * `null` when the drag could not be priced — see
+   * {@link ReportFundingVenue.qualifyingPolls}.
+   */
+  qualifyingPolls: number | null;
+}
+
+/**
+ * Recompute the best cross-venue funding differential per poll, in SQL.
+ *
+ * This is `rankVenueSpreads` (`src/engine/funding.ts`) evaluated over a week of
+ * boards, and it produces the same gross figure by the same rule: **annualise
+ * first, then difference**. That equivalence is what makes the SQL legitimate —
+ * `funding_rates.annualized_pct` is each venue's rate already annualised on
+ * *its own* settlement cadence, so `MAX(annualized_pct) − MIN(annualized_pct)`
+ * within one `(ts, symbol)` group is exactly the widest pair that function
+ * picks. `test/report.test.ts` pins the two against each other on a seeded
+ * board rather than leaving the claim to this comment.
+ *
+ * It is done in SQL and not by calling the function because a week of boards is
+ * ~150k rows: the pure engine is the right shape for one board and the wrong
+ * shape for two thousand of them.
+ *
+ * **Bounded to `symbols`**, which the caller passes as the verified major set.
+ * The full board's tail is ~1500 rows a poll and, worse, a shared ticker outside
+ * the majors is not a shared asset — `rankVenueSpreads` reports those rows and
+ * marks them `verifiedPair: false`, which a single aggregate number has no way
+ * to do. So the report answers the question it can answer honestly.
+ *
+ * One assumption, shared with the carry pass and held by the poll rather than by
+ * the schema: a board carries **at most one row per `(venue, symbol)`**. Where
+ * that held, `COUNT(DISTINCT venue) >= 2` means the max and the min are two
+ * different venues.
+ */
+export async function reportVenueSpreads(
+  db: D1Database,
+  fromTs: number,
+  toTs: number,
+  symbols: readonly string[],
+  dragAnnualPct: number | null,
+  minAnnualPct: number,
+): Promise<ReportVenueSpreads> {
+  if (symbols.length === 0) {
+    return {
+      polls: 0,
+      avgGrossAnnualPct: null,
+      maxGrossAnnualPct: null,
+      qualifyingPolls: dragAnnualPct === null ? null : 0,
+    };
+  }
+
+  // Bound parameters, never interpolation: the symbol list is app-owned today
+  // and a placeholder list keeps it safe the day it is not.
+  const placeholders = symbols.map((_, i) => `?${i + 5}`).join(", ");
+  const row = await db
+    .prepare(
+      "SELECT COUNT(*) AS polls, AVG(gross) AS avg_gross, MAX(gross) AS max_gross," +
+        // NULL drag -> NULL comparison -> ELSE -> 0, discarded below for `null`.
+        " SUM(CASE WHEN gross - ?3 >= ?4 THEN 1 ELSE 0 END) AS qualifying_polls" +
+        " FROM (SELECT ts, MAX(spread) AS gross FROM (" +
+        "   SELECT ts, symbol, MAX(annualized_pct) - MIN(annualized_pct) AS spread" +
+        "   FROM funding_rates" +
+        `   WHERE ts >= ?1 AND ts <= ?2 AND symbol IN (${placeholders})` +
+        "   GROUP BY ts, symbol HAVING COUNT(DISTINCT venue) >= 2" +
+        " ) GROUP BY ts)",
+    )
+    .bind(fromTs, toTs, dragAnnualPct, minAnnualPct, ...symbols)
+    .first<{
+      polls: number;
+      avg_gross: number | null;
+      max_gross: number | null;
+      qualifying_polls: number;
+    }>();
+
+  return {
+    polls: row?.polls ?? 0,
+    avgGrossAnnualPct: finiteOrNull(row?.avg_gross),
+    maxGrossAnnualPct: finiteOrNull(row?.max_gross),
+    qualifyingPolls: dragAnnualPct === null ? null : (row?.qualifying_polls ?? 0),
+  };
+}
+
+/** The dated-futures basis board's record over the window. */
+export interface ReportBasis {
+  observations: number;
+  polls: number;
+  /**
+   * Mean, over polls, of the best net annual basis available that poll,
+   * recomputed at the current fee rates. `null` when those rates are unusable.
+   */
+  avgBestNetAnnualPct: number | null;
+  maxBestNetAnnualPct: number | null;
+  /** Polls whose best net cleared the bar. `null` when the fees are unusable. */
+  qualifyingPolls: number | null;
+}
+
+/**
+ * Basis aggregates for the window, on **one fee basis** like every other
+ * section: the stored `net_annual_pct` column is not read.
+ *
+ * A basis row's drag is not the funding board's single scalar — it is amortised
+ * over each contract's own remaining life — but that does not make it
+ * unrecomputable, only per row. `days_to_expiry` is stored on the row beside the
+ * gross `annualized_pct`, so the whole drag is
+ *
+ * ```
+ * roundTripFeeFraction x (365 / days_to_expiry) x 100
+ * ```
+ *
+ * which is exactly `feeDragAnnualPct` (`src/engine/funding.ts`) written in SQL,
+ * evaluated inside the existing `GROUP BY` rather than by pulling rows into JS.
+ * The cost is an expression per row in a query that was already visiting every
+ * one of them; there is no extra scan.
+ *
+ * The rationale is the funding section's, unchanged: a stored net was priced at
+ * whatever `fee_rate` and `perp_fee_rate` were in force at poll time, and
+ * averaging across a retune describes a fee schedule that never existed. It has
+ * not happened to `basis_rates` yet — the table is one phase old — but a report
+ * whose correctness depends on nobody having touched the settings is one edit
+ * away from being wrong, and silently.
+ *
+ * `feeFraction` is `roundTripFeeFraction(fee_rate, perp_fee_rate)`, or `null`
+ * when those rates cannot price a round trip at all; `null` propagates to every
+ * net figure rather than pricing the legs at zero.
+ */
+export async function reportBasis(
+  db: D1Database,
+  fromTs: number,
+  toTs: number,
+  feeFraction: number | null,
+  minAnnualPct: number,
+): Promise<ReportBasis> {
+  const row = await db
+    .prepare(
+      "SELECT COALESCE(SUM(n), 0) AS observations, COUNT(*) AS polls," +
+        " AVG(best) AS avg_best, MAX(best) AS max_best," +
+        " SUM(CASE WHEN best >= ?4 THEN 1 ELSE 0 END) AS qualifying_polls" +
+        " FROM (SELECT ts, COUNT(*) AS n," +
+        // The CASE guards the divisor: a row with a non-positive
+        // `days_to_expiry` cannot be annualised, so its net is NULL and the
+        // aggregate MAX steps over it rather than the whole poll becoming
+        // unpriceable. `?3` is NULL for an unusable fee schedule, which makes
+        // every net NULL — the section then reports "not measured", the truth.
+        "        MAX(CASE WHEN days_to_expiry > 0 THEN" +
+        "              annualized_pct - ?3 * (365.0 / days_to_expiry) * 100" +
+        "            END) AS best" +
+        "       FROM basis_rates WHERE ts >= ?1 AND ts <= ?2 GROUP BY ts)",
+    )
+    .bind(fromTs, toTs, feeFraction, minAnnualPct)
+    .first<{
+      observations: number;
+      polls: number;
+      avg_best: number | null;
+      max_best: number | null;
+      qualifying_polls: number;
+    }>();
+
+  return {
+    observations: row?.observations ?? 0,
+    polls: row?.polls ?? 0,
+    avgBestNetAnnualPct: finiteOrNull(row?.avg_best),
+    maxBestNetAnnualPct: finiteOrNull(row?.max_best),
+    qualifyingPolls: feeFraction === null ? null : (row?.qualifying_polls ?? 0),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Reset
 // ---------------------------------------------------------------------------
 
@@ -1542,6 +2284,12 @@ export async function resetAll(
       // deleted would leave it unable to accrue, unable to price a close, and
       // 24 hours from being closed as stale.
       db.prepare("DELETE FROM funding_positions"),
+      // The basis board and its own poll marker, on the same terms as the
+      // funding pair above: the rows reference `scan_id`, and a marker left
+      // behind would make the next scan sit out an interval measured against
+      // rows that no longer exist.
+      db.prepare("DELETE FROM basis_rates"),
+      db.prepare("DELETE FROM settings WHERE key = ?1").bind(BASIS_POLL_TS_KEY),
     );
   }
 

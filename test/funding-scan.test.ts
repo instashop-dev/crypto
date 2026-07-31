@@ -12,6 +12,7 @@
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { setBasisFetcher } from "../src/basis";
 import { setRestFetcher, setWsCollector } from "../src/binance";
 import {
   ASSET_UNIVERSE,
@@ -42,6 +43,7 @@ import { runScan } from "../src/scan";
 import type { BookTickerEntry, Env, FundingVenue } from "../src/types";
 import type { FundingFetcher, VenueOutcome } from "../src/funding";
 import { fundingQuote, snapshotOf } from "./funding-stub";
+import { serveMinimalBasisBoard } from "./basis-stub";
 
 const ASSETS = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -101,12 +103,14 @@ beforeEach(async () => {
   // several tests below assert that a funding failure leaves them intact.
   setWsCollector(serve(BINANCE));
   setRestFetcher(serve(MEXC));
+  setBasisFetcher(serveMinimalBasisBoard());
 });
 
 afterEach(() => {
   setWsCollector(null);
   setRestFetcher(null);
   setFundingFetcher(null);
+  setBasisFetcher(null);
 });
 
 /** A full Bybit-shaped board at the current clock, one quote per asset. */

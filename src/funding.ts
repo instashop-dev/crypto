@@ -78,7 +78,11 @@ const KUCOIN_CONTRACTS_PATH = "/api/v1/contracts/active";
  *        kucoin contracts     1
  *                           ---
  *        funding worst case  15
- * total worst case            18  <= 50
+ * basis  okx tickers FUTURES  1   (Phase 17; see `src/basis.ts`)
+ *        okx tickers SPOT     1
+ *                           ---
+ *        basis worst case     2
+ * total worst case            20  <= 50
  * ```
  *
  * The margin is what pays for a future venue: every full-board venue costs one
@@ -86,6 +90,12 @@ const KUCOIN_CONTRACTS_PATH = "/api/v1/contracts/active";
  * constraint. What must *not* grow is the OKX leg — it is priced per contract,
  * so pointing it at a full board would cost ~600 subrequests by itself. That is
  * why the universe widening in Phase 14 goes through Gate and KuCoin only.
+ *
+ * The basis pair is counted here rather than in `src/basis.ts` because the
+ * budget is a property of the *invocation*, and one scan is one invocation: a
+ * table split across two modules would be two tables that disagree. Both of its
+ * legs are full-board single requests and neither scales with the universe, so
+ * a second basis venue would cost exactly two more.
  *
  * **Kraken futures is deliberately absent.** Its perps fund continuously and
  * accrue per hour against a different reference, so normalising it into the

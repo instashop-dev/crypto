@@ -11,6 +11,7 @@
  */
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { setBasisFetcher } from "../src/basis";
 import { MEXC_BASE, setWsCollector, type WsCollector } from "../src/binance";
 import { DEFAULTS } from "../src/config";
 import {
@@ -28,6 +29,7 @@ import {
 } from "../src/db";
 import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { serveFlatBoard } from "./funding-stub";
+import { serveMinimalBasisBoard } from "./basis-stub";
 import { runScan } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
@@ -51,6 +53,7 @@ const serveFundingBoard: FundingFetcher = serveFlatBoard();
 afterEach(() => {
   setWsCollector(null);
   setFundingFetcher(null);
+  setBasisFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -100,6 +103,7 @@ beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
   setFundingFetcher(serveFundingBoard);
+  setBasisFetcher(serveMinimalBasisBoard());
 });
 
 describe("ensureSeeded", () => {
