@@ -536,7 +536,8 @@ export async function fetchOkxFunding(
  * carry*: long the spot asset, short its perp. There is no spot leg for a
  * synthetic Tesla or gold contract on a crypto exchange, so a fat funding rate
  * on one is not an opportunity — it is a row that would push a real one out of
- * the per-venue top 25.
+ * the per-venue tail budget ({@link FUNDING_BOARD_TOP_N} best-paying plus
+ * {@link FUNDING_BOARD_BOTTOM_N} deepest-negative).
  *
  * A **deny** list rather than an allow list on purpose: crypto perps carry an
  * empty `contract_type`, and an allow list of `""` would silently empty the
@@ -847,15 +848,29 @@ export async function getFundingSnapshot(
  *   the scan on the day it happens"), and a one-sided cap then discarded every
  *   one of them. A -1548%/yr contract is not a row worth less than the 20th
  *   best positive one; it is the most interesting row on the board.
+ * - **Plus every `(venue, symbol)` in `held`**, whatever it pays and wherever
+ *   it ranks. This one is not about what is interesting to read; it is what
+ *   keeps the carry book measurable. A tail contract is opened on *because* it
+ *   paid, and the position closes when the rate falls — but a rate that falls
+ *   is a rate that drops out of the top 20, and the moment its rows stop being
+ *   persisted `getLatestFundingRateFor` freezes on the last one written.
+ *   `rate_below_exit` can then never fire (the stale row still clears the exit
+ *   bar), the position idles for 24 hours, and `stale_data` closes it with a
+ *   fee-only loss that reads as a prediction error rather than as the board
+ *   dropout it actually was. Retaining a held contract's row costs one insert
+ *   per poll per open position and is the difference between measuring the
+ *   strategy and measuring the cap.
  *
  * Per venue, not globally: a venue whose whole board happens to pay less than
  * another's must still contribute its own top rows, or a single hot venue would
  * crowd every other one out of the board entirely and the cross-venue
  * comparison would quietly stop existing.
  *
- * The two halves are **deduplicated**, so a venue with fewer than
- * `topN + bottomN` non-majors keeps all of them once rather than twice. The
- * per-venue non-major budget is therefore `topN + bottomN` at most.
+ * The halves are **deduplicated**, so a venue with fewer than
+ * `topN + bottomN` non-majors keeps all of them once rather than twice, and a
+ * held contract that is also a major (or already in the top 20) is not counted
+ * twice either. The per-venue non-major budget is therefore
+ * `topN + bottomN + |held on that venue|` at most.
  *
  * **Precondition:** `ranked` is sorted by net annual carry, best first — which
  * is exactly what {@link import("./engine").rankFundingOpportunities} returns.
@@ -869,9 +884,15 @@ export function capFundingBoard<
   majors: Iterable<string>,
   topN: number = FUNDING_BOARD_TOP_N,
   bottomN: number = FUNDING_BOARD_BOTTOM_N,
+  held: Iterable<{ venue: string; symbol: string }> = [],
 ): T[] {
   const majorSet = new Set(normaliseAssets([...majors]));
   const isMajor = (row: T) => majorSet.has(row.quote.symbol.toUpperCase());
+
+  const heldSet = new Set<string>();
+  for (const key of held) heldSet.add(fundingBoardKey(key.venue, key.symbol));
+  const isHeld = (row: T) =>
+    heldSet.size > 0 && heldSet.has(fundingBoardKey(row.quote.venue, row.quote.symbol));
 
   // Where each venue's non-major rows sit in `ranked`, in ranked order — so the
   // head of the list is that venue's best-paying tail and the end is its worst.
@@ -893,7 +914,21 @@ export function capFundingBoard<
     if (bottom > 0) for (const i of indices.slice(-bottom)) keep.add(i);
   }
 
-  return ranked.filter((row, i) => isMajor(row) || keep.has(i));
+  return ranked.filter((row, i) => isMajor(row) || isHeld(row) || keep.has(i));
+}
+
+/**
+ * `(venue, symbol)` as one comparable string, joined on a NUL.
+ *
+ * A NUL rather than `:` or `-`, because both of those appear inside real
+ * instrument names, and a separator a symbol can contain is a separator that
+ * can collide. The same key `src/scan.ts` builds to dedupe carry candidates,
+ * and deliberately the same shape, so the two agree about what one contract is.
+ * The symbol is upper-cased on the way in: every parser here already emits an
+ * upper-case symbol, and folding makes the key survive it if one ever stops.
+ */
+function fundingBoardKey(venue: string, symbol: string): string {
+  return `${venue}\u0000${symbol.toUpperCase()}`;
 }
 
 /** Signature of {@link getFundingSnapshot}; the seam tests substitute. */

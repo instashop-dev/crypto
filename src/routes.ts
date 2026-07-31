@@ -670,7 +670,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
     return c.json({ ok: sources.some((s) => s.ok), ts: Date.now(), sources });
   });
 
-  app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 10 }));
+  app.get("/api/version", (c) => c.json({ name: "crypto-arb", phase: 18 }));
 
   /**
    * Dev aid: resolve a snapshot for the given symbols through the real source
@@ -756,6 +756,12 @@ export function createApp(): Hono<{ Bindings: Env }> {
    * break-even the UI marks surviving nets against is a function of the fee in
    * force *now*, so an operator who retunes `fee_rate` must move the bar rather
    * than leave the dashboard drawing a line from a rate nobody charges.
+   *
+   * Deliberately **no `ensureSeeded`**: this route only reads settings, and
+   * {@link getSettings} already merges `DEFAULTS` over whatever the table holds,
+   * so an unseeded database answers with the same thresholds a seeded one does.
+   * The dashboard polls this every 5 seconds, and a write batch per poll to
+   * materialise rows nothing here needs is pure D1 traffic.
    */
   app.get("/api/opportunities", async (c) => {
     try {
@@ -764,7 +770,6 @@ export function createApp(): Hono<{ Bindings: Env }> {
       const filter = parseStrategy(c.req.query("strategy"));
       if (!filter.ok) return c.json({ error: filter.error }, 400);
 
-      await ensureSeeded(c.env.DB);
       const [opportunities, settings] = await Promise.all([
         listOpportunities(c.env.DB, limit, filter.strategy),
         getSettings(c.env.DB),
@@ -1172,14 +1177,30 @@ export function createApp(): Hono<{ Bindings: Env }> {
 
   // -- administration -------------------------------------------------------
 
+  /**
+   * Restore the paper balances. **Wiping history is opt-in.**
+   *
+   * `{"wipeHistory": true}` and nothing else clears trades, opportunities,
+   * scans, funding rows, basis rows and the carry book. A bodyless call — a
+   * curl someone pasted, a retried request, a dashboard button that forgot to
+   * send its intent — resets the balances and keeps every recorded row.
+   *
+   * The default used to be the other way round, on the reading that "reset"
+   * unqualified means start over. That is the wrong default for *this*
+   * application: the balances are a paper fiction nothing has moved since Phase
+   * 12, while `funding_positions` and `opportunities` are a multi-day soak that
+   * `GET /api/report` is the only consumer of and that cannot be re-collected
+   * after the fact. Destroying the evidence has to be something the caller
+   * asked for in so many words.
+   */
   app.post("/api/reset", async (c) => {
     try {
       const body = await readJsonBody(c);
       if ("wipeHistory" in body && typeof body.wipeHistory !== "boolean") {
         return c.json({ error: "wipeHistory must be a boolean" }, 400);
       }
-      // Default true: "reset" without qualification means start over.
-      const wipeHistory = body.wipeHistory !== false;
+      // Opt-in, strictly: anything that is not an explicit `true` keeps history.
+      const wipeHistory = body.wipeHistory === true;
 
       await ensureSeeded(c.env.DB);
       await resetAll(c.env.DB, { wipeHistory });

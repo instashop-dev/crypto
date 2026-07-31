@@ -293,6 +293,7 @@ describe("runScan - the poll gate", () => {
     expect(second.fundingError).toBeUndefined();
     // The spread half is unaffected: it runs every scan, funding does not.
     expect(second.error).toBeUndefined();
+    expect(second.spreadsCount).toBe(2);
     await expect(fundingRows()).resolves.toHaveLength(11);
   });
 

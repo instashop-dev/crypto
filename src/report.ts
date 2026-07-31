@@ -7,7 +7,7 @@
  * them:
  *
  * 1. **Realised vs predicted carry error** — did a rate observed at entry
- *    survive being held? (`answers.realizedVsPredictedCarryErrorPct`)
+ *    survive being held? (`answers.realizedVsPredictedCarry`)
  * 2. **Spread survival rate** — what fraction of cross-exchange spreads outlive
  *    the ~4s collection skew that may have invented them?
  *    (`answers.spreadSurvivalRate`)
@@ -16,6 +16,31 @@
  *
  * Read-only and additive: it writes nothing, changes no strategy path, and
  * every figure in it is derived from rows the scanner had already recorded.
+ *
+ * ## Question 1 is answered by two populations, never by one number
+ *
+ * `funding_hold_days` is 30 and this endpoint serves at most 7 days, so
+ * `max_hold` — the ending a position that *worked* reaches — cannot fire inside
+ * any window it can be asked for. Everything that closes inside the window
+ * closed early, and closed early for an adverse reason: `rate_below_exit`, or
+ * `stale_data`. The positions that are doing fine are all still open and, if
+ * only closes are counted, contribute nothing at all.
+ *
+ * A single "realised vs predicted" scalar over that population is therefore
+ * negative *by construction* — it would print a confident indictment of the
+ * entry model even on a book where every position was paying exactly what it
+ * promised. So `answers.realizedVsPredictedCarry` is a labelled structure, not
+ * a scalar: the closed mean, the closed count, the closes broken out by reason
+ * (so a reader can see for themselves that no `max_hold` is in there), and
+ * beside it the **open** book marked to date — accrued-so-far annualised over
+ * the hold-so-far, with no fees charged, because the round trip is paid on exit
+ * and these positions have not exited. The two halves are never averaged
+ * together; a blend would hide exactly the selection it exists to expose.
+ *
+ * Confirming the bias is what `closeReasons` is for. When a soak eventually
+ * runs longer than `funding_hold_days`, `max_hold` closes appear in it and the
+ * closed mean becomes an unbiased estimate on its own — the structure does not
+ * change, only what is in it.
  *
  * ## Three rules this module keeps
  *
@@ -189,7 +214,35 @@ export interface ReportVenueSpreadSection extends ReportVenueSpreads {
   feeDragAnnualPct: number | null;
   avgNetAnnualPct: number | null;
   maxNetAnnualPct: number | null;
+  /**
+   * The symbols this section was computed over — the verified majors, and only
+   * them. See {@link VENUE_SPREAD_POPULATION_NOTE}.
+   */
+  symbols: string[];
+  /** {@link VENUE_SPREAD_POPULATION_NOTE}, carried in the response. */
+  note: string;
 }
+
+/**
+ * Why this section and `GET /api/funding`'s `spreads` disagree, in the
+ * response rather than only in a docblock.
+ *
+ * The dashboard's cross-venue table is the **whole** board: every symbol quoted
+ * by two or more venues, including the tail, with a `verifiedPair: false` badge
+ * on the rows where three shared letters may well be two different projects.
+ * This section is bounded to the 11 verified majors, because an *aggregate*
+ * cannot carry that badge — one unverified pair with a 900%/yr "differential"
+ * between two unrelated tokens would set `maxGrossAnnualPct` for the week.
+ *
+ * The consequence a reader has to be able to explain:
+ * `answers.anyStrategyClearedBreakEven.venueSpreads` can be `false` while the
+ * dashboard shows a large spread, and neither is wrong. They are answers about
+ * different populations, and this note says which is which.
+ */
+export const VENUE_SPREAD_POPULATION_NOTE =
+  "computed over the verified majors only; GET /api/funding's `spreads` covers" +
+  " every two-venue symbol including unverified tail pairs, so a large spread" +
+  " there can coexist with a false answer here";
 
 /** Which of the five strategies produced a positive result over the window. */
 export interface BreakEvenAnswers {
@@ -209,15 +262,54 @@ export interface BreakEvenAnswers {
   basis: boolean;
 }
 
+/**
+ * (a) Realised vs predicted carry, **as two labelled populations**.
+ *
+ * Deliberately not a scalar. See the "Question 1" section of this module's
+ * header for why a closed-only mean is adverse-selected inside a window shorter
+ * than `funding_hold_days`, and `reportCarry` in `src/db.ts` for the arithmetic.
+ */
+export interface CarryPredictionAnswer {
+  /**
+   * Mean `realized_annual_pct − predicted_net_annual_pct` over the positions
+   * **closed** in the window. Negative means entry over-promised. `null` until
+   * something has closed. Adverse-selected while `closeReasons` carries no
+   * `max_hold` — read the two together.
+   */
+  closedAvgErrorPct: number | null;
+  closedCount: number;
+  /**
+   * `close_reason -> count` over the same closes. The population, stated, so
+   * the absence of `max_hold` is visible rather than inferred.
+   */
+  closeReasons: Record<string, number>;
+  /**
+   * Mean `accruedAnnualPct − predictedNetAnnualPct` over the **open** book,
+   * marked to the end of the window. **No fees are charged in the first term**:
+   * the round trip is paid on exit and these have not exited, so this is a
+   * gross accrual against a net expectation and reads slightly optimistic —
+   * the opposite bias to the closed half, and the reason both are shown.
+   */
+  openAvgAccruedVsPredictedPct: number | null;
+  openCount: number;
+  /** The bias warning, in one sentence, carried in the response. */
+  note: string;
+}
+
+/**
+ * What {@link CarryPredictionAnswer.note} says: the sentence a reader needs
+ * beside a negative `closedAvgErrorPct` before they conclude anything from it.
+ */
+export const CARRY_ANSWER_NOTE =
+  "closed positions are adverse-selected in a window shorter than" +
+  " funding_hold_days — max_hold cannot fire, so only rate_below_exit and" +
+  " stale_data closes appear and the closed mean is negative by construction;" +
+  " the open marks are gross of the exit fees that have not been paid yet";
+
 /** The §6 acceptance criteria, answered literally. */
 export interface ReportAnswers {
-  /**
-   * (a) Mean `realized_annual_pct − predicted_net_annual_pct` over the
-   * positions closed in the window. Negative means entry over-promised, which is
-   * the direction `src/engine/funding.ts` predicts. `null` until something has
-   * closed.
-   */
-  realizedVsPredictedCarryErrorPct: number | null;
+  /** (a) See {@link CarryPredictionAnswer}. */
+  realizedVsPredictedCarry: CarryPredictionAnswer;
   /**
    * (b) Fraction of re-priced cross-exchange spreads that were still positive on
    * a later snapshot. `null` when nothing has been re-priced.
@@ -388,7 +480,9 @@ export async function buildReport(
     // clear the bar only because nobody charged them. The counts come back
     // `null` instead, and `meta.settings.fundingDragAnnualPct` says why.
     reportFundingByVenue(db, fromTs, toTs, fundingDrag, minAnnualPct),
-    reportCarry(db, fromTs, toTs),
+    // `nowTs`, not just the window: the open book is marked *as of now*, which
+    // is the same instant `toTs` names.
+    reportCarry(db, fromTs, toTs, nowTs),
     // The xchg bar is the display threshold, not a fee bar: `persist_net_pct`
     // has already paid both legs. See {@link ReportXchgSection}.
     reportXchg(db, STRATEGY_CROSS_EXCHANGE, fromTs, toTs, minProfitPct),
@@ -444,6 +538,19 @@ export async function buildReport(
     feeDragAnnualPct: spreadDrag,
     avgNetAnnualPct: less(venueSpreads.avgGrossAnnualPct, spreadDrag),
     maxNetAnnualPct: less(venueSpreads.maxGrossAnnualPct, spreadDrag),
+    symbols: [...VERIFIED_SPREAD_SYMBOLS],
+    note: VENUE_SPREAD_POPULATION_NOTE,
+  };
+
+  // The two carry populations, each labelled. Never blended — see the module
+  // header, and `reportCarry` in `src/db.ts`.
+  const carryAnswer: CarryPredictionAnswer = {
+    closedAvgErrorPct: carry.avgPredictionErrorPct,
+    closedCount: carry.closedCount,
+    closeReasons: Object.fromEntries(carry.closeReasons.map((r) => [r.reason, r.count])),
+    openAvgAccruedVsPredictedPct: carry.openAvgAccruedVsPredictedPct,
+    openCount: carry.openCount,
+    note: CARRY_ANSWER_NOTE,
   };
 
   const covered = {
@@ -470,7 +577,7 @@ export async function buildReport(
     venueSpreads: venueSpreadSection,
     basis,
     answers: {
-      realizedVsPredictedCarryErrorPct: carry.avgPredictionErrorPct,
+      realizedVsPredictedCarry: carryAnswer,
       spreadSurvivalRate: xchgSection.survivalRate,
       // Each of the five is "did this strategy end the window ahead of the
       // costs it actually pays", and **all five** are judged against a

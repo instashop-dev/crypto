@@ -150,24 +150,6 @@ export function settlementBoundaries(
 }
 
 /**
- * How many settlement boundaries elapsed in `(lastAccrualTs, nowTs]`.
- *
- * The count of {@link settlementBoundaries}, and the number the accrual pass
- * would use if every boundary had a rate behind it. It rarely does — see the
- * module header on skipped boundaries — so this is the *upper bound* on a
- * position's accruals, not the figure stored in `accrual_count`.
- */
-export function settlementsCrossed(
-  lastAccrualTs: number,
-  nowTs: number,
-  intervalMinutes: number,
-  anchorTs: number | null = null,
-): number {
-  return settlementBoundaries(lastAccrualTs, nowTs, intervalMinutes, anchorTs)
-    .length;
-}
-
-/**
  * Funding received by the short perp leg over `settlements` settlements, in
  * USDT: `rate x notional x settlements`.
  *

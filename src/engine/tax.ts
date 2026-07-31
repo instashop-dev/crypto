@@ -275,7 +275,7 @@ function total(values: readonly number[]): number {
  * `spreadTax` in `./crossExchange` for the two-hop wrapper.
  *
  * A **disabled** policy still returns a breakdown rather than `null`: callers
- * (the executor, the API) want one shape to render either way, and the zeros it
+ * (the scanner, the API) want one shape to render either way, and the zeros it
  * carries make `netProfit === cashProfit === grossProfit` true by construction.
  * `null` is reserved for "this chain cannot be priced against this book".
  */

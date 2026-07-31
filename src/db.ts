@@ -11,14 +11,16 @@
  *   as one implicit transaction — a board of funding rows landing without its
  *   retention prune, or the reverse, would leave a gap no reader could explain.
  *
- * ## `trades` and `balances` are read-only now
+ * ## `trades` and `balances` no longer move with the market
  *
  * Phase 12 deleted every paper-fill path, so nothing in this module writes a
- * trade or moves a balance any more; `ensureSeeded` materialises the one
- * starting balance and that is the last word on it. The tables, their columns
- * and their readers all stay: the rows already on disk are the record of what
- * the fill-era scanner did, and `GET /api/trades` and `GET /api/portfolio`
- * still serve them. There is no destructive migration.
+ * trade or *moves* a balance any more. Two writers are left, and both set the
+ * balance rather than adjust it: `ensureSeeded` materialises the starting
+ * balance on a cold table, and `resetAll` re-establishes it on an explicit
+ * `POST /api/reset`. The tables, their columns and their readers all stay: the
+ * rows already on disk are the record of what the fill-era scanner did, and
+ * `GET /api/trades` and `GET /api/portfolio` still serve them. There is no
+ * destructive migration.
  */
 import { BASE_ASSET, DEFAULTS, STRATEGY_TRIANGULAR, type Strategy } from "./config";
 import { round8, type ExecutedLeg, type TaxPolicy } from "./engine";
@@ -283,8 +285,9 @@ async function countRows(db: D1Database, table: string): Promise<number> {
  * Settings are inserted with `INSERT OR IGNORE` per key, so adding a new
  * tunable in a later release back-fills it without clobbering the ones the
  * operator already tuned. Balances are seeded only when the table is entirely
- * empty — a deliberately zeroed balance is real state, not an absence — and
- * this is now the only write the app ever makes to that table.
+ * empty — a deliberately zeroed balance is real state, not an absence — so
+ * this is the only write to that table the app makes on its own; the only
+ * other one is {@link resetAll}, which an operator has to ask for.
  */
 export async function ensureSeeded(db: D1Database): Promise<void> {
   await db.batch(
@@ -973,9 +976,22 @@ export interface FundingRateInput {
  * Statements per `batch()` call when writing a board.
  *
  * D1 caps how many statements one batch may carry, and Phase 14's multi-venue
- * board is the first thing here that can plausibly approach it: four venues x
- * (11 majors + 25 tail) is ~144 inserts where the single-venue board was 11. 50
- * is a defensive fraction of the documented limit, chosen so the chunking is
+ * board is the first thing here that can plausibly approach it. The ceiling is
+ * **94**, not the `4 x 36 = 144` an earlier revision of this comment claimed:
+ * only the two full-board venues contribute a tail, because Bybit and OKX are
+ * polled per major and cannot quote anything else.
+ *
+ * ```
+ * gate     11 majors + 25 tail  = 36
+ * kucoin   11 majors + 25 tail  = 36
+ * bybit    11 majors            = 11
+ * okx      11 majors            = 11
+ *                               ---
+ *                                94   (+1 per open carry position retained
+ *                                      through the cap; see capFundingBoard)
+ * ```
+ *
+ * 50 is a defensive fraction of the documented limit, chosen so the chunking is
  * exercised by every real poll rather than only by the day the board grows.
  */
 export const FUNDING_INSERT_CHUNK = 50;
@@ -1839,22 +1855,123 @@ function finiteOrNull(value: number | null | undefined): number | null {
   return Number.isFinite(value) ? round8(value) : null;
 }
 
+/**
+ * One `close_reason`'s share of the window's closes.
+ *
+ * The grouping exists because the reasons are **not** an interchangeable
+ * population. Inside a report window shorter than `funding_hold_days`,
+ * `max_hold` cannot fire at all, so every close is either `rate_below_exit`
+ * (the carry collapsed), `stale_data` (the board stopped quoting it) or
+ * `manual` — the three adverse endings. A mean taken across them and reported
+ * as "the" prediction error is a mean over the losers only. See
+ * {@link reportCarry}.
+ */
+export interface ReportCarryCloseReason {
+  /** `max_hold` | `rate_below_exit` | `stale_data` | `manual`. */
+  reason: string;
+  count: number;
+  /** Mean `realized − predicted` for this reason alone. */
+  avgErrorPct: number | null;
+  /** Mean `accrual_count`: settlements actually booked, not merely elapsed. */
+  avgAccrualCount: number | null;
+  /**
+   * Mean number of settlement periods the hold *spanned*, from
+   * `(close_ts − entry_ts) / interval`. The upper bound on what could have been
+   * accrued (±1 for where the venue's grid falls relative to entry), so
+   * `avgAccrualCount / avgSpannedSettlements` is the accrual coverage: a
+   * position that booked 2 of 9 settlements did not earn a low return, it was
+   * measured through a hole. Skipped settlements are not stored per position —
+   * `ScanResult.skippedSettlements` counts them per *pass* — so this is the
+   * cheapest honest proxy rather than an exact count.
+   */
+  avgSpannedSettlements: number | null;
+}
+
+/**
+ * One open position, marked to date.
+ *
+ * **This is not a realised figure and must never be compared to one.**
+ * {@link accruedAnnualPct} charges **no fees at all**: the round trip is paid
+ * on the way out and this position has not been out. Amortising the exit fee
+ * over a hold that is still running would invent a cost that has not been
+ * incurred, over a denominator that is still moving, and would read as a loss
+ * on every position in its first days. So the fair comparison is
+ * gross-accrual-so-far against the *gross* expectation, and the field is
+ * labelled rather than silently folded into a net.
+ */
+export interface ReportCarryOpenMark {
+  id: number;
+  venue: string;
+  symbol: string;
+  notionalUsdt: number;
+  entryTs: number;
+  /** How long it has been running, at the report's clock. */
+  holdDays: number;
+  accruedFundingUsdt: number;
+  accrualCount: number;
+  /**
+   * `accrued / notional`, annualised over the hold so far, **fees excluded**.
+   * `null` for a position younger than a moment or with no usable notional.
+   */
+  accruedAnnualPct: number | null;
+  /** What the entry row promised, net of the drag amortised over the plan. */
+  predictedNetAnnualPct: number;
+  /** {@link accruedAnnualPct} − {@link predictedNetAnnualPct}; `null` if the first is. */
+  accruedVsPredictedPct: number | null;
+}
+
 /** The paper carry book's record over the window. */
 export interface ReportCarry {
   /** Positions open **now** — a position is not "in" a window, it is running. */
   openCount: number;
   openNotionalUsdt: number;
   openAccruedUsdt: number;
+  /**
+   * Mean {@link ReportCarryOpenMark.accruedVsPredictedPct} over the **whole**
+   * open book (not just the marks listed below), or `null` when no open
+   * position can be marked yet. Fee-free by construction — see
+   * {@link ReportCarryOpenMark}.
+   */
+  openAvgAccruedVsPredictedPct: number | null;
+  /**
+   * Per-position marks, newest entry last, capped at
+   * {@link REPORT_OPEN_MARKS_LIMIT}. The average above is over every open
+   * position regardless of this cap.
+   */
+  openMarks: ReportCarryOpenMark[];
   /** Positions whose `close_ts` fell inside the window. */
   closedCount: number;
   realizedPnlUsdt: number;
   /** Mean realised annual %, over the closed positions that have one. */
   avgRealizedAnnualPct: number | null;
-  /** Mean of `realized − predicted`; negative means entry over-promised. */
+  /**
+   * Mean of `realized − predicted` over the window's closes; negative means
+   * entry over-promised. **Read it beside {@link closeReasons}**: over a window
+   * shorter than the planned hold this population is adverse-selected.
+   */
   avgPredictionErrorPct: number | null;
+  /** The window's closes grouped by why they closed, commonest first. */
+  closeReasons: ReportCarryCloseReason[];
   best: FundingPosition | null;
   worst: FundingPosition | null;
 }
+
+/**
+ * Most open positions {@link reportCarry} marks individually: 50.
+ *
+ * The open book is bounded by `funding_max_positions` and is in practice a
+ * handful, so this is a guard rather than a page size — it stops a book left
+ * over from a much larger setting from turning one report field into an
+ * unbounded array. The aggregate beside it is computed in SQL over every open
+ * position, so the cap can never move the reported average.
+ */
+export const REPORT_OPEN_MARKS_LIMIT = 50;
+
+/** Days in the year every annualisation in this app shares (`src/engine`). */
+const REPORT_DAYS_PER_YEAR = 365;
+
+/** Milliseconds in a day. */
+const REPORT_MS_PER_DAY = 86_400_000;
 
 /**
  * Carry aggregates for the window.
@@ -1865,20 +1982,96 @@ export interface ReportCarry {
  * positions that were open during this window" would mean reconstructing a book
  * from an entry timestamp and a close that has not happened. So the open half is
  * the book as it stands, and the response labels it that way.
+ *
+ * ## Why the open book is marked at all, and why the mark is fee-free
+ *
+ * The closed half alone is a **biased** estimator of "did entry over-promise",
+ * and biased in a knowable direction. `funding_hold_days` defaults to 30 while
+ * this report's window can be at most 7, so `max_hold` — the *planned* ending,
+ * the one a position that worked reaches — cannot fire inside any window this
+ * endpoint serves. Everything that closes inside 7 days closed because
+ * something went wrong: the rate fell through `funding_exit_annual_pct`, or the
+ * board stopped quoting it. The healthy positions are all still open and
+ * contribute nothing. Averaging only the closes therefore prints a confidently
+ * negative prediction error *by construction*, and would do so even if every
+ * position on the book were paying exactly what it promised.
+ *
+ * So the open book is marked to date beside it: accrued-so-far, annualised over
+ * the hold so far, **with no fees charged**, because the round trip is paid on
+ * exit and these have not exited (see {@link ReportCarryOpenMark}). The two
+ * populations are reported separately and labelled — never blended into one
+ * scalar, which is the thing that hid the bias in the first place.
+ *
+ * `nowTs` defaults to `toTs`, which is the report's own clock: the open marks
+ * are "as of the end of the window", the same instant everything else is
+ * measured at.
  */
 export async function reportCarry(
   db: D1Database,
   fromTs: number,
   toTs: number,
+  nowTs: number = toTs,
 ): Promise<ReportCarry> {
+  // The mark, in SQL, once — reused by the aggregate and by the per-position
+  // list so the two can never disagree about what "accrued annual %" means.
+  // Guarded on both denominators: a zero notional or a position entered at (or
+  // after) `nowTs` yields NULL, which AVG then skips rather than poisoning.
+  const accruedAnnualSql =
+    "CASE WHEN notional_usdt > 0 AND ?2 > entry_ts" +
+    `  THEN (accrued_funding_usdt / notional_usdt) * (${REPORT_DAYS_PER_YEAR}.0 /` +
+    `       ((?2 - entry_ts) / ${REPORT_MS_PER_DAY}.0)) * 100.0` +
+    "  ELSE NULL END";
+
   const open = await db
     .prepare(
       "SELECT COUNT(*) AS n, COALESCE(SUM(notional_usdt), 0) AS notional," +
-        " COALESCE(SUM(accrued_funding_usdt), 0) AS accrued" +
+        " COALESCE(SUM(accrued_funding_usdt), 0) AS accrued," +
+        ` AVG(${accruedAnnualSql} - predicted_net_annual_pct) AS avg_mark_err` +
         " FROM funding_positions WHERE status = ?1",
     )
-    .bind(CARRY_STATUS_OPEN)
-    .first<{ n: number; notional: number; accrued: number }>();
+    .bind(CARRY_STATUS_OPEN, nowTs)
+    .first<{ n: number; notional: number; accrued: number; avg_mark_err: number | null }>();
+
+  const { results: openRows } = await db
+    .prepare(
+      "SELECT id, venue, symbol, notional_usdt, entry_ts, accrued_funding_usdt," +
+        " accrual_count, predicted_net_annual_pct," +
+        ` ${accruedAnnualSql} AS accrued_annual_pct` +
+        " FROM funding_positions WHERE status = ?1" +
+        " ORDER BY entry_ts ASC, id ASC LIMIT ?3",
+    )
+    .bind(CARRY_STATUS_OPEN, nowTs, REPORT_OPEN_MARKS_LIMIT)
+    .all<{
+      id: number;
+      venue: string;
+      symbol: string;
+      notional_usdt: number;
+      entry_ts: number;
+      accrued_funding_usdt: number;
+      accrual_count: number;
+      predicted_net_annual_pct: number;
+      accrued_annual_pct: number | null;
+    }>();
+
+  const openMarks: ReportCarryOpenMark[] = (openRows ?? []).map((r) => {
+    const accruedAnnualPct = finiteOrNull(r.accrued_annual_pct);
+    return {
+      id: r.id,
+      venue: r.venue,
+      symbol: r.symbol,
+      notionalUsdt: r.notional_usdt,
+      entryTs: r.entry_ts,
+      holdDays: round8((nowTs - r.entry_ts) / REPORT_MS_PER_DAY),
+      accruedFundingUsdt: round8(r.accrued_funding_usdt ?? 0),
+      accrualCount: r.accrual_count ?? 0,
+      accruedAnnualPct,
+      predictedNetAnnualPct: r.predicted_net_annual_pct,
+      accruedVsPredictedPct:
+        accruedAnnualPct === null
+          ? null
+          : round8(accruedAnnualPct - r.predicted_net_annual_pct),
+    };
+  });
 
   const closed = await db
     .prepare(
@@ -1889,6 +2082,28 @@ export async function reportCarry(
     )
     .bind(CARRY_STATUS_CLOSED, fromTs, toTs)
     .first<{ n: number; realized: number; avg_realized: number | null; avg_err: number | null }>();
+
+  // Grouped in SQL and bounded by the number of close reasons that exist (4),
+  // so this is a fixed-size result however large the book gets.
+  const { results: reasonRows } = await db
+    .prepare(
+      "SELECT COALESCE(close_reason, 'unknown') AS reason, COUNT(*) AS n," +
+        " AVG(realized_annual_pct - predicted_net_annual_pct) AS avg_err," +
+        " AVG(accrual_count) AS avg_accruals," +
+        " AVG(CASE WHEN interval_minutes > 0" +
+        "     THEN CAST((close_ts - entry_ts) / (interval_minutes * 60000.0) AS INTEGER)" +
+        "     ELSE NULL END) AS avg_spanned" +
+        " FROM funding_positions WHERE status = ?1 AND close_ts >= ?2 AND close_ts <= ?3" +
+        " GROUP BY reason ORDER BY n DESC, reason ASC",
+    )
+    .bind(CARRY_STATUS_CLOSED, fromTs, toTs)
+    .all<{
+      reason: string;
+      n: number;
+      avg_err: number | null;
+      avg_accruals: number | null;
+      avg_spanned: number | null;
+    }>();
 
   const extreme = async (direction: "DESC" | "ASC") => {
     const row = await db
@@ -1906,10 +2121,19 @@ export async function reportCarry(
     openCount: open?.n ?? 0,
     openNotionalUsdt: round8(open?.notional ?? 0),
     openAccruedUsdt: round8(open?.accrued ?? 0),
+    openAvgAccruedVsPredictedPct: finiteOrNull(open?.avg_mark_err),
+    openMarks,
     closedCount: closed?.n ?? 0,
     realizedPnlUsdt: round8(closed?.realized ?? 0),
     avgRealizedAnnualPct: finiteOrNull(closed?.avg_realized),
     avgPredictionErrorPct: finiteOrNull(closed?.avg_err),
+    closeReasons: (reasonRows ?? []).map((r) => ({
+      reason: r.reason,
+      count: r.n ?? 0,
+      avgErrorPct: finiteOrNull(r.avg_err),
+      avgAccrualCount: finiteOrNull(r.avg_accruals),
+      avgSpannedSettlements: finiteOrNull(r.avg_spanned),
+    })),
     best: await extreme("DESC"),
     worst: await extreme("ASC"),
   };
@@ -1936,10 +2160,15 @@ export interface ReportXchg {
   /**
    * Measured rows whose re-priced net cleared `xchg_min_profit_pct`.
    *
-   * A strictly higher bar than {@link survived}, and a display preference rather
-   * than an economic one: it is the same threshold the dashboard's `qualifies`
-   * badge uses, so the report and the board agree about which rows are worth
-   * looking at.
+   * A display preference rather than an economic one: it is the same threshold
+   * the dashboard's `qualifies` badge uses, so the report and the board agree
+   * about which rows are worth looking at.
+   *
+   * A *higher* bar than {@link survived} only while `xchg_min_profit_pct` is
+   * positive. The setting may legitimately be zero or negative (`src/routes.ts`
+   * documents why a negative bar is meaningful here), and at or below zero this
+   * is the **wider** count of the two: `survived` is a strict `> 0` where this
+   * one is `>= minProfitPct`.
    */
   qualifying: number;
   avgPersistNetPct: number | null;
@@ -2238,8 +2467,12 @@ export async function reportBasis(
 // ---------------------------------------------------------------------------
 
 export interface ResetOptions {
-  /** Also drop trades, opportunities, scans and funding rows. Defaults to
-   *  `true` at the API. */
+  /**
+   * Also drop trades, opportunities, scans, funding rows and carry positions.
+   * **Opt-in at the API** (`{"wipeHistory": true}`): the recorded series is the
+   * product, and a bodyless `POST /api/reset` must not be able to destroy a
+   * week of soak data that the acceptance report is the only consumer of.
+   */
   wipeHistory: boolean;
 }
 
@@ -2284,10 +2517,17 @@ export async function resetAll(
       // deleted would leave it unable to accrue, unable to price a close, and
       // 24 hours from being closed as stale.
       db.prepare("DELETE FROM funding_positions"),
-      // The basis board and its own poll marker, on the same terms as the
-      // funding pair above: the rows reference `scan_id`, and a marker left
-      // behind would make the next scan sit out an interval measured against
-      // rows that no longer exist.
+      // The basis board and its own poll marker. The rows go for the same
+      // reason the funding ones do — they reference `scan_id`, and a marker
+      // left behind would make the next scan sit out an interval measured
+      // against rows that no longer exist. **What a missing marker then means
+      // is not the same on the two boards**, and the difference is deliberate:
+      // an absent `funding_last_poll_ts` forces a poll on the next scan, while
+      // an absent basis marker is *seeded* to `startedAt − interval + stagger`
+      // and the first basis poll is skipped, landing ~150s later so the two
+      // boards alternate instead of polling in the same invocation. So a reset
+      // costs the funding board nothing and the basis board one skipped poll —
+      // see the cold-start note in `src/scan.ts`.
       db.prepare("DELETE FROM basis_rates"),
       db.prepare("DELETE FROM settings WHERE key = ?1").bind(BASIS_POLL_TS_KEY),
     );

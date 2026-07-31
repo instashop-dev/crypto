@@ -18,7 +18,6 @@ import {
   MS_PER_DAY,
   realizedFigures,
   settlementBoundaries,
-  settlementsCrossed,
   shouldClose,
 } from "../src/engine";
 
@@ -121,14 +120,17 @@ describe("settlementBoundaries", () => {
   });
 });
 
-describe("settlementsCrossed", () => {
-  it("counts what settlementBoundaries lists", () => {
-    expect(settlementsCrossed(0, 3 * PERIOD_MS, INTERVAL)).toBe(3);
-    expect(settlementsCrossed(0, PERIOD_MS - 1, INTERVAL)).toBe(0);
-    expect(settlementsCrossed(T0, T0 + MS_PER_DAY, INTERVAL, T0)).toBe(3);
-    expect(settlementsCrossed(T0, T0 + 200 * PERIOD_MS, INTERVAL, T0)).toBe(
-      MAX_CATCHUP_SETTLEMENTS,
-    );
+describe("settlementBoundaries - how many it lists", () => {
+  it("counts one boundary per elapsed period, capped at the catch-up limit", () => {
+    // The count used to have its own `settlementsCrossed` wrapper; nothing in
+    // `src/` ever called it (the accrual pass needs the boundaries themselves,
+    // not their number), so the assertions live on the list's length instead.
+    expect(settlementBoundaries(0, 3 * PERIOD_MS, INTERVAL)).toHaveLength(3);
+    expect(settlementBoundaries(0, PERIOD_MS - 1, INTERVAL)).toHaveLength(0);
+    expect(settlementBoundaries(T0, T0 + MS_PER_DAY, INTERVAL, T0)).toHaveLength(3);
+    expect(
+      settlementBoundaries(T0, T0 + 200 * PERIOD_MS, INTERVAL, T0),
+    ).toHaveLength(MAX_CATCHUP_SETTLEMENTS);
   });
 });
 
