@@ -1,0 +1,101 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "list": [
+      {
+        "symbol": "BTCUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "BTC",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1585526400000",
+        "fundingInterval": 480,
+        "priceScale": "2",
+        "lotSizeFilter": { "minOrderQty": "0.001", "qtyStep": "0.001" }
+      },
+      {
+        "symbol": "ETHUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "ETH",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "SOLUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "SOL",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "fundingInterval": 240
+      },
+      {
+        "symbol": "BNBUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "XRPUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "ADAUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "LTCUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "AVAXUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "LINKUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "DOGEUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      },
+      {
+        "symbol": "TRXUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": "not-a-number"
+      },
+      {
+        "symbol": "WIFUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 240
+      },
+      {
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "fundingInterval": 480
+      }
+    ],
+    "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1672376496048
+}

@@ -77,6 +77,30 @@ export const DEFAULTS = {
    * usual primary/fallback chain, no second REST call, no spread rows.
    */
   xchg_enabled: 1,
+  /**
+   * Net annualised percent a funding-rate carry must clear to be flagged as an
+   * opportunity on the dashboard.
+   *
+   * Display-only, and deliberately so: the funding scanner is an *observer*.
+   * Every quote it prices is persisted regardless of this number, because a
+   * carry position is held for days and the history is the point — a row that
+   * was 4% yesterday and 12% today is the signal, and a threshold applied at
+   * write time would have thrown the first half away. Compare `min_profit_pct`,
+   * which gates an actual (paper) fill and therefore must be applied up front.
+   *
+   * 5% is roughly the point above which the carry beats a T-bill, which is the
+   * only honest benchmark for a delta-neutral trade.
+   */
+  funding_min_annual_pct: 5,
+  /**
+   * Assumed holding period, in days, used to amortise the round-trip fee.
+   *
+   * The funding stream accrues per interval while the 4 legs of fees are paid
+   * once, so the net figure is meaningless without saying how long the position
+   * is held. 30 days is a month of carry — long enough that fees are a minor
+   * drag, short enough to be a decision someone would actually make.
+   */
+  funding_hold_days: 30,
 } as const;
 
 export type Defaults = typeof DEFAULTS;
@@ -102,6 +126,39 @@ export const STRATEGIES: readonly Strategy[] = [
   STRATEGY_TRIANGULAR,
   STRATEGY_CROSS_EXCHANGE,
 ] as const;
+
+/**
+ * How often the funding board is polled, in milliseconds.
+ *
+ * Not a setting: funding settles every 8 hours on almost every contract, so a
+ * 5-minute refresh is already ~96x oversampled and there is nothing an operator
+ * would gain by tuning it. It exists as a constant only so the minutely scan
+ * does not make an upstream call it has no use for — see the poll gate in
+ * `src/scan.ts`.
+ */
+export const FUNDING_POLL_INTERVAL_MS = 300_000;
+
+/**
+ * How long a cached funding-interval map is trusted, in milliseconds.
+ *
+ * A contract's settlement cadence changes on the order of never; when a venue
+ * does change one it announces it weeks ahead. A day of staleness costs at most
+ * one day of rows tagged with the old interval, against one saved request on
+ * every one of the ~288 daily polls.
+ */
+export const FUNDING_INTERVAL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The universe minus the settlement asset: the assets with a `<X>USDT` perp
+ * worth quoting. 11 of the 12 for the shipped universe.
+ *
+ * `USDT` is excluded because there is no `USDTUSDT` perpetual — the base asset
+ * is the thing the contract is *quoted in*, not something one carries against
+ * itself.
+ */
+export function perpAssets(universe: string[], base: string): string[] {
+  return universe.filter((asset) => asset !== base);
+}
 
 /**
  * Every ordered concatenation `A + B` with `A !== B` for the given universe.

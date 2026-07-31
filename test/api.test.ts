@@ -5,16 +5,18 @@
 import { env, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { MEXC_BASE, setWsCollector, type WsCollector } from "../src/binance";
-import { DEFAULTS } from "../src/config";
+import { ASSET_UNIVERSE, BASE_ASSET, DEFAULTS, perpAssets } from "../src/config";
 import {
   commitTrade,
   ensureSeeded,
   getBalance,
   getSettings,
+  insertFundingRates,
   insertOpportunities,
   insertScan,
   replacePairs,
 } from "../src/db";
+import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { app } from "../src/index";
 import type { BookTickerEntry, Env } from "../src/types";
 
@@ -27,7 +29,37 @@ beforeAll(() => {
 
 afterEach(() => {
   setWsCollector(null);
+  setFundingFetcher(null);
   fetchMock.assertNoPendingInterceptors();
+});
+
+/** 11 assets: the universe minus USDT. */
+const PERP_ASSETS = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
+
+/**
+ * A stub funding board, so `POST /api/scan` never reaches a perp venue.
+ *
+ * Rates descend with the asset's position in the universe, giving the ranking
+ * an unambiguous winner (BTC) without any test having to name a number twice.
+ */
+const serveFundingBoard: FundingFetcher = async (assets) => ({
+  venue: "bybit",
+  ts: Date.now(),
+  quotes: new Map(
+    assets.map((symbol, i) => [
+      symbol,
+      {
+        venue: "bybit" as const,
+        symbol,
+        instrument: `${symbol}USDT`,
+        rate: 0.0002 - i * 0.00002,
+        intervalMinutes: 480,
+        intervalSource: "api" as const,
+        nextFundingTs: Date.now() + 3_600_000,
+        markPrice: 100 + i,
+      },
+    ]),
+  ),
 });
 
 const PAIRS = [
@@ -85,6 +117,7 @@ async function send(path: string, method: string, body?: unknown): Promise<Respo
 beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
+  setFundingFetcher(serveFundingBoard);
 });
 
 /** Insert one synthetic trade + opportunity pair at a controlled timestamp. */
@@ -876,5 +909,399 @@ describe("POST /api/admin/refresh-pairs", () => {
 
     const pairs = (await (await get("/api/pairs")).json()) as { count: number };
     expect(pairs.count).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Funding rates over HTTP
+// ---------------------------------------------------------------------------
+
+interface FundingRateBody {
+  id: number;
+  scanId: number | null;
+  ts: number;
+  venue: string;
+  symbol: string;
+  instrument: string;
+  rate: number;
+  intervalMinutes: number;
+  intervalSource: string;
+  annualizedPct: number;
+  netAnnualPct: number;
+  nextFundingTs: number | null;
+  markPrice: number | null;
+  qualifies: boolean;
+}
+
+interface FundingBody {
+  ts: number | null;
+  ageMs: number | null;
+  stale: boolean;
+  venue: string | null;
+  count: number;
+  minAnnualPct: number;
+  holdDays: number;
+  feeRate: number;
+  pollIntervalMs: number;
+  rates: FundingRateBody[];
+}
+
+/** One synthetic funding row at a controlled timestamp. */
+function fundingRow(symbol: string, netAnnualPct: number) {
+  return {
+    venue: "bybit",
+    symbol,
+    instrument: `${symbol}USDT`,
+    rate: 0.0001,
+    intervalMinutes: 480,
+    intervalSource: "api",
+    annualizedPct: netAnnualPct + 4.86666667,
+    netAnnualPct,
+    nextFundingTs: null,
+    markPrice: null,
+  };
+}
+
+async function funding(): Promise<FundingBody> {
+  return (await (await get("/api/funding")).json()) as FundingBody;
+}
+
+async function fundingRowCount(): Promise<number> {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM funding_rates").first<{
+    n: number;
+  }>();
+  return row?.n ?? 0;
+}
+
+describe("GET /api/funding", () => {
+  it("answers 200 with an empty board before the first poll", async () => {
+    const res = await get("/api/funding");
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as FundingBody;
+    // "No board yet" is the state of every deployment for its first few
+    // seconds, not a 404.
+    expect(body.ts).toBeNull();
+    expect(body.count).toBe(0);
+    expect(body.rates).toEqual([]);
+    expect(body.venue).toBeNull();
+    expect(body.stale).toBe(false);
+    // The settings echo is present either way, so the panel can render its
+    // header before any row exists.
+    expect(body.minAnnualPct).toBe(DEFAULTS.funding_min_annual_pct);
+    expect(body.holdDays).toBe(DEFAULTS.funding_hold_days);
+    expect(body.feeRate).toBe(DEFAULTS.fee_rate);
+  });
+
+  it("returns the newest board, best net carry first", async () => {
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+
+    const body = await funding();
+    expect(body.count).toBe(11);
+    expect(body.venue).toBe("bybit");
+    expect(body.rates).toHaveLength(11);
+    expect(body.rates[0].symbol).toBe("BTC");
+    expect(body.rates[0].instrument).toBe("BTCUSDT");
+    expect(body.rates[0].annualizedPct).toBeCloseTo(21.9, 6);
+    expect(body.rates[0].netAnnualPct).toBeCloseTo(17.03333333, 6);
+
+    for (let i = 1; i < body.rates.length; i++) {
+      expect(body.rates[i].netAnnualPct).toBeLessThanOrEqual(
+        body.rates[i - 1].netAnnualPct,
+      );
+    }
+    expect(body.rates.map((r) => r.symbol).sort()).toEqual([...PERP_ASSETS].sort());
+    expect(body.ageMs).toBeGreaterThanOrEqual(0);
+    expect(body.stale).toBe(false);
+  });
+
+  it("recomputes qualifies against the current threshold, not the stored one", async () => {
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+
+    const before = await funding();
+    expect(before.minAnnualPct).toBe(5);
+    const qualifying = before.rates.filter((r) => r.qualifies);
+    expect(qualifying.length).toBeGreaterThan(0);
+    expect(qualifying.every((r) => r.netAnnualPct >= 5)).toBe(true);
+
+    // Raising the bar must re-classify rows already on disk: qualifying is a
+    // judgement about a measurement, not part of it.
+    await send("/api/settings", "PUT", { funding_min_annual_pct: 1000 });
+    const after = await funding();
+    expect(after.minAnnualPct).toBe(1000);
+    expect(after.rates.every((r) => !r.qualifies)).toBe(true);
+    // The stored percentages themselves did not move.
+    expect(after.rates[0].netAnnualPct).toBe(before.rates[0].netAnnualPct);
+
+    await send("/api/settings", "PUT", { funding_min_annual_pct: -1000 });
+    expect((await funding()).rates.every((r) => r.qualifies)).toBe(true);
+  });
+
+  it("flags a board older than two poll intervals as stale", async () => {
+    const fresh = Date.now();
+    await insertFundingRates(env.DB, null, [fundingRow("BTC", 6)], fresh);
+    expect((await funding()).stale).toBe(false);
+
+    await env.DB.prepare("DELETE FROM funding_rates").run();
+    // Just past 2 x 5 minutes: one missed poll is jitter, two is a signal.
+    await insertFundingRates(
+      env.DB,
+      null,
+      [fundingRow("BTC", 6)],
+      Date.now() - (2 * 300_000 + 1000),
+    );
+
+    const stale = await funding();
+    expect(stale.stale).toBe(true);
+    expect(stale.ageMs).toBeGreaterThan(600_000);
+    expect(stale.count).toBe(1);
+  });
+
+  it("reads exactly one poll, never a mixture of two", async () => {
+    const older = Date.now() - 600_000;
+    await insertFundingRates(
+      env.DB,
+      null,
+      [fundingRow("BTC", 6), fundingRow("ETH", 5)],
+      older,
+    );
+    await insertFundingRates(env.DB, null, [fundingRow("BTC", 9)], Date.now());
+
+    const body = await funding();
+    expect(body.count).toBe(1);
+    expect(body.rates[0].netAnnualPct).toBe(9);
+  });
+});
+
+describe("GET /api/funding/history", () => {
+  beforeEach(async () => {
+    for (let i = 0; i < 3; i++) {
+      await insertFundingRates(env.DB, null, [fundingRow("BTC", i)], 6_000 + i);
+    }
+    await insertFundingRates(env.DB, null, [fundingRow("ETH", 42)], 6_010);
+  });
+
+  it("returns one symbol's series, newest first", async () => {
+    const body = (await (await get("/api/funding/history?symbol=BTC")).json()) as {
+      symbol: string;
+      count: number;
+      limit: number;
+      rates: FundingRateBody[];
+    };
+
+    expect(body.symbol).toBe("BTC");
+    expect(body.count).toBe(3);
+    expect(body.limit).toBe(100);
+    expect(body.rates.map((r) => r.ts)).toEqual([6_002, 6_001, 6_000]);
+    expect(body.rates.every((r) => r.symbol === "BTC")).toBe(true);
+  });
+
+  it("clamps the limit and upper-cases the symbol", async () => {
+    const clamped = (await (
+      await get("/api/funding/history?symbol=btc&limit=9999")
+    ).json()) as { symbol: string; limit: number; count: number };
+    expect(clamped.limit).toBe(500);
+    expect(clamped.symbol).toBe("BTC");
+    expect(clamped.count).toBe(3);
+
+    const one = (await (
+      await get("/api/funding/history?symbol=BTC&limit=1")
+    ).json()) as { count: number; rates: FundingRateBody[] };
+    expect(one.count).toBe(1);
+    expect(one.rates[0].ts).toBe(6_002);
+  });
+
+  it("returns an empty series for a symbol nobody ever quoted", async () => {
+    const body = (await (await get("/api/funding/history?symbol=NOPE")).json()) as {
+      count: number;
+      rates: unknown[];
+    };
+    expect(body.count).toBe(0);
+    expect(body.rates).toEqual([]);
+  });
+
+  it("rejects a missing symbol rather than guessing one", async () => {
+    const res = await get("/api/funding/history");
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: "symbol is required" });
+  });
+});
+
+describe("POST /api/funding/refresh", () => {
+  it("polls unconditionally and writes rows that belong to no scan", async () => {
+    const res = await send("/api/funding/refresh", "POST");
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as { count: number; venue: string; ts: number };
+    expect(body.count).toBe(11);
+    expect(body.venue).toBe("bybit");
+    expect(typeof body.ts).toBe("number");
+
+    const { results } = await env.DB.prepare(
+      "SELECT scan_id FROM funding_rates",
+    ).all<{ scan_id: number | null }>();
+    // Minting a scans row for this would put a scan in the history that never
+    // looked at a single market.
+    expect(results).toHaveLength(11);
+    expect((results ?? []).every((r) => r.scan_id === null)).toBe(true);
+    await expect(
+      get("/api/scans").then((r) => r.json()),
+    ).resolves.toMatchObject({ count: 0 });
+
+    expect((await funding()).count).toBe(11);
+  });
+
+  it("bypasses the poll gate that throttles the scan path", async () => {
+    await send("/api/funding/refresh", "POST");
+    const again = await send("/api/funding/refresh", "POST");
+    expect(again.status).toBe(200);
+    // Two unconditional polls, and the retention delete never removed the
+    // first: both are inside the 7-day window.
+    expect(await fundingRowCount()).toBeGreaterThanOrEqual(11);
+  });
+
+  it("answers 502 when neither venue is reachable", async () => {
+    setFundingFetcher(async () => {
+      throw new Error(
+        "no funding-rate source available (bybit: HTTP 403; okx: HTTP 429)",
+      );
+    });
+
+    const res = await send("/api/funding/refresh", "POST");
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("no funding-rate source available");
+    expect(body.error).toContain("bybit");
+    await expect(fundingRowCount()).resolves.toBe(0);
+  });
+});
+
+describe("PUT /api/settings - funding", () => {
+  it("exposes the two new tunables among the seeded defaults", async () => {
+    const body = (await (await get("/api/settings")).json()) as Record<string, number>;
+
+    expect(body).toEqual({ ...DEFAULTS });
+    expect(body.funding_min_annual_pct).toBe(5);
+    expect(body.funding_hold_days).toBe(30);
+  });
+
+  it("accepts any finite funding_min_annual_pct, negatives included", async () => {
+    for (const value of [12, 0, -3.5]) {
+      const res = await send("/api/settings", "PUT", { funding_min_annual_pct: value });
+      expect(res.status, String(value)).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({
+        funding_min_annual_pct: value,
+      });
+    }
+
+    const junk = await send("/api/settings", "PUT", { funding_min_annual_pct: "12" });
+    expect(junk.status).toBe(400);
+    await expect(getSettings(env.DB)).resolves.toMatchObject({
+      funding_min_annual_pct: -3.5,
+    });
+  });
+
+  it("clamps funding_hold_days to (0, 3650]", async () => {
+    for (const value of [0, -1, 3651]) {
+      const res = await send("/api/settings", "PUT", { funding_hold_days: value });
+      expect(res.status, String(value)).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("funding_hold_days");
+    }
+    // Nothing was persisted by any of the rejected attempts.
+    await expect(getSettings(env.DB)).resolves.toMatchObject({
+      funding_hold_days: DEFAULTS.funding_hold_days,
+    });
+
+    for (const value of [1, 90, 3650]) {
+      const ok = await send("/api/settings", "PUT", { funding_hold_days: value });
+      expect(ok.status, String(value)).toBe(200);
+      await expect(ok.json()).resolves.toMatchObject({ funding_hold_days: value });
+    }
+  });
+
+  it("rejects a misspelled funding key rather than ignoring it", async () => {
+    const res = await send("/api/settings", "PUT", { funding_min_annual: 12 });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("funding_min_annual");
+  });
+});
+
+describe("POST /api/scan - funding block", () => {
+  it("carries the funding figures alongside the arbitrage ones", async () => {
+    serveProfitableBook();
+    const body = (await (await send("/api/scan", "POST")).json()) as {
+      error?: string;
+      executed: boolean;
+      fundingVenue: string | null;
+      fundingCount: number;
+      bestFundingNetAnnualPct: number | null;
+      fundingError?: string;
+      fundingSkipped?: boolean;
+    };
+
+    expect(body.error).toBeUndefined();
+    expect(body.executed).toBe(true);
+    expect(body.fundingVenue).toBe("bybit");
+    expect(body.fundingCount).toBe(11);
+    expect(body.bestFundingNetAnnualPct).toBeCloseTo(17.03333333, 6);
+    expect(body.fundingError).toBeUndefined();
+    expect(body.fundingSkipped).toBeUndefined();
+  });
+
+  it("reports the funding half as skipped on an immediate second scan", async () => {
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+    serveProfitableBook();
+
+    const body = (await (await send("/api/scan", "POST")).json()) as {
+      fundingSkipped?: boolean;
+      fundingCount: number;
+    };
+    expect(body.fundingSkipped).toBe(true);
+    expect(body.fundingCount).toBe(0);
+    // Still exactly one board on disk.
+    await expect(fundingRowCount()).resolves.toBe(11);
+  });
+
+  it("never lets a dead perp venue reach scans.error", async () => {
+    serveProfitableBook();
+    setFundingFetcher(async () => {
+      throw new Error(
+        "no funding-rate source available (bybit: HTTP 403; okx: HTTP 429)",
+      );
+    });
+
+    const body = (await (await send("/api/scan", "POST")).json()) as {
+      error?: string;
+      executed: boolean;
+      fundingError?: string;
+    };
+    expect(body.error).toBeUndefined();
+    expect(body.executed).toBe(true);
+    expect(body.fundingError).toContain("no funding-rate source available");
+
+    const scans = (await (await get("/api/scans")).json()) as {
+      scans: Array<{ error: string | null }>;
+    };
+    expect(scans.scans[0].error).toBeNull();
+  });
+});
+
+describe("POST /api/reset - funding rows", () => {
+  it("clears the board with the rest of the history, and keeps it otherwise", async () => {
+    await send("/api/funding/refresh", "POST");
+    expect((await funding()).count).toBe(11);
+
+    await send("/api/reset", "POST", { wipeHistory: false });
+    expect((await funding()).count).toBe(11);
+
+    await send("/api/reset", "POST");
+    const wiped = await funding();
+    expect(wiped.count).toBe(0);
+    expect(wiped.ts).toBeNull();
   });
 });

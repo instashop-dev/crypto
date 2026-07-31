@@ -18,13 +18,21 @@ import {
   USER_AGENT,
   type WsCollector,
 } from "./binance";
-import { ASSET_UNIVERSE, BASE_ASSET, STRATEGIES, type Strategy } from "./config";
+import {
+  ASSET_UNIVERSE,
+  BASE_ASSET,
+  FUNDING_POLL_INTERVAL_MS,
+  STRATEGIES,
+  type Strategy,
+} from "./config";
 import {
   ensureSeeded,
   getBalances,
   getPairs,
   getSettings,
   getTaxTotals,
+  listFundingRatesForSymbol,
+  listLatestFundingRates,
   listOpportunities,
   listOpportunitiesForScan,
   listScans,
@@ -32,10 +40,11 @@ import {
   replacePairs,
   resetAll,
   updateSettings,
+  type FundingRate,
   type Settings,
 } from "./db";
 import { round8 } from "./engine";
-import { runScan } from "./scan";
+import { pollFundingRates, runScan } from "./scan";
 import type { Env } from "./types";
 
 const MEXC_PING_PATH = "/api/v3/ping";
@@ -55,6 +64,9 @@ const LIMITS = {
   opportunities: [50, 200],
   trades: [50, 200],
   scans: [20, 100],
+  /** Funding history is one symbol's time series, so it is sampled far denser
+   *  than the other collections: 100 rows is ~8 hours of 5-minute polls. */
+  funding: [100, 500],
 } as const;
 
 /** Settings an operator may change at runtime. `initial_usdt` is not one of
@@ -69,8 +81,28 @@ const MUTABLE_SETTINGS = [
   "tax_rate",
   "xchg_min_profit_pct",
   "xchg_enabled",
+  "funding_min_annual_pct",
+  "funding_hold_days",
 ] as const;
 type MutableSetting = (typeof MUTABLE_SETTINGS)[number];
+
+/**
+ * Ceiling on the assumed carry holding period: 10 years.
+ *
+ * Not a market limit but an arithmetic one — `holdingDays` is a divisor in the
+ * fee-drag term, so a fat-fingered `36500` would report an essentially fee-free
+ * carry. Anything past a decade is a typo, not a strategy.
+ */
+const MAX_FUNDING_HOLD_DAYS = 3650;
+
+/**
+ * A funding board older than this is flagged stale to the client.
+ *
+ * Two poll intervals, not one: at exactly one interval every board is a
+ * heartbeat away from "stale" and the badge would flicker on and off with
+ * ordinary scheduling jitter. Missing *two* consecutive polls is a real signal.
+ */
+const FUNDING_STALE_MS = 2 * FUNDING_POLL_INTERVAL_MS;
 
 /** Sanity ceiling on the fee rate: 1% per leg is already an absurd taker fee,
  *  and a fat-fingered 0.1 (10%) would make every cycle unprofitable forever. */
@@ -321,6 +353,19 @@ export function validateSettingsPatch(
     if (key === "xchg_enabled" && value !== 0 && value !== 1) {
       return { ok: false, error: "xchg_enabled must be 0 or 1" };
     }
+    // `funding_min_annual_pct` takes any finite number and needs no range
+    // check: it is a display threshold on a figure that is routinely negative,
+    // and unlike the two profit thresholds a negative value here is not a demo
+    // switch — nothing is ever filled — it simply widens what qualifies.
+    if (
+      key === "funding_hold_days" &&
+      (value <= 0 || value > MAX_FUNDING_HOLD_DAYS)
+    ) {
+      return {
+        ok: false,
+        error: `funding_hold_days must be between 0 and ${MAX_FUNDING_HOLD_DAYS}`,
+      };
+    }
     patch[key as MutableSetting] = value;
   }
 
@@ -452,6 +497,102 @@ export function createApp(): Hono<{ Bindings: Env }> {
       return c.json({ count: scans.length, limit, scans });
     } catch (err) {
       return c.json({ error: message(err) }, 500);
+    }
+  });
+
+  // -- funding rates --------------------------------------------------------
+
+  /**
+   * The newest funding board, best net carry first.
+   *
+   * `qualifies` is computed **here**, against the current
+   * `funding_min_annual_pct`, rather than stored on the row: it is a judgement
+   * about a measurement, not part of it, and raising the threshold must
+   * re-classify yesterday's rows rather than leave them claiming an answer to a
+   * question nobody asks any more. The two percentages beside it are the
+   * opposite case — they were computed from the fee rate in force at poll time
+   * and are stored, so retuning `fee_rate` does not rewrite history.
+   *
+   * An empty table answers 200, not 404: "no board yet" is the state of every
+   * deployment for its first few seconds.
+   */
+  app.get("/api/funding", async (c) => {
+    try {
+      await ensureSeeded(c.env.DB);
+      const [rates, settings] = await Promise.all([
+        listLatestFundingRates(c.env.DB),
+        getSettings(c.env.DB),
+      ]);
+
+      const minAnnualPct = settings.funding_min_annual_pct;
+      const shared = {
+        minAnnualPct,
+        holdDays: settings.funding_hold_days,
+        feeRate: settings.fee_rate,
+        pollIntervalMs: FUNDING_POLL_INTERVAL_MS,
+      };
+
+      if (rates.length === 0) {
+        return c.json({
+          ts: null,
+          ageMs: null,
+          stale: false,
+          venue: null,
+          count: 0,
+          ...shared,
+          rates: [],
+        });
+      }
+
+      const ts = rates[0].ts;
+      const ageMs = Date.now() - ts;
+      return c.json({
+        ts,
+        ageMs,
+        stale: ageMs > FUNDING_STALE_MS,
+        venue: rates[0].venue,
+        count: rates.length,
+        ...shared,
+        rates: rates.map((r: FundingRate) => ({
+          ...r,
+          qualifies: r.netAnnualPct >= minAnnualPct,
+        })),
+      });
+    } catch (err) {
+      return c.json({ error: message(err) }, 500);
+    }
+  });
+
+  /** One symbol's funding history, newest first. Unknown symbols are empty. */
+  app.get("/api/funding/history", async (c) => {
+    try {
+      const symbol = (c.req.query("symbol") ?? "").trim().toUpperCase();
+      if (!symbol) return c.json({ error: "symbol is required" }, 400);
+
+      const [fallback, max] = LIMITS.funding;
+      const limit = parseLimit(c.req.query("limit"), fallback, max);
+      const rates = await listFundingRatesForSymbol(c.env.DB, symbol, limit);
+      return c.json({ symbol, count: rates.length, limit, rates });
+    } catch (err) {
+      return c.json({ error: message(err) }, 500);
+    }
+  });
+
+  /**
+   * Poll the board now, bypassing the scan's 5-minute gate.
+   *
+   * Rows land with `scan_id = NULL`: this poll belongs to no scan, and minting
+   * a `scans` row for it would put a scan in the history that never looked at a
+   * single market. 502 rather than 500 when both venues fail — the failure is
+   * upstream, exactly as it is for `/api/tickers`.
+   */
+  app.post("/api/funding/refresh", async (c) => {
+    try {
+      await ensureSeeded(c.env.DB);
+      const { count, venue, ts } = await pollFundingRates(c.env, null);
+      return c.json({ count, venue, ts });
+    } catch (err) {
+      return c.json({ error: message(err) }, 502);
     }
   });
 

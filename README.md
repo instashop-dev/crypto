@@ -2,7 +2,8 @@
 
 A fully serverless paper-trading bot that scans Binance for triangular-arbitrage
 opportunities (e.g. `USDT → BTC → ETH → USDT`) every minute, simulates fills at
-live best bid/ask, and tracks a virtual portfolio. **No real orders are ever
+live best bid/ask, and tracks a virtual portfolio. It also monitors
+cross-exchange spreads and perpetual funding rates. **No real orders are ever
 placed.**
 
 **Live**: https://crypto-arb.thapi.workers.dev
@@ -26,8 +27,15 @@ POST /api/scan ──────────►    │
                       → one paper trade per strategy, if net ≥ its threshold
                       (atomic D1 batch: balance + trade + flags)
                               │
+              api.bybit.com / www.okx.com  ◄── perp funding rates, polled at
+                              │                most every 5 min (gated)
+        [funding]     annualise the next funding rate of all 11 perps, net of
+                      4 legs of fees over the assumed holding period →
+                      persist the whole board (no positions — see below)
+                              │
                               ▼
-        D1 (SQLite): balances · pairs · scans · opportunities · trades · settings
+        D1 (SQLite): balances · pairs · scans · opportunities · trades ·
+                     funding_rates · settings
                               │
                               ▼
         Dashboard (vanilla JS, Workers Assets) — 5s polling
@@ -54,6 +62,9 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `GET /api/opportunities?limit=50` | Ranked cycles and spreads per scan, with per-leg detail. `&strategy=triangular\|cross_exchange` filters; an unknown value is a 400 |
 | `GET /api/trades?limit=50` | Simulated fills. Same `&strategy=` filter |
 | `GET /api/scans?limit=20` | Scan log (trigger, source, duration, errors, spread counts) |
+| `GET /api/funding` | Newest funding board, best net carry first, with `qualifies` judged against the current threshold |
+| `GET /api/funding/history?symbol=BTC&limit=100` | One symbol's rate series, newest first (limit clamped to 500) |
+| `POST /api/funding/refresh` | Poll the perp venues now, bypassing the 5-minute gate. 502 if both venues fail |
 | `GET/PUT /api/settings` | See the settings table below |
 | `POST /api/reset` | Restore balances; `{"wipeHistory": true}` also clears history |
 | `POST /api/admin/refresh-pairs` | Rebuild the tradable-pair cache |
@@ -70,6 +81,8 @@ source produced its data. Full findings: [docs/superpowers/specs/2026-07-30-cryp
 | `tax_rate` | `0.3` | `0`–`0.5` | Section 115BBH rate on gains. Use `0.312` to include the 4% cess. |
 | `xchg_min_profit_pct` | `0.05` | any | Net % a **spread** must beat to fill. **Negative = demo mode**, same as above. Separate from `min_profit_pct` because two legs of fees is a different break-even from three. |
 | `xchg_enabled` | `1` | `0` or `1` | Scan cross-exchange spreads. `0` restores the exact triangles-only scan path (one snapshot, no second REST call). |
+| `funding_min_annual_pct` | `5` | any | Net annualised % a carry must clear to be flagged `qualifies`. **Display only** — every priced row is persisted regardless, and nothing is ever filled. |
+| `funding_hold_days` | `30` | `0 < d ≤ 3650` | Days a carry is assumed held, used to amortise the 4 legs of fees. Changing it re-prices future rows only. |
 
 `initial_usdt` is immutable — it is the denominator of every P&L figure ever
 reported, so moving it would rewrite history rather than change behaviour.
@@ -78,7 +91,7 @@ reported, so moving it would rewrite history rather than change behaviour.
 
 ```bash
 npm install
-npm test                                        # 218 tests: pure engine math +
+npm test                                        # 313 tests: pure engine math +
                                                 # workerd integration (in-memory D1,
                                                 # mocked network)
 npx wrangler d1 migrations apply crypto-arb --local
@@ -225,6 +238,95 @@ executes. On the worked example above, at 100 USDT: base `200.7325`, TDS
 `2.007325`, tax due `0.18953025`, net `0.44223725` — still a ~2% drag on a
 ~0.6% edge, so the conclusion of the India-mode section holds with one leg less.
 
+## Funding-rate carry (cash-and-carry)
+
+The third strategy, and the only one that is **observed rather than simulated**.
+
+A perpetual future has no expiry, so it is tethered to spot by a *funding
+payment* exchanged between longs and shorts every settlement interval (8 hours
+on almost every contract). When the rate is positive, longs pay shorts. Buy the
+asset on the spot market, sell the same size of its perp, and the two price
+exposures cancel: what is left is the funding stream, less the cost of getting
+in and out.
+
+```
+periods    525600 / intervalMinutes                (8h -> 1095 a year)
+annual     rate x periods x 100                     [%, simple, not compounded]
+fees       feeRate x 4                              buy spot, sell perp,
+                                                    sell spot, buy perp back
+drag       fees x (365 / holdingDays) x 100        [%, the round trip annualised]
+net        annual - drag
+```
+
+Worked example — rate `0.0001` per 8h, `fee_rate` 0.1%, held 30 days:
+
+```
+periods    525600 / 480                  = 1095
+annual     0.0001 x 1095 x 100           = 10.95%
+fees       0.001 x 4                     =  0.004      (0.4% of notional)
+drag       0.004 x (365 / 30) x 100      =  4.86666667%
+net        10.95 - 4.86666667            =  6.08333333%
+
+sanity     over the 30 days actually held:
+           10.95 x 30/365 - 0.4          =  0.5% earned
+           0.5 x 365/30                  =  6.08333333%   ✓
+```
+
+Held for a year the same rate nets **10.55%**; held for a *day* it nets
+**−135.05%**, because the 0.4% round trip is then paid 365 times over. Holding
+period is not a detail of this trade, it is most of it.
+
+**Venue chain**, both unauthenticated and both reached with a User-Agent and
+nothing else — the header builder in `src/funding.ts` takes no `Env`, so a
+Binance credential structurally cannot be attached to either:
+
+1. **Bybit v5** `/v5/market/tickers?category=linear` — the whole linear board in
+   one request. It does not carry the settlement interval, so
+   `/v5/market/instruments-info` supplies that separately and is cached for 24h
+   in a `settings` row (same escape hatch as the scan lock). A missing cadence
+   falls back to 8 hours and the row is tagged `interval_source = 'assumed'`,
+   because the annualised figure scales *linearly* with it.
+2. **OKX v5** `/api/v5/public/funding-rate?instId=…` — one request per
+   instrument (11), under `Promise.allSettled`. The cadence is derived from
+   `nextFundingTime − fundingTime`, so the fallback is not a second-class
+   source. Used when Bybit fails or covers under 60% of the universe; if both
+   fail the error names both, exactly as the spot chain's does.
+
+**Cadence and retention.** The board is polled at most every 5 minutes, gated on
+`MAX(ts)` in `funding_rates` — funding settles every 8 hours, so a minutely scan
+has nothing to learn by asking every minute. Rows are kept for **7 days** and
+pruned inside the same `batch()` that writes the new board, so the prune can
+never run without its insert. `POST /api/funding/refresh` bypasses the gate and
+writes rows with `scan_id = NULL`.
+
+**No positions are opened**, on purpose. This repo's paper-execution model is
+atomic — a cycle opens and closes inside one snapshot, against one `balances`
+row — and a carry is held for days. Booking one against that model would report
+a P&L nobody could reconcile, so migration `0004` deliberately adds no positions
+table; the schema is shaped so one can be added later without rewriting these
+rows.
+
+**Disclaimers**, all documented in `src/engine/funding.ts`:
+
+- **The predicted next rate is the dominant error source.** A venue publishes
+  the rate for the *next* settlement only. Annualising it assumes that rate
+  repeats ~1095 times, which it does not: funding mean-reverts, flips sign with
+  sentiment, and the eye-catching numbers are precisely the ones least likely to
+  persist. Treat every percentage here as "what the last observation would pay
+  if it never changed".
+- **Only long-spot / short-perp is modelled.** The mirror needs borrow, and
+  borrow cost is not modelled — negative rows are ranked and reported (they are
+  the finding on the day they happen) but never presented as tradable from the
+  other side.
+- **Basis is ignored** — entry and exit are assumed at the same spot/perp
+  spread, which is where a real carry makes or loses most of its non-funding
+  P&L.
+- **Margin and liquidation are ignored.** The short perp needs collateral, that
+  collateral earns nothing here, and an adverse move large enough to liquidate
+  it is not simulated at all. Slippage and depth are ignored as everywhere else.
+- **Simple returns, 365-day year.** Funding is assumed withdrawn, not
+  reinvested; compounding would raise every figure above.
+
 ## Simplifications (MVP)
 
 - Fills at snapshot best bid/ask; order-book depth, lot-size/notional filters,
@@ -232,9 +334,12 @@ executes. On the worked example above, at 100 USDT: base `200.7325`, TDS
 - Equity = USDT balance (every cycle and every spread returns to USDT).
 - Pair discovery uses MEXC's listing (REST-reachable), which covers 19 of the
   ~38 Binance-listed pairs in the universe — fewer triangles than the full set.
-- Max one paper trade **per strategy** per scan (so at most two).
+- Max one paper trade **per strategy** per scan (so at most two — funding opens
+  no positions at all).
 - Cross-exchange spreads assume pre-positioned inventory: no transfer, no
   withdrawal fee, no latency between the two legs. See the section above.
+- Funding carry is scanned and recorded, never simulated; its annualisation
+  extrapolates a single published rate. See the section above.
 
 ## Architecture decisions
 

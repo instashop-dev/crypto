@@ -19,7 +19,15 @@ import {
 } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { MEXC_BASE, setWsCollector, type WsCollector } from "../src/binance";
-import { ensureSeeded, listScans, listTrades, replacePairs } from "../src/db";
+import { ASSET_UNIVERSE, BASE_ASSET, perpAssets } from "../src/config";
+import {
+  ensureSeeded,
+  listLatestFundingRates,
+  listScans,
+  listTrades,
+  replacePairs,
+} from "../src/db";
+import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import worker from "../src/index";
 import type { BookTickerEntry } from "../src/types";
 
@@ -31,8 +39,30 @@ beforeAll(() => {
   fetchMock.disableNetConnect();
 });
 
+/** A minimal funding board, keeping the cron tick's funding poll off the wire. */
+const serveFundingBoard: FundingFetcher = async (assets) => ({
+  venue: "bybit",
+  ts: Date.now(),
+  quotes: new Map(
+    assets.map((symbol) => [
+      symbol,
+      {
+        venue: "bybit" as const,
+        symbol,
+        instrument: `${symbol}USDT`,
+        rate: 0.0001,
+        intervalMinutes: 480,
+        intervalSource: "api" as const,
+        nextFundingTs: null,
+        markPrice: null,
+      },
+    ]),
+  ),
+});
+
 afterEach(() => {
   setWsCollector(null);
+  setFundingFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -85,6 +115,7 @@ async function tick(): Promise<void> {
 beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
+  setFundingFetcher(serveFundingBoard);
 });
 
 describe("scheduled()", () => {
@@ -181,6 +212,26 @@ describe("scheduled()", () => {
     expect(scan.source).toBeNull();
     expect(scan.executed_count).toBe(0);
     await expect(listTrades(env.DB, 10)).resolves.toHaveLength(0);
+  });
+
+  it("lands a funding board on the same tick as the trade", async () => {
+    serveBook(PROFITABLE);
+
+    await tick();
+
+    // The funding poll runs inside the cron path too, so a deployment nobody
+    // ever opens the dashboard on still builds the rate history.
+    const rates = await listLatestFundingRates(env.DB);
+    expect(rates).toHaveLength(perpAssets(ASSET_UNIVERSE, BASE_ASSET).length);
+    expect(rates.every((r) => r.venue === "bybit")).toBe(true);
+    expect(rates[0].annualizedPct).toBeCloseTo(10.95, 8);
+    expect(rates[0].netAnnualPct).toBeCloseTo(6.08333333, 6);
+
+    const [scan] = await listScans(env.DB, 10);
+    const { results } = await env.DB.prepare(
+      "SELECT DISTINCT scan_id FROM funding_rates",
+    ).all<{ scan_id: number | null }>();
+    expect(results).toEqual([{ scan_id: scan.id }]);
   });
 
   it("releases the lock so the next tick scans again", async () => {

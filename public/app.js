@@ -89,6 +89,25 @@
     return d.toLocaleTimeString("en-GB", { hour12: false });
   }
 
+  /**
+   * `"7h 42m"`, `"42m 10s"`, `"38s"` — time remaining, counting down.
+   *
+   * Recomputed from the stored timestamp on every 5s poll rather than driven by
+   * a timer of its own: a second interval would add a second thing that can
+   * drift, for a figure nobody reads to the second. Past due reads `"due"`,
+   * because a settlement that has already fired is not a negative wait.
+   */
+  function fmtCountdown(ms) {
+    if (!isNum(ms)) return "—";
+    if (ms <= 0) return "due";
+    const secs = Math.floor(ms / 1000);
+    const hours = Math.floor(secs / 3600);
+    const mins = Math.floor((secs % 3600) / 60);
+    if (hours > 0) return hours + "h " + mins + "m";
+    if (mins > 0) return mins + "m " + (secs % 60) + "s";
+    return secs + "s";
+  }
+
   /** `"42s ago"`, `"5m ago"`, `"2h ago"`, `"3d ago"`. */
   function fmtRelative(ts, now = Date.now()) {
     if (!isNum(ts)) return "—";
@@ -166,6 +185,7 @@
   /** Columns in the opportunities and scans tables. Fixed, unlike trades. */
   const OPPS_COLS = 7;
   const SCANS_COLS = 10;
+  const FUNDING_COLS = 8;
 
   function setIndiaMode(on) {
     indiaMode = Boolean(on);
@@ -554,6 +574,103 @@
       .join("");
   }
 
+  /**
+   * The funding board.
+   *
+   * `qualifies` arrives from the server, already judged against the *current*
+   * threshold, so the badge never disagrees with the settings panel next to it.
+   * Everything else the row shows is stored, including the interval — which is
+   * flagged when it was assumed rather than published, because the annualised
+   * column scales linearly with it.
+   */
+  function renderFunding(data) {
+    const body = $("funding-body");
+    const note = $("funding-note");
+    const rates = Array.isArray(data.rates) ? data.rates : [];
+
+    if (rates.length === 0) {
+      placeholder(body, FUNDING_COLS, "No funding rates yet — run a scan.");
+      note.textContent = "—";
+      note.classList.remove("bad");
+      return;
+    }
+
+    const now = Date.now();
+    body.innerHTML = rates
+      .map((r) => {
+        const assumed = r.intervalSource !== "api";
+        const hours = isNum(r.intervalMinutes) ? r.intervalMinutes / 60 : NaN;
+        const interval = isNum(hours)
+          ? (Number.isInteger(hours) ? hours : Number(hours.toFixed(2))) + "h"
+          : "—";
+        const countdown = isNum(r.nextFundingTs)
+          ? fmtCountdown(r.nextFundingTs - now)
+          : "—";
+
+        return (
+          '<tr class="data-row">' +
+          '<td class="mono"><span title="' +
+          esc(r.instrument || r.symbol) +
+          '">' +
+          esc(r.symbol) +
+          "</span></td>" +
+          '<td class="mono">' +
+          esc(r.venue) +
+          "</td>" +
+          // The per-interval rate itself, in percent: 0.0001 -> +0.0100%.
+          '<td class="right num ' +
+          signClass(r.rate) +
+          '">' +
+          fmtPct(isNum(r.rate) ? r.rate * 100 : NaN, 4) +
+          "</td>" +
+          '<td class="right num nowrap">' +
+          (assumed
+            ? '<span class="ago" title="Assumed — this venue did not publish a' +
+              ' settlement interval, so the annualised figures below scale off a' +
+              ' guess.">' +
+              esc(interval) +
+              " *</span>"
+            : esc(interval)) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(r.annualizedPct) +
+          '">' +
+          fmtPct(r.annualizedPct, 2) +
+          "</td>" +
+          '<td class="right num ' +
+          signClass(r.netAnnualPct) +
+          '">' +
+          fmtPct(r.netAnnualPct, 2) +
+          "</td>" +
+          '<td class="right num nowrap">' +
+          esc(countdown) +
+          "</td>" +
+          "<td>" +
+          (r.qualifies
+            ? '<span class="tag tag-exec">qualifies</span>'
+            : '<span class="tag tag-skip">—</span>') +
+          "</td>" +
+          "</tr>"
+        );
+      })
+      .join("");
+
+    const venue = data.venue ? esc(data.venue) : "unknown";
+    const age = isNum(data.ts) ? fmtRelative(data.ts, now) : "—";
+    note.textContent =
+      venue +
+      " · " +
+      rates.length +
+      " perps · min " +
+      (isNum(data.minAnnualPct) ? data.minAnnualPct : "—") +
+      "% · " +
+      (isNum(data.holdDays) ? data.holdDays : "—") +
+      "d hold · updated " +
+      age +
+      (data.stale ? " (stale)" : "");
+    note.classList.toggle("bad", Boolean(data.stale));
+  }
+
   /** Header badge + age line, both driven by the newest scan row. */
   function renderStatus(scans) {
     const badge = $("source-badge");
@@ -595,6 +712,8 @@
     tax_rate: "set-tax-rate",
     xchg_min_profit_pct: "set-xchg-min-profit",
     xchg_enabled: "set-xchg-enabled",
+    funding_min_annual_pct: "set-funding-min",
+    funding_hold_days: "set-funding-hold",
   };
 
   function applySettings(s) {
@@ -618,6 +737,11 @@
       " USDT · fee " +
       s.fee_rate +
       (s.xchg_enabled ? " · x-chg min " + s.xchg_min_profit_pct + "%" : " · x-chg off") +
+      " · carry min " +
+      s.funding_min_annual_pct +
+      "%/" +
+      s.funding_hold_days +
+      "d" +
       (s.india_mode ? " · india " + s.tds_rate + "/" + s.tax_rate : "");
     settingsError("");
   }
@@ -704,6 +828,18 @@
             " spreads · best " +
             bestSpread +
             (r.xchgExecuted ? " · spread trade executed" : "");
+        // The funding half is polled on its own cadence, so it reports either a
+        // fresh board, a deliberate skip, or its own upstream failure.
+        const funding = r.fundingError
+          ? " · funding unavailable (" + r.fundingError + ")"
+          : r.fundingSkipped
+            ? " · funding not due"
+            : " · " +
+              (r.fundingCount || 0) +
+              " perps · best carry " +
+              (isNum(r.bestFundingNetAnnualPct)
+                ? fmtPct(r.bestFundingNetAnnualPct, 2)
+                : "n/a");
         toast(
           "Scan " +
             (r.source || "unknown") +
@@ -714,6 +850,7 @@
             (r.executed ? " · trade executed" : "") +
             tax +
             spreads +
+            funding +
             " · " +
             r.durationMs +
             "ms",
@@ -763,13 +900,14 @@
     if (inFlight) return;
     inFlight = true;
     try {
-      const [portfolio, opps, trades, scans] = await Promise.allSettled([
+      const [portfolio, opps, funding, trades, scans] = await Promise.allSettled([
         getJson("/api/portfolio"),
         getJson(
           "/api/opportunities?limit=" +
             OPPS_LIMIT +
             (oppsStrategy ? "&strategy=" + encodeURIComponent(oppsStrategy) : ""),
         ),
+        getJson("/api/funding"),
         getJson("/api/trades?limit=" + TRADES_LIMIT),
         getJson("/api/scans?limit=" + SCANS_LIMIT),
       ]);
@@ -786,6 +924,21 @@
           "unavailable — " + opps.reason.message,
           false,
         );
+      }
+
+      // One dead route degrades exactly one panel: the funding board is a
+      // separate upstream from the spot venues and fails independently of them.
+      if (funding.status === "fulfilled") {
+        renderFunding(funding.value || {});
+      } else {
+        placeholder(
+          $("funding-body"),
+          FUNDING_COLS,
+          "unavailable — " + funding.reason.message,
+          false,
+        );
+        $("funding-note").textContent = "unavailable";
+        $("funding-note").classList.add("bad");
       }
 
       if (trades.status === "fulfilled") {

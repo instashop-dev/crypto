@@ -23,6 +23,7 @@ import {
   SETTING_KEYS,
   updateSettings,
 } from "../src/db";
+import { setFundingFetcher, type FundingFetcher } from "../src/funding";
 import { runScan } from "../src/scan";
 import type { BookTickerEntry } from "../src/types";
 
@@ -33,8 +34,37 @@ beforeAll(() => {
   fetchMock.disableNetConnect();
 });
 
+/**
+ * A minimal funding board.
+ *
+ * Every scan now polls funding as well as arbitrage, so the perp venues need a
+ * seam here for exactly the reason the spot venues do: without one the poll
+ * would reach for the network. Nothing in this file asserts on funding — the
+ * stub exists so that the arbitrage assertions below stay about arbitrage.
+ */
+const serveFundingBoard: FundingFetcher = async (assets) => ({
+  venue: "bybit",
+  ts: Date.now(),
+  quotes: new Map(
+    assets.map((symbol) => [
+      symbol,
+      {
+        venue: "bybit" as const,
+        symbol,
+        instrument: `${symbol}USDT`,
+        rate: 0.0001,
+        intervalMinutes: 480,
+        intervalSource: "api" as const,
+        nextFundingTs: null,
+        markPrice: null,
+      },
+    ]),
+  ),
+});
+
 afterEach(() => {
   setWsCollector(null);
+  setFundingFetcher(null);
   fetchMock.assertNoPendingInterceptors();
 });
 
@@ -98,6 +128,7 @@ function serveBook(snapshot: Map<string, BookTickerEntry>): void {
 beforeEach(async () => {
   await ensureSeeded(env.DB);
   await replacePairs(env.DB, PAIRS, "test");
+  setFundingFetcher(serveFundingBoard);
 });
 
 describe("ensureSeeded", () => {
