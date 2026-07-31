@@ -37,6 +37,17 @@ CF; confirm on the first production scan after deploy by checking
 `GET /api/funding` reports `venue: "bybit"` (fallback engaged or a thrown
 funding error would surface as `venue: "okx"` / a stale board).
 
+**Production result (2026-07-31, post-deploy):** `GET /api/funding`
+reports `venue: "okx"` — Bybit joins Binance REST in the
+blocked-from-Workers-egress column despite the 2026-07-30 probe, and the
+fallback chain engaged on the first cron scan with a full 11-row board,
+`interval_source: "api"` throughout (intervals derived from OKX
+funding-time deltas). Treat OKX as the de-facto primary in production;
+Bybit remains first in the chain in case reachability differs by colo or
+returns. The same scan also recorded `xchg_error: "binance-ws: ...
+(HTTP 451)"` with `scans.error` null and a clean `mexc-rest` triangular
+pass — the per-strategy degradation isolation working live.
+
 ## Multi-instId OKX batching
 
 Not attempted (primary sufficed). The per-instrument fan-out (11 calls
