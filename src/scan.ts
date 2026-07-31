@@ -19,9 +19,16 @@ import {
   SCAN_LOCK_KEY,
   setRawSetting,
   deleteRawSetting,
+  toTaxPolicy,
+  type OpportunityInput,
   type PairRow,
 } from "./db";
-import { rankOpportunities, simulateExecution } from "./engine";
+import {
+  computeTradeTax,
+  quoteTax,
+  rankOpportunities,
+  simulateExecution,
+} from "./engine";
 import type { Env, PairInfo, SnapshotSource } from "./types";
 
 /** How many ranked cycles are kept per scan. */
@@ -56,6 +63,8 @@ export interface ScanResult {
   error?: string;
   /** Set when an overlapping scan held the lock. */
   skipped?: boolean;
+  /** India-mode figures for the executed trade; absent when the mode is off. */
+  tax?: { tdsWithheld: number; taxDue: number; netProfit: number };
 }
 
 /** Injection seams. Production passes nothing; tests override the clock. */
@@ -151,9 +160,11 @@ export async function runScan(
   let executed = false;
   let tradeId: number | undefined;
   let error: string | null = null;
+  let tax: ScanResult["tax"];
 
   try {
     const settings = await getSettings(db);
+    const policy = toTaxPolicy(settings);
 
     const pairs = await loadPairs(env, deps);
     pairsCount = pairs.length;
@@ -175,7 +186,25 @@ export async function runScan(
     bestNetPct = quotes.length > 0 ? quotes[0].netPct : null;
 
     const top = quotes.slice(0, OPPORTUNITIES_PER_SCAN);
-    const opportunityIds = await insertOpportunities(db, scanId, top, snapshot.ts);
+    // Mapped explicitly rather than passing the quotes through: the persisted
+    // shape now carries india-mode columns the engine knows nothing about, and
+    // a structural pass-through would silently stop persisting them the moment
+    // either shape moved. When the mode is off the columns stay SQL NULL, so
+    // "not measured" never masquerades as "measured as zero".
+    const rows: OpportunityInput[] = top.map((q) => {
+      const figures = policy.enabled
+        ? quoteTax(q, snapshot.book, settings.fee_rate, BASE_ASSET, policy)
+        : null;
+      return {
+        cycle: q.cycle,
+        grossPct: q.grossPct,
+        netPct: q.netPct,
+        legs: q.legs,
+        indiaNetPct: figures?.indiaNetPct ?? null,
+        tdsPct: figures?.tdsPct ?? null,
+      };
+    });
+    const opportunityIds = await insertOpportunities(db, scanId, rows, snapshot.ts);
 
     const best = top[0];
     // A negative threshold means demo mode: fill the best cycle uncondition-
@@ -194,14 +223,40 @@ export async function runScan(
           settings.trade_size_usdt,
         );
         if (simulated) {
-          tradeId = await commitTrade(db, {
-            scanId,
-            opportunityId: opportunityIds[0] ?? null,
-            trade: simulated,
-            source: snapshot.source,
-            ts: snapshot.ts,
-          });
-          executed = true;
+          // Re-priced from the triangle, never from `simulated.legs`: those
+          // amounts are round8-quantised for reporting and would poison the
+          // TDS base (see the precision note in src/engine/tax.ts).
+          const breakdown = policy.enabled
+            ? computeTradeTax(
+                best.triangle,
+                snapshot.book,
+                settings.fee_rate,
+                settings.trade_size_usdt,
+                BASE_ASSET,
+                policy,
+              )
+            : null;
+          // Unpriceable tax under an enabled policy is a skip, exactly like an
+          // unpriceable re-simulation: booking a fill whose withholding we
+          // could not compute would corrupt the very P&L this mode reports.
+          if (breakdown || !policy.enabled) {
+            tradeId = await commitTrade(db, {
+              scanId,
+              opportunityId: opportunityIds[0] ?? null,
+              trade: simulated,
+              source: snapshot.source,
+              ts: snapshot.ts,
+              ...(breakdown ? { tax: breakdown } : {}),
+            });
+            executed = true;
+            if (breakdown) {
+              tax = {
+                tdsWithheld: breakdown.tdsWithheld,
+                taxDue: breakdown.taxDue,
+                netProfit: breakdown.netProfit,
+              };
+            }
+          }
         }
       }
     }
@@ -241,5 +296,6 @@ export async function runScan(
     ...(tradeId != null ? { tradeId } : {}),
     durationMs,
     ...(error != null ? { error } : {}),
+    ...(tax != null ? { tax } : {}),
   };
 }

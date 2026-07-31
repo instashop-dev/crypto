@@ -12,12 +12,15 @@ import {
   getBalance,
   getBalances,
   getSettings,
+  getTaxTotals,
   listOpportunities,
+  listOpportunitiesForScan,
   listScans,
   listTrades,
   replacePairs,
   setRawSetting,
   SCAN_LOCK_KEY,
+  SETTING_KEYS,
   updateSettings,
 } from "../src/db";
 import { runScan } from "../src/scan";
@@ -363,6 +366,238 @@ describe("runScan - failures", () => {
 
     expect(second.skipped).toBeUndefined();
     expect(second.executed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// India mode
+// ---------------------------------------------------------------------------
+//
+// The arithmetic is derived in test/tax.test.ts; only the persistence and the
+// balance effects are re-checked here. On the PROFITABLE book at a 100 USDT
+// notional, 1% TDS and 30% tax:
+//
+//   profit      +1.6943059     tdsBase   301.679452
+//   tdsWithheld  3.01679452    taxDue      0.50829177
+//   netProfit    1.18601413    cash effect profit - tds = -1.32248862
+const TDS_WITHHELD = 3.01679452;
+const TAX_DUE = 0.50829177;
+const NET_PROFIT = 1.18601413;
+const CASH_EFFECT = -1.32248862;
+
+/** Raw trade row, so the stored columns are checked rather than the mapping. */
+async function tradeRow(): Promise<Record<string, number | null>> {
+  const row = await env.DB.prepare(
+    "SELECT profit, net_profit, tds_base, tds_withheld, tax_due, tds_rate, tax_rate" +
+      " FROM trades ORDER BY id DESC LIMIT 1",
+  ).first<Record<string, number | null>>();
+  if (!row) throw new Error("no trade row");
+  return row;
+}
+
+describe("runScan - india mode off (regression)", () => {
+  it("books exactly the pre-Phase-8 numbers and zeroed tax columns", async () => {
+    serveBook(PROFITABLE);
+    expect((await getSettings(env.DB)).india_mode).toBe(0);
+
+    const result = await runScan(env, "manual");
+
+    // Byte-identical to the untaxed assertions higher up this file.
+    expect(result.executed).toBe(true);
+    expect(result.tax).toBeUndefined();
+
+    const [trade] = await listTrades(env.DB, 1);
+    expect(trade.profit).toBeCloseTo(EXPECTED_PROFIT, 8);
+    expect(trade.endAmount).toBeCloseTo(101.694305898, 6);
+    expect(trade.profitPct).toBeCloseTo(EXPECTED_NET_PCT, 6);
+    await expect(getBalance(env.DB, "USDT")).resolves.toBeCloseTo(
+      DEFAULTS.initial_usdt + EXPECTED_PROFIT,
+      8,
+    );
+
+    // No withholding, no charge, and net profit falls back to gross.
+    const row = await tradeRow();
+    expect(row.tds_base).toBe(0);
+    expect(row.tds_withheld).toBe(0);
+    expect(row.tax_due).toBe(0);
+    expect(row.tds_rate).toBe(0);
+    expect(row.tax_rate).toBe(0);
+    expect(row.net_profit).toBe(row.profit);
+    expect(trade.netProfit).toBe(trade.profit);
+    expect(trade.netProfitPct).toBeCloseTo(trade.profitPct, 6);
+  });
+});
+
+describe("runScan - india mode on", () => {
+  beforeEach(async () => {
+    await updateSettings(env.DB, { india_mode: 1 });
+  });
+
+  it("withholds TDS from the balance and stores the full breakdown", async () => {
+    serveBook(PROFITABLE);
+
+    const result = await runScan(env, "manual");
+
+    expect(result.executed).toBe(true);
+    expect(result.tax).toEqual({
+      tdsWithheld: TDS_WITHHELD,
+      taxDue: TAX_DUE,
+      netProfit: NET_PROFIT,
+    });
+
+    // The trade itself is untouched: india mode is a reporting overlay, so the
+    // chain still ends at 101.6943059 and still reports +1.694305898%.
+    const [trade] = await listTrades(env.DB, 1);
+    expect(trade.profit).toBeCloseTo(EXPECTED_PROFIT, 8);
+    expect(trade.profitPct).toBeCloseTo(EXPECTED_NET_PCT, 6);
+
+    expect(trade.tdsWithheld).toBe(TDS_WITHHELD);
+    expect(trade.taxDue).toBe(TAX_DUE);
+    expect(trade.netProfit).toBe(NET_PROFIT);
+    expect(trade.tdsBase).toBeCloseTo(301.679452, 8);
+    expect(trade.tdsRate).toBe(0.01);
+    expect(trade.taxRate).toBe(0.3);
+
+    // The headline: a +1.69% cycle *loses* cash once 1%/leg is withheld.
+    const balance = await getBalance(env.DB, "USDT");
+    expect(balance - DEFAULTS.initial_usdt).toBeCloseTo(CASH_EFFECT, 8);
+    expect(balance).toBeLessThan(DEFAULTS.initial_usdt);
+    expect(balance - DEFAULTS.initial_usdt).toBeCloseTo(trade.profit - TDS_WITHHELD, 8);
+  });
+
+  it("still withholds on a losing cycle, and charges no tax on it", async () => {
+    serveBook(UNPROFITABLE);
+    await updateSettings(env.DB, { min_profit_pct: -100 });
+
+    const result = await runScan(env, "manual");
+    expect(result.executed).toBe(true);
+
+    const [trade] = await listTrades(env.DB, 1);
+    expect(trade.profit).toBeLessThan(0);
+    // 115BBH allows no loss offset, so a loss simply owes nothing.
+    expect(trade.taxDue).toBe(0);
+    expect(trade.netProfit).toBe(trade.profit);
+    // ...but 194S is on turnover, so cash still leaves. Three legs of a ~100
+    // USDT cycle are ~300 USDT of consideration, whatever the cycle did.
+    expect(trade.tdsWithheld).toBeGreaterThan(0);
+    expect(trade.tdsBase / trade.startAmount).toBeGreaterThan(2.99);
+    expect(trade.tdsWithheld).toBeCloseTo(trade.tdsBase * 0.01, 8);
+    // The withholding dwarfs the trading loss it sits on top of.
+    expect(trade.tdsWithheld).toBeGreaterThan(Math.abs(trade.profit));
+
+    const balance = await getBalance(env.DB, "USDT");
+    expect(balance - DEFAULTS.initial_usdt).toBeCloseTo(
+      trade.profit - trade.tdsWithheld,
+      8,
+    );
+    expect(DEFAULTS.initial_usdt - balance).toBeCloseTo(
+      Math.abs(trade.profit) + trade.tdsWithheld,
+      8,
+    );
+  });
+
+  it("snapshots the rates in force, so retuning cannot rewrite history", async () => {
+    serveBook(PROFITABLE);
+    await runScan(env, "manual");
+
+    await updateSettings(env.DB, { tds_rate: 0.05, tax_rate: 0.5 });
+
+    const row = await tradeRow();
+    expect(row.tds_rate).toBe(0.01);
+    expect(row.tax_rate).toBe(0.3);
+    expect(row.tds_withheld).toBe(TDS_WITHHELD);
+    expect(row.tax_due).toBe(TAX_DUE);
+  });
+
+  it("attaches per-opportunity figures, and leaves them NULL when off", async () => {
+    serveBook(PROFITABLE);
+    const on = await runScan(env, "manual");
+
+    // Ordered by net_pct, so [0] is the cycle that was actually filled.
+    const ranked = await listOpportunitiesForScan(env.DB, on.scanId!);
+    expect(ranked).toHaveLength(2);
+    const [best] = ranked;
+    expect(best.cycle).toBe("USDT>BTC>ETH>USDT");
+    expect(best.executed).toBe(true);
+
+    // netPct x (1 - 0.3), and ~3.02% of notional withheld per cycle.
+    expect(best.indiaNetPct).toBeCloseTo(best.netPct * 0.7, 8);
+    expect(best.tdsPct).toBeCloseTo(3.01679452, 8);
+    // The TDS drag alone is ~1.8x the whole edge, on the *best* cycle here.
+    expect(best.tdsPct!).toBeGreaterThan(best.netPct);
+    // Every persisted row carries the figures, not just the executed one.
+    expect(ranked.every((o) => o.indiaNetPct !== null && o.tdsPct !== null)).toBe(true);
+    // The transform is order-preserving: ranking did not move.
+    expect(ranked[0].indiaNetPct!).toBeGreaterThan(ranked[1].indiaNetPct!);
+
+    // Turn the mode off and the columns go back to "not measured".
+    await updateSettings(env.DB, { india_mode: 0 });
+    serveBook(PROFITABLE);
+    const off = await runScan(env, "cron");
+
+    const later = await listOpportunitiesForScan(env.DB, off.scanId!);
+    expect(later).toHaveLength(2);
+    expect(later.every((o) => o.indiaNetPct === null && o.tdsPct === null)).toBe(true);
+    expect(later[0].netPct).toBeCloseTo(EXPECTED_NET_PCT, 6);
+  });
+
+  it("keeps the accounting identity across two scans", async () => {
+    serveBook(PROFITABLE);
+    await runScan(env, "manual");
+    await runScan(env, "cron");
+
+    const totals = await getTaxTotals(env.DB);
+    expect(totals.trades).toBe(2);
+    expect(totals.profitableTrades).toBe(2);
+
+    const equity = await getBalance(env.DB, "USDT");
+    // equity already has TDS withheld and no tax paid, so adding back the
+    // receivable and deducting the liability must land on the economic result.
+    expect(equity + totals.tdsWithheld - totals.taxDue).toBeCloseTo(
+      DEFAULTS.initial_usdt + totals.netProfit,
+      8,
+    );
+    expect(totals.netProfit).toBeCloseTo(NET_PROFIT * 2, 8);
+    expect(totals.tdsWithheld).toBeCloseTo(TDS_WITHHELD * 2, 8);
+    expect(totals.grossProfit).toBeCloseTo(EXPECTED_PROFIT * 2, 6);
+  });
+
+  it("does not move the execution gate", async () => {
+    // The gate is `netPct >= min_profit_pct` on the pre-tax figure, exactly as
+    // with the mode off: india mode reports on fills, it does not veto them.
+    serveBook(PROFITABLE);
+    const yes = await runScan(env, "manual");
+    expect(yes.executed).toBe(true);
+
+    serveBook(UNPROFITABLE);
+    const no = await runScan(env, "cron");
+    expect(no.executed).toBe(false);
+    expect(no.tax).toBeUndefined();
+    await expect(listTrades(env.DB, 50)).resolves.toHaveLength(1);
+  });
+});
+
+describe("ensureSeeded - india-mode settings", () => {
+  it("back-fills the new keys without disturbing the tuned ones", async () => {
+    await updateSettings(env.DB, { min_profit_pct: -2 });
+    for (const key of ["india_mode", "tds_rate", "tax_rate"]) {
+      await env.DB.prepare("DELETE FROM settings WHERE key = ?1").bind(key).run();
+    }
+
+    await ensureSeeded(env.DB);
+
+    const settings = await getSettings(env.DB);
+    expect(settings.india_mode).toBe(DEFAULTS.india_mode);
+    expect(settings.tds_rate).toBe(DEFAULTS.tds_rate);
+    expect(settings.tax_rate).toBe(DEFAULTS.tax_rate);
+    expect(settings.min_profit_pct).toBe(-2);
+
+    // Every declared key is materialised, so a later reader never has to guess.
+    const { results } = await env.DB.prepare(
+      "SELECT key FROM settings ORDER BY key",
+    ).all<{ key: string }>();
+    const stored = new Set(results.map((r) => r.key));
+    for (const key of SETTING_KEYS) expect(stored.has(key)).toBe(true);
   });
 });
 

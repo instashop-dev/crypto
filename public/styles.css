@@ -381,6 +381,20 @@ main {
   color: var(--fg-muted);
 }
 
+/*
+ * The india-mode row sits directly under the main stats and is a *different*
+ * accounting view of the same portfolio, so it gets a rule above it to stop the
+ * two grids reading as one eight-cell block. `hidden` has to be restored here
+ * because `display: grid` on .stats would otherwise win over the UA default.
+ */
+#tax-stats {
+  border-top: 1px solid var(--border-strong);
+}
+
+#tax-stats[hidden] {
+  display: none;
+}
+
 .up {
   color: var(--up);
 }
@@ -452,6 +466,35 @@ main {
 
 .input:disabled {
   opacity: 0.5;
+}
+
+/*
+ * A checkbox field has no full-width control to align to, so the box and its
+ * hint sit on one baseline row and the field itself absorbs the height a text
+ * input would have occupied — otherwise the grid cell collapses and the label
+ * drifts out of line with its neighbours.
+ */
+.field-check {
+  justify-content: flex-start;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.15rem;
+}
+
+.input-check {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.check-row .field-hint {
+  min-width: 0;
 }
 
 .hint {

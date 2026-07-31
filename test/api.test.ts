@@ -113,11 +113,27 @@ async function seedHistory(ts: number, profit: number): Promise<number> {
   return scanId;
 }
 
+interface PortfolioTaxBody {
+  indiaMode: boolean;
+  tdsRate: number;
+  taxRate: number;
+  grossProfitUsdt: number;
+  tdsWithheldUsdt: number;
+  taxDueUsdt: number;
+  netProfitUsdt: number;
+  tdsReceivableUsdt: number;
+  taxLiabilityUsdt: number;
+  netEquityUsdt: number;
+  trades: number;
+  profitableTrades: number;
+}
+
 interface PortfolioBody {
   balances: Array<{ asset: string; amount: number }>;
   equityUsdt: number;
   pnl: { absUsdt: number; pct: number };
   initialUsdt: number;
+  tax: PortfolioTaxBody;
 }
 
 describe("GET /api/portfolio", () => {
@@ -355,6 +371,255 @@ describe("GET|PUT /api/settings", () => {
       DEFAULTS.initial_usdt + EXPECTED_PROFIT * 2,
       6,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// India mode over HTTP
+// ---------------------------------------------------------------------------
+//
+// Figures derived in test/tax.test.ts; on the PROFITABLE book at 100 USDT:
+//   gross +1.6943059  tds 3.01679452  tax 0.50829177  net 1.18601413
+const TDS_WITHHELD = 3.01679452;
+const TAX_DUE = 0.50829177;
+const NET_PROFIT = 1.18601413;
+
+async function portfolio(): Promise<PortfolioBody> {
+  return (await (await get("/api/portfolio")).json()) as PortfolioBody;
+}
+
+describe("PUT /api/settings - india mode", () => {
+  it("exposes the three new tunables among the seeded defaults", async () => {
+    const body = (await (await get("/api/settings")).json()) as Record<string, number>;
+    expect(body).toEqual({ ...DEFAULTS });
+    expect(body.india_mode).toBe(0);
+    expect(body.tds_rate).toBe(0.01);
+    expect(body.tax_rate).toBe(0.3);
+  });
+
+  it("accepts india_mode 1 and india_mode 0", async () => {
+    const on = await send("/api/settings", "PUT", { india_mode: 1 });
+    expect(on.status).toBe(200);
+    await expect(on.json()).resolves.toMatchObject({ india_mode: 1 });
+
+    const off = await send("/api/settings", "PUT", { india_mode: 0 });
+    expect(off.status).toBe(200);
+    await expect(getSettings(env.DB)).resolves.toMatchObject({ india_mode: 0 });
+  });
+
+  it("rejects an india_mode that is not exactly 0 or 1", async () => {
+    for (const value of [2, 0.5, -1]) {
+      const res = await send("/api/settings", "PUT", { india_mode: value });
+      expect(res.status, String(value)).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("india_mode must be 0 or 1");
+    }
+    // Nothing was persisted by any of the rejected attempts.
+    await expect(getSettings(env.DB)).resolves.toMatchObject({ india_mode: 0 });
+  });
+
+  it("clamps tds_rate to [0, 0.05]", async () => {
+    await expect(
+      send("/api/settings", "PUT", { tds_rate: 0.06 }).then((r) => r.status),
+    ).resolves.toBe(400);
+    await expect(
+      send("/api/settings", "PUT", { tds_rate: -0.001 }).then((r) => r.status),
+    ).resolves.toBe(400);
+    await expect(getSettings(env.DB)).resolves.toMatchObject({
+      tds_rate: DEFAULTS.tds_rate,
+    });
+
+    const ok = await send("/api/settings", "PUT", { tds_rate: 0.05 });
+    expect(ok.status).toBe(200);
+    await expect(ok.json()).resolves.toMatchObject({ tds_rate: 0.05 });
+  });
+
+  it("clamps tax_rate to [0, 0.5] and allows the cess-inclusive 31.2%", async () => {
+    const tooHigh = await send("/api/settings", "PUT", { tax_rate: 0.6 });
+    expect(tooHigh.status).toBe(400);
+    const body = (await tooHigh.json()) as { error: string };
+    expect(body.error).toContain("tax_rate");
+
+    const cess = await send("/api/settings", "PUT", { tax_rate: 0.312 });
+    expect(cess.status).toBe(200);
+    await expect(cess.json()).resolves.toMatchObject({ tax_rate: 0.312 });
+  });
+});
+
+describe("GET /api/portfolio - tax block", () => {
+  it("reports an inert tax block on a fresh portfolio", async () => {
+    const body = await portfolio();
+
+    expect(body.tax.indiaMode).toBe(false);
+    expect(body.tax.tdsRate).toBe(DEFAULTS.tds_rate);
+    expect(body.tax.taxRate).toBe(DEFAULTS.tax_rate);
+    expect(body.tax.grossProfitUsdt).toBe(0);
+    expect(body.tax.tdsWithheldUsdt).toBe(0);
+    expect(body.tax.taxDueUsdt).toBe(0);
+    expect(body.tax.netProfitUsdt).toBe(0);
+    expect(body.tax.trades).toBe(0);
+    expect(body.tax.profitableTrades).toBe(0);
+
+    // With nothing withheld and nothing owed, net equity is just equity.
+    expect(body.tax.netEquityUsdt).toBe(body.equityUsdt);
+    // The pre-Phase-8 fields keep their exact meaning.
+    expect(body.equityUsdt).toBe(DEFAULTS.initial_usdt);
+    expect(body.pnl).toEqual({ absUsdt: 0, pct: 0 });
+  });
+
+  it("reports the worked figures after an india-mode scan", async () => {
+    await send("/api/settings", "PUT", { india_mode: 1 });
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+
+    const body = await portfolio();
+
+    expect(body.tax.indiaMode).toBe(true);
+    expect(body.tax.trades).toBe(1);
+    expect(body.tax.profitableTrades).toBe(1);
+    expect(body.tax.grossProfitUsdt).toBeCloseTo(EXPECTED_PROFIT, 6);
+    expect(body.tax.tdsWithheldUsdt).toBeCloseTo(TDS_WITHHELD, 8);
+    expect(body.tax.taxDueUsdt).toBeCloseTo(TAX_DUE, 8);
+    expect(body.tax.netProfitUsdt).toBeCloseTo(NET_PROFIT, 8);
+
+    // Cash-flow names and balance-sheet names for the same two figures.
+    expect(body.tax.tdsReceivableUsdt).toBe(body.tax.tdsWithheldUsdt);
+    expect(body.tax.taxLiabilityUsdt).toBe(body.tax.taxDueUsdt);
+
+    // Equity is the cash view: TDS already gone, so a winning cycle is down.
+    expect(body.equityUsdt).toBeCloseTo(
+      DEFAULTS.initial_usdt + EXPECTED_PROFIT - TDS_WITHHELD,
+      8,
+    );
+    expect(body.pnl.absUsdt).toBeLessThan(0);
+
+    // Net equity settles the receivable against the liability.
+    expect(body.tax.netEquityUsdt).toBeCloseTo(
+      body.equityUsdt + body.tax.tdsWithheldUsdt - body.tax.taxDueUsdt,
+      8,
+    );
+    expect(body.tax.netEquityUsdt).toBeCloseTo(
+      DEFAULTS.initial_usdt + NET_PROFIT,
+      8,
+    );
+  });
+
+  it("zeroes the tax totals on reset", async () => {
+    await send("/api/settings", "PUT", { india_mode: 1 });
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+    expect((await portfolio()).tax.tdsWithheldUsdt).toBeGreaterThan(0);
+
+    const res = await send("/api/reset", "POST");
+    const body = (await res.json()) as PortfolioBody;
+
+    expect(body.tax.trades).toBe(0);
+    expect(body.tax.tdsWithheldUsdt).toBe(0);
+    expect(body.tax.taxDueUsdt).toBe(0);
+    expect(body.tax.netProfitUsdt).toBe(0);
+    expect(body.tax.netEquityUsdt).toBe(DEFAULTS.initial_usdt);
+    // The mode itself is a setting, and settings survive a reset.
+    expect(body.tax.indiaMode).toBe(true);
+  });
+});
+
+describe("history listings - tax fields", () => {
+  it("exposes the tax columns on trades, falling back for untaxed rows", async () => {
+    await send("/api/settings", "PUT", { india_mode: 1 });
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+    // An insert that carries no tax at all, as every pre-Phase-8 row does.
+    await seedHistory(3_000, 5);
+
+    const body = (await (await get("/api/trades")).json()) as {
+      trades: Array<{
+        ts: number;
+        profit: number;
+        netProfit: number;
+        netProfitPct: number;
+        tdsBase: number;
+        tdsWithheld: number;
+        taxDue: number;
+        tdsRate: number;
+        taxRate: number;
+      }>;
+    };
+    expect(body.trades).toHaveLength(2);
+
+    const untaxed = body.trades.find((t) => t.ts === 3_000)!;
+    expect(untaxed).toBeDefined();
+    expect(untaxed.tdsWithheld).toBe(0);
+    expect(untaxed.taxDue).toBe(0);
+    expect(untaxed.tdsRate).toBe(0);
+    expect(untaxed.netProfit).toBe(untaxed.profit);
+
+    const taxed = body.trades.find((t) => t.ts !== 3_000)!;
+    expect(taxed.tdsWithheld).toBeCloseTo(TDS_WITHHELD, 8);
+    expect(taxed.taxDue).toBeCloseTo(TAX_DUE, 8);
+    expect(taxed.netProfit).toBeCloseTo(NET_PROFIT, 8);
+    expect(taxed.netProfitPct).toBeCloseTo(NET_PROFIT, 8); // 100 USDT notional
+    expect(taxed.tdsRate).toBe(0.01);
+    expect(taxed.taxRate).toBe(0.3);
+    expect(taxed.tdsBase).toBeCloseTo(301.679452, 6);
+  });
+
+  it("exposes indiaNetPct/tdsPct on opportunities, null when the mode is off", async () => {
+    // Written with the mode off.
+    await seedHistory(4_000, 5);
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+
+    const off = (await (await get("/api/opportunities")).json()) as {
+      opportunities: Array<{
+        cycle: string;
+        indiaNetPct: number | null;
+        tdsPct: number | null;
+      }>;
+    };
+    expect(off.opportunities.every((o) => o.indiaNetPct === null)).toBe(true);
+    expect(off.opportunities.every((o) => o.tdsPct === null)).toBe(true);
+
+    await send("/api/settings", "PUT", { india_mode: 1 });
+    serveProfitableBook();
+    await send("/api/scan", "POST");
+
+    const on = (await (await get("/api/opportunities")).json()) as {
+      opportunities: Array<{
+        cycle: string;
+        netPct: number;
+        indiaNetPct: number | null;
+        tdsPct: number | null;
+      }>;
+    };
+    const best = on.opportunities.find((o) => o.cycle === "USDT>BTC>ETH>USDT");
+    expect(best).toBeDefined();
+    expect(best!.indiaNetPct).toBeCloseTo(best!.netPct * 0.7, 8);
+    expect(best!.tdsPct).toBeCloseTo(3.01679452, 8);
+  });
+});
+
+describe("POST /api/scan - tax block", () => {
+  it("carries the tax figures when india mode is on and omits them when off", async () => {
+    serveProfitableBook();
+    const plain = (await (await send("/api/scan", "POST")).json()) as {
+      executed: boolean;
+      tax?: unknown;
+    };
+    expect(plain.executed).toBe(true);
+    expect(plain.tax).toBeUndefined();
+
+    await send("/api/settings", "PUT", { india_mode: 1 });
+    serveProfitableBook();
+    const taxed = (await (await send("/api/scan", "POST")).json()) as {
+      executed: boolean;
+      tax?: { tdsWithheld: number; taxDue: number; netProfit: number };
+    };
+    expect(taxed.executed).toBe(true);
+    expect(taxed.tax).toEqual({
+      tdsWithheld: TDS_WITHHELD,
+      taxDue: TAX_DUE,
+      netProfit: NET_PROFIT,
+    });
   });
 });
 
