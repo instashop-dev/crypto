@@ -399,8 +399,10 @@
           <strong>Survived</strong> is the same trade, same direction, re-priced against
           the next scan’s books; “—” means not measured (too old to re-price, or waiting
           for the next scan). A spread that was real is still there a minute later; one
-          the skew invented is not. If surviving nets never clear the
-          <strong>0.2003%</strong> two-leg fee break-even, this strategy is display-only.
+          the skew invented is not. That figure is <em>already net of both legs’ fees</em>,
+          so its bar is <strong>zero</strong> — the 0.2003% two-leg break-even belongs to
+          the Gross&nbsp;% column, and charging it here would take the round trip twice.
+          If no surviving net stays above zero, this strategy is display-only.
         </p>
       </section>
 

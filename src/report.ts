@@ -22,12 +22,15 @@
  * - **Aggregate in SQL.** A week is ~150k funding rows and ~100k spread rows.
  *   The reductions live in `src/db.ts` and what crosses into this file is a
  *   handful of already-grouped rows. Nothing here loops over a table.
- * - **One fee basis for the whole window.** Funding and cross-exchange figures
- *   are recomputed against *today's* settings rather than read from the stored
- *   `net_annual_pct` column — see the section header in `src/db.ts` for why
- *   (rows written before Phase 13 used a materially different fee model, and
+ * - **One fee basis for the whole window.** The funding, cross-venue and basis
+ *   figures are recomputed against *today's* settings rather than read from the
+ *   stored `net_annual_pct` columns — see the section header in `src/db.ts` for
+ *   why (rows written before Phase 13 used a materially different fee model, and
  *   averaging across that boundary describes no fee schedule that ever existed).
- *   `meta.settings` states the basis that was used.
+ *   `meta.settings` states the basis that was used. The `xchg` section is the
+ *   one that does not recompute, and for the opposite reason: `persist_net_pct`
+ *   is not a gross figure awaiting a drag, it is a net one, and re-charging it
+ *   would double-count the very fees it already paid.
  * - **`null` is "not measured".** An average of no positions is not zero, a
  *   survival rate over no measured spreads is not zero, and a report that said
  *   otherwise would turn "we have no evidence" into "we have evidence of
@@ -57,6 +60,7 @@ import {
   feeDragAnnualPct,
   MS_PER_DAY,
   round8,
+  roundTripFeeFraction,
   venueSpreadDragAnnualPct,
 } from "./engine";
 
@@ -109,17 +113,23 @@ export function parseReportDays(raw: string | undefined): ReportDays {
 }
 
 /**
- * The gross percentage a two-leg spread must clear to break even on fees:
+ * The **gross** percentage a two-leg spread must clear to break even on fees:
  * `(1/(1 − fee)² − 1) × 100`.
  *
  * At the shipped 0.1% taker rate this is **0.2003004%** — the figure
  * `test/crossExchange.test.ts` asserts against `evaluateSpread` itself and the
- * one `public/app.js` marks surviving nets against. The compounded form rather
+ * one `public/app.js` marks *gross* edges against. The compounded form rather
  * than the linear `2 × fee`, because a spread's two legs are multiplicative: the
  * second leg is charged on what the first one left.
  *
+ * **This bar belongs to gross figures only.** Nothing in this report is judged
+ * against it: every percentage the `xchg` section reports is a `persist_net_pct`
+ * that has already had both legs' fees taken out of it, so comparing one to this
+ * number charges the same round trip twice. It is reported in `meta.settings` as
+ * the fee basis in force, beside the drags, and used nowhere else here.
+ *
  * `null` for an unusable fee rate, so a hand-edited setting cannot put a `NaN`
- * bar into the verdict.
+ * into the response.
  */
 export function twoLegBreakEvenPct(feeRate: number): number | null {
   if (!Number.isFinite(feeRate) || feeRate < 0 || feeRate >= 1) return null;
@@ -138,21 +148,36 @@ export interface ReportFundingSection {
    * any venue quoted, less the current drag. `null` when no venue quoted.
    */
   bestNetAnnualPct: number | null;
-  /** Polls, summed across venues, whose best row cleared the current bar. */
-  qualifyingPolls: number;
+  /**
+   * Polls, summed across venues, whose best row cleared the current bar. `null`
+   * when the drag could not be priced — the comparison was never made.
+   */
+  qualifyingPolls: number | null;
   observations: number;
   /** The drag subtracted from every gross figure in this section. */
   feeDragAnnualPct: number | null;
 }
 
-/** The cross-exchange section: `reportXchg` plus the derived judgements. */
+/**
+ * The cross-exchange section: `reportXchg` plus the two derived fractions.
+ *
+ * The two are deliberately different questions about the same column, and
+ * neither is the gross fee bar:
+ *
+ * - {@link survivalRate} — net above **zero**. `persist_net_pct` is already net
+ *   of both legs' fees, so zero is where the round trip paid for itself. This is
+ *   the break-even, and `answers.spreadSurvivalRate` is this number.
+ * - {@link qualifyingRate} — net at or above `xchg_min_profit_pct`, the display
+ *   threshold the dashboard flags rows with. Strictly the harder bar, and a
+ *   preference rather than an economic fact.
+ */
 export interface ReportXchgSection extends ReportXchg {
-  /** The bar, quoted at the *current* `fee_rate`. */
-  breakEvenPct: number | null;
+  /** The display threshold {@link qualifyingRate} was taken against. */
+  minProfitPct: number;
   /** Fraction of measured rows whose re-priced net was above zero. */
   survivalRate: number | null;
-  /** Fraction of measured rows that cleared {@link breakEvenPct}. */
-  breakEvenRate: number | null;
+  /** Fraction of measured rows that also cleared {@link minProfitPct}. */
+  qualifyingRate: number | null;
   medianPersistNetPct: number | null;
   /** The README decision rule, in one sentence. See {@link xchgVerdict}. */
   verdict: string;
@@ -172,7 +197,11 @@ export interface BreakEvenAnswers {
   funding: boolean;
   /** Closed paper carry positions netted a positive realised P&L. */
   carry: boolean;
-  /** At least one re-priced spread cleared the two-leg fee break-even. */
+  /**
+   * At least one re-priced spread was still worth something after fees — i.e.
+   * had a `persist_net_pct` above zero. Not the gross two-leg bar: that column
+   * has already paid the round trip.
+   */
   xchg: boolean;
   /** Best cross-venue differential, after the all-perp drag, was above zero. */
   venueSpreads: boolean;
@@ -227,7 +256,14 @@ export interface ReportMeta {
     minAnnualPct: number;
     fundingDragAnnualPct: number | null;
     venueSpreadDragAnnualPct: number | null;
+    /**
+     * The **gross** two-leg fee bar at the current `fee_rate`, stated so a
+     * reader can price a gross edge. No figure in this report is judged against
+     * it — see {@link twoLegBreakEvenPct}.
+     */
     xchgBreakEvenPct: number | null;
+    /** The display threshold the `xchg` section's `qualifyingRate` used. */
+    minProfitPct: number;
   };
 }
 
@@ -244,10 +280,19 @@ export interface Report {
 /**
  * The README's cross-exchange decision rule, as a sentence.
  *
- * The rule itself has been in the README and on the dashboard since Phase 16:
- * *if surviving nets never clear the two-leg fee break-even, this strategy is
- * display-only.* It has never had a place that actually applied it to the data —
- * a reader had to eyeball a column. This is that place.
+ * The rule has been in the README and on the dashboard since Phase 16: *if
+ * surviving nets never stay above zero once the round trip is paid, this
+ * strategy is display-only.* It has never had a place that actually applied it
+ * to the data — a reader had to eyeball a column. This is that place.
+ *
+ * **The bar is zero, not the gross fee break-even.** `persist_net_pct` is
+ * `evaluateSpread`'s output on a later book, already net of both legs' taker
+ * fees; holding it against `(1/(1−fee)² − 1) × 100` would charge those legs a
+ * second time and condemn a strategy on double-counted costs. So the verdict
+ * turns on `survived`, and reports `qualifying` — the same
+ * `xchg_min_profit_pct` the dashboard badges rows with — beside it, because "it
+ * paid for itself" and "it cleared the threshold we bother to display" are two
+ * facts and the string is more useful carrying both.
  *
  * Three outcomes, and the first is not a failure: a window with nothing measured
  * in it says "no evidence yet", which is different from "evidence of nothing"
@@ -255,24 +300,20 @@ export interface Report {
  */
 export function xchgVerdict(
   measured: number,
-  cleared: number | null,
-  breakEvenPct: number | null,
+  survived: number,
+  qualifying: number,
+  minProfitPct: number,
 ): string {
   if (measured === 0) {
     return "not measured: no cross-exchange spread in this window has been re-priced yet";
   }
-  // An unpriceable bar is its own answer, and it is not "display-only": the
-  // rows may well clear a break-even nobody can currently compute.
-  if (breakEvenPct === null || cleared === null) {
-    return (
-      `not measured: ${measured} spreads were re-priced, but the two-leg` +
-      " break-even cannot be priced from the stored fee_rate"
-    );
+  if (survived === 0) {
+    return `display-only: 0 of ${measured} measured spreads survived with positive net`;
   }
-  if (cleared === 0) {
-    return `display-only: 0 of ${measured} measured spreads cleared ${breakEvenPct}%`;
-  }
-  return `${cleared} of ${measured} measured spreads cleared ${breakEvenPct}% — investigate`;
+  return (
+    `${survived} of ${measured} survived;` +
+    ` ${qualifying} cleared the ${minProfitPct}% display bar — investigate`
+  );
 }
 
 /**
@@ -319,8 +360,15 @@ export async function buildReport(
     settings.perp_fee_rate,
     settings.funding_hold_days,
   );
+  // The per-row basis drag the basis section applies in SQL: the same
+  // `2 x spot + 2 x perp` fraction `feeDragAnnualPct` is built on, handed over
+  // un-annualised because each basis row amortises it over its own life.
+  const basisFeeFraction = roundTripFeeFraction(settings.fee_rate, settings.perp_fee_rate);
+  // Reported in `meta.settings` as the gross fee basis, and judged against
+  // nowhere in this report — see {@link twoLegBreakEvenPct}.
   const breakEvenPct = twoLegBreakEvenPct(settings.fee_rate);
   const minAnnualPct = settings.funding_min_annual_pct;
+  const minProfitPct = settings.xchg_min_profit_pct;
 
   const [
     fundingVenues,
@@ -333,26 +381,19 @@ export async function buildReport(
     spreadWindow,
     closedWindow,
   ] = await Promise.all([
-    // A `null` drag means the stored fee rates are unusable. Passing 0 keeps the
-    // comparison well-defined (nothing is subtracted) while every reported
-    // figure stays gross and `meta.settings.fundingDragAnnualPct` reports the
-    // null, so the response says which of the two happened.
-    reportFundingByVenue(db, fromTs, toTs, fundingDrag ?? 0, minAnnualPct),
+    // A `null` drag means the stored fee rates are unusable, and it is passed
+    // straight through rather than defaulted to `0`. Zero is not a neutral
+    // stand-in here: it is the claim that the round trip is free, and every
+    // `qualifyingPolls` count taken against it would be inflated by polls that
+    // clear the bar only because nobody charged them. The counts come back
+    // `null` instead, and `meta.settings.fundingDragAnnualPct` says why.
+    reportFundingByVenue(db, fromTs, toTs, fundingDrag, minAnnualPct),
     reportCarry(db, fromTs, toTs),
-    // `null` is passed straight through rather than defaulted to `0`, unlike
-    // the drag above. A drag of zero leaves the reported figures gross and
-    // harmless; a *break-even* of zero would count every non-negative row as
-    // having cleared the bar and answer §6(c) "yes" on no evidence at all.
-    reportXchg(db, STRATEGY_CROSS_EXCHANGE, fromTs, toTs, breakEvenPct),
-    reportVenueSpreads(
-      db,
-      fromTs,
-      toTs,
-      VERIFIED_SPREAD_SYMBOLS,
-      spreadDrag ?? 0,
-      minAnnualPct,
-    ),
-    reportBasis(db, fromTs, toTs, minAnnualPct),
+    // The xchg bar is the display threshold, not a fee bar: `persist_net_pct`
+    // has already paid both legs. See {@link ReportXchgSection}.
+    reportXchg(db, STRATEGY_CROSS_EXCHANGE, fromTs, toTs, minProfitPct),
+    reportVenueSpreads(db, fromTs, toTs, VERIFIED_SPREAD_SYMBOLS, spreadDrag, minAnnualPct),
+    reportBasis(db, fromTs, toTs, basisFeeFraction, minAnnualPct),
     reportWindow(db, "funding_rates", "ts", fromTs, toTs),
     reportWindow(db, "basis_rates", "ts", fromTs, toTs),
     reportWindow(db, "opportunities", "ts", fromTs, toTs, STRATEGY_CROSS_EXCHANGE),
@@ -379,18 +420,23 @@ export async function buildReport(
   const funding: ReportFundingSection = {
     venues: fundingVenues,
     bestNetAnnualPct: bestFundingNet,
-    qualifyingPolls: fundingVenues.reduce((n, v) => n + v.qualifyingPolls, 0),
+    // A sum of per-venue counts that are themselves `null` when the drag was
+    // unpriceable: the total is then unknown too, not zero.
+    qualifyingPolls:
+      fundingDrag === null
+        ? null
+        : fundingVenues.reduce((n, v) => n + (v.qualifyingPolls ?? 0), 0),
     observations: fundingVenues.reduce((n, v) => n + v.observations, 0),
     feeDragAnnualPct: fundingDrag,
   };
 
   const xchgSection: ReportXchgSection = {
     ...xchg,
-    breakEvenPct,
+    minProfitPct,
     survivalRate: rate(xchg.survived, xchg.measured),
-    breakEvenRate: rate(xchg.clearedBreakEven, xchg.measured),
+    qualifyingRate: rate(xchg.qualifying, xchg.measured),
     medianPersistNetPct,
-    verdict: xchgVerdict(xchg.measured, xchg.clearedBreakEven, breakEvenPct),
+    verdict: xchgVerdict(xchg.measured, xchg.survived, xchg.qualifying, minProfitPct),
   };
 
   const venueSpreadSection: ReportVenueSpreadSection = {
@@ -427,21 +473,21 @@ export async function buildReport(
       realizedVsPredictedCarryErrorPct: carry.avgPredictionErrorPct,
       spreadSurvivalRate: xchgSection.survivalRate,
       // Each of the five is "did this strategy end the window ahead of the
-      // costs it actually pays", and every one of them is judged against a
-      // *fee-aware net* figure — so the bar is zero rather than
-      // `funding_min_annual_pct`. The threshold is a display preference; zero is
-      // the arithmetic. `qualifyingPolls` beside each section reports the other
-      // question for whoever wants it.
+      // costs it actually pays", and **all five** are judged against a
+      // *fee-aware net* figure above zero — there is no exception. The fee bar
+      // is already inside every one of these columns, so the threshold settings
+      // (`funding_min_annual_pct`, `xchg_min_profit_pct`) are display
+      // preferences and zero is the arithmetic. The `qualifying*` fields beside
+      // each section report the threshold question for whoever wants it.
       anyStrategyClearedBreakEven: {
         funding: bestFundingNet !== null && bestFundingNet > 0,
         carry: carry.closedCount > 0 && carry.realizedPnlUsdt > 0,
-        // The one exception: a spread's break-even is the *gross* fee bar,
-        // because `persist_net_pct` is already net of both legs' fees — the
-        // column re-prices the same round trip. `clearedBreakEven` counts rows
-        // at or above it, so any row at all is the yes — and `null` (the bar
-        // itself unpriceable) is a `false`, because this field claims evidence
-        // and there is none.
-        xchg: xchg.clearedBreakEven !== null && xchg.clearedBreakEven > 0,
+        // No exception for the spreads either: `persist_net_pct` is already net
+        // of both legs' fees, so a single measured row above zero is a spread
+        // that outlived the skew *and* paid for itself. Judging this against
+        // the gross fee bar would charge the same round trip twice and answer
+        // "no" to a strategy that had in fact broken even.
+        xchg: xchg.survived > 0,
         venueSpreads:
           venueSpreadSection.maxNetAnnualPct !== null &&
           venueSpreadSection.maxNetAnnualPct > 0,
@@ -463,6 +509,7 @@ export async function buildReport(
         fundingDragAnnualPct: fundingDrag,
         venueSpreadDragAnnualPct: spreadDrag,
         xchgBreakEvenPct: breakEvenPct,
+        minProfitPct,
       },
     },
   };

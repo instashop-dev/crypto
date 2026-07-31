@@ -36,6 +36,10 @@
  *   this strategy and the perp carry are priced by literally the same helper
  *   ({@link import("./funding").feeDragAnnualPct}) and cannot drift apart. If it
  *   is wrong it is wrong by basis points on a figure quoted in percent.
+ * - **Contracts inside a day of settlement are excluded entirely.** See
+ *   {@link MIN_DAYS_TO_EXPIRY}: the annualisation multiplier past that point is
+ *   large enough to turn a rounding error into a headline, and the carry is not
+ *   actionable anyway.
  * - **The hold *is* `daysToExpiry`.** Unlike a perp carry, the holding period is
  *   not a tunable assumption: the trade ends when the contract settles. So the
  *   fee drag is amortised over the actual remaining life of the contract, and
@@ -58,17 +62,26 @@ import { feeDragAnnualPct } from "./funding";
 import { round8 } from "./pricing";
 
 /**
- * Shortest remaining life a contract may have and still be priced: one hour.
+ * Shortest remaining life a contract may have and still be priced: **one day**.
  *
  * `daysToExpiry` is a *divisor* in both the annualisation and the fee-drag term,
- * so a contract in its last minutes produces an annualised figure that is
- * arithmetically correct and completely meaningless — a 0.01% basis over ten
- * minutes annualises to ~525%. An hour is short enough that no real quarterly is
- * ever excluded and long enough that the extrapolation is not absurd. Contracts
- * inside it (and any already past expiry) are skipped, not zeroed: "too close to
- * settlement to annualise" is not "pays nothing".
+ * so a contract in its last hours produces an annualised figure that is
+ * arithmetically correct and completely meaningless. At an hour the multiplier
+ * is 8760x: a 0.05% mismark — well inside the width of a thin far-dated book,
+ * and exactly what the `last`-price fallback produces — becomes a **+438%/yr**
+ * headline that then sorts to the top of the board. At a day it is 365x, which
+ * is the same order as the near-dated contracts a reader is already used to
+ * comparing.
+ *
+ * The exclusion is not only about arithmetic sensitivity: near-expiry carry is
+ * not actionable. A contract settling inside 24 hours leaves no room to open
+ * both legs, and the basis it still shows is the residual nobody bothered to
+ * arbitrage away rather than a return anyone could capture.
+ *
+ * Contracts inside it (and any already past expiry) are skipped, not zeroed:
+ * "too close to settlement to annualise" is not "pays nothing".
  */
-export const MIN_DAYS_TO_EXPIRY = 1 / 24;
+export const MIN_DAYS_TO_EXPIRY = 1;
 
 /**
  * Days from `nowTs` until settlement. `null` when the contract has expired, is

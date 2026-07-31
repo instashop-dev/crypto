@@ -311,18 +311,33 @@ pre-Phase-16 history keeps the NULL that honestly says "not measured". A failure
 anywhere in the pass lands in `ScanResult.persistError` and costs the
 measurement only; the board it measures is still priced and persisted.
 
-**The decision rule this exists to settle.** A two-leg round trip at 0.1%/leg
-needs `1/(1 - 0.001)² - 1 = 0.2003%` of gross edge to break even — the gross
-figure at which `evaluateSpread` nets exactly zero, asserted against the engine
-itself in `test/crossExchange.test.ts` and computed by both the dashboard's
-marker and `GET /api/report`. (Earlier revisions of this paragraph quoted
-0.2002% from a differently-derived expression; the three implementations always
-agreed with each other, and now the prose does too.) If the *surviving* nets —
-not the nets at the moment of the skew — never clear that bar, then the
-cross-exchange spread scanner is measuring an artefact and the strategy is
-**display-only**:
-the rows stay (they are the evidence), and no further effort goes into it. That
-verdict needs a soak, not a scan, which is precisely why the columns exist
+**The decision rule this exists to settle.**
+
+`persist_net_pct` — the Survived column, and the only column this rule is about
+— is `evaluateSpread` re-run on a later book, and **it has already paid both
+legs' taker fees**. So the bar it is judged against is **zero**:
+
+> If no measured spread's surviving net stays above zero, the cross-exchange
+> scanner is measuring an artefact and the strategy is **display-only** — the
+> rows stay (they are the evidence) and no further effort goes into it.
+
+The gross figure `1/(1 - 0.001)² - 1 = 0.2003%` is the same rule stated on the
+*other* side of the fees: it is the gross edge at which `evaluateSpread` nets
+exactly zero, asserted against the engine itself in `test/crossExchange.test.ts`.
+It belongs to gross numbers only — the dashboard's Gross&nbsp;% column and
+`meta.settings.xchgBreakEvenPct` — and holding a *net* figure against it charges
+the same round trip a second time, which is what the dashboard's Survived marker
+and the report's `xchg` verdict both did until Phase 17's review caught it.
+(Earlier revisions of this paragraph also quoted 0.2002% from a
+differently-derived expression; the implementations always agreed with each
+other, and now the prose does too.)
+
+Beside survival the report gives one more, weaker number: the fraction of
+measured spreads clearing `xchg_min_profit_pct` (0.05% by default). That is a
+display preference — what is worth putting a badge on — not a claim about
+whether anything made money. The verdict string carries both.
+
+That verdict needs a soak, not a scan, which is precisely why the columns exist
 rather than an opinion.
 
 **India mode applies to spreads too**, and they fare slightly better: a spread
@@ -736,6 +751,23 @@ returned **zero** contracts. `test/fixtures/okx-futures-tickers.json` is a
 captured live response, not a hand-written stub, which is the only reason that
 was caught before it shipped.
 
+**Cadence: the same 5 minutes as funding, deliberately out of phase with it.**
+The basis poll has its own marker (`basis_last_poll_ts`) and its own `try/catch`,
+so neither poll can gate or break the other. It also has one thing the funding
+gate does not: on a **cold start** it does not poll. It writes its marker at
+`startedAt − FUNDING_POLL_INTERVAL_MS + BASIS_POLL_STAGGER_MS`
+(150s, half an interval), so the first basis board lands ~2.5 minutes after the
+first funding board and the two alternate from then on.
+
+Without that, both gates open on the same scan and stay aligned for ever — and
+that scan pays them **serially inside one `SCAN_LOCK_TTL_MS` of 45s**: ~18s for
+the funding block's worst case (cadence fetch plus a venue timeout), ~9s for the
+basis block's, plus the spot snapshot, for ~35s. It fits, but one slow venue on
+either side spends the margin, and a scan that outruns its lock can be
+overlapped by the next one. Staggered, the worst case per scan is the larger of
+the two blocks rather than their sum. The cost is one skipped board on a cold
+database: the series starts 2.5 minutes late, once.
+
 **Honest-model caveats**, on top of everything the carry section disclaims:
 
 - **Margin and liquidation are the big omission**, and bigger here than for a
@@ -756,6 +788,15 @@ was caught before it shipped.
   for its whole derivatives book, so this is the right order of magnitude, but
   it is an approximation — made deliberately so this strategy and the perp carry
   share one fee helper and cannot drift apart.
+- **Contracts inside a day of settlement are excluded from the board entirely.**
+  `days` is a divisor in both derived figures, so the annualisation multiplier
+  grows without bound as expiry approaches: at one hour it is 8760x, and a 0.05%
+  mismark — comfortably inside the width of a thin far-dated book, and exactly
+  what the `last`-price fallback above produces — becomes a **+438%/yr** headline
+  that then sorts to the top. At one day it is 365x, the same order as the
+  near-dated contracts a reader already compares. Near-expiry carry is not
+  actionable anyway: there is no room to open both legs before settlement, and
+  the residual basis is what nobody bothered to arbitrage away.
 - **The USD unit is assumed to be worth one USDT.** A linear OKX future quoted
   in `USD` is joined to the `<BASE>-USDT` spot market. At any stablecoin peg
   worth trading that is true to a few basis points; if the peg breaks, every
@@ -784,13 +825,19 @@ Five sections — `funding`, `carry`, `xchg`, `venueSpreads`, `basis` — plus
 }
 ```
 
-**Break-even here is a net figure above zero**, not `funding_min_annual_pct`.
-The fee drag has already been subtracted from every one of those percentages, so
-zero *is* the arithmetic; the threshold is a display preference, and each
-section reports its `qualifyingPolls` count separately for whoever wants that
-question instead. The one exception is `xchg`, whose bar is the *gross* two-leg
-fee break-even `(1/(1 − fee)² − 1) × 100` — 0.2003% at 0.1%/leg — because
-`persist_net_pct` re-prices the same round trip and is already net of it.
+**Break-even here is a net figure above zero**, not `funding_min_annual_pct` —
+in all five sections, with no exception. The fee drag has already been
+subtracted from every one of those percentages, so zero *is* the arithmetic; the
+thresholds are display preferences, and each section reports its `qualifying*`
+count separately for whoever wants that question instead.
+
+`xchg` is the section where this is easiest to get wrong, so it states both
+explicitly: `survivalRate` is the fraction of measured spreads with
+`persist_net_pct > 0` (the break-even, because that column already paid both
+legs) and `qualifyingRate` is the fraction clearing `xchg_min_profit_pct` (the
+display bar). The gross `(1/(1 − fee)² − 1) × 100` figure appears only in
+`meta.settings.xchgBreakEvenPct`, as the fee basis, and nothing is judged
+against it.
 
 **Three rules the endpoint keeps.**
 
@@ -802,13 +849,19 @@ fee break-even `(1/(1 − fee)² − 1) × 100` — 0.2003% at 0.1%/leg — beca
    which is exactly what `rankVenueSpreads` computes for one board — the two are
    pinned against each other in `test/report.test.ts` rather than left to a
    comment.
-2. **One fee basis across the whole window.** The funding and cross-exchange
-   figures are recomputed from each row's stored *gross* percentage against
-   today's settings, **not** read from the stored `net_annual_pct`. Rows written
-   before Phase 13 charged the spot taker rate on all four legs — a 4.87% drag
-   against today's 3.65% — and averaging across that boundary would produce a
-   number describing a fee schedule that never existed. `meta.settings` states
-   the basis that was used.
+2. **One fee basis across the whole window.** The funding, cross-venue and
+   basis figures are recomputed from each row's stored *gross* percentage
+   against today's settings, **not** read from the stored `net_annual_pct`. Rows
+   written before Phase 13 charged the spot taker rate on all four legs — a
+   4.87% drag against today's 3.65% — and averaging across that boundary would
+   produce a number describing a fee schedule that never existed. The basis
+   section does this per row rather than per board, because a dated contract
+   amortises the round trip over its own remaining life: it recomputes
+   `annualized_pct − (2·fee_rate + 2·perp_fee_rate) × (365/days_to_expiry) × 100`
+   inside the same `GROUP BY`, which is `feeDragAnnualPct` written in SQL and
+   costs no extra scan. `meta.settings` states the basis that was used. The
+   `xchg` section is the one that recomputes nothing, for the opposite reason:
+   `persist_net_pct` is not a gross figure awaiting a drag, it is a net one.
 3. **`null` is "not measured", never zero.** An average of no closed positions
    is not 0%/yr and a survival rate over no re-priced spreads is not 0%. The
    `xchg.verdict` string says `not measured` for an empty window rather than

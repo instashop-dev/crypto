@@ -1695,7 +1695,19 @@ export async function getCarryTotals(db: D1Database): Promise<CarryTotals> {
 // ever existed. So the report reads the *gross* `annualized_pct` — which no fee
 // change has ever touched — and subtracts the drag implied by today's settings,
 // passed in by the caller. One fee basis across the whole window, stated in the
-// response's `meta.settings`.
+// response's `meta.settings`. `basis_rates` is recomputed the same way, per row
+// rather than per board, because a dated contract amortises the round trip over
+// its own remaining life; see {@link reportBasis}.
+//
+// The one column that is read as stored is `opportunities.persist_net_pct`, and
+// that is the same rule rather than an exception to it: it is not a gross figure
+// awaiting a drag, it is `evaluateSpread`'s output *after* the drag, so the
+// honest thing to do with it is nothing. See {@link reportXchg}.
+//
+// A drag that cannot be priced from the stored fee rates is passed as `null`,
+// never as `0`: zero is the claim that trading is free, and every count taken
+// against it would be inflated by rows that only clear a bar nobody charged
+// them for. The affected counts come back `null` — "not measured".
 
 /** A helper's view of how much of a window a table actually covers. */
 export interface ReportWindow {
@@ -1751,8 +1763,14 @@ export interface ReportFundingVenue {
   avgBestAnnualPct: number | null;
   /** The single best annualised rate this venue quoted in the window. */
   maxBestAnnualPct: number | null;
-  /** Polls whose best row cleared the bar *net of the current drag*. */
-  qualifyingPolls: number;
+  /**
+   * Polls whose best row cleared the bar *net of the current drag*.
+   *
+   * `null` — not `0` — when the drag itself could not be priced from the stored
+   * fee settings: the comparison was never made, and a zero would read as "no
+   * poll cleared" against a fee schedule of nothing.
+   */
+  qualifyingPolls: number | null;
 }
 
 /**
@@ -1768,18 +1786,28 @@ export interface ReportFundingVenue {
  * only in the `qualifyingPolls` comparison; the returned percentages stay gross
  * so the caller can show both, and so the one place the fee basis is applied is
  * visible. See the section header for why the stored net column is not used.
+ *
+ * Pass `null` for a drag that cannot be priced from the stored fee rates, and
+ * the comparison is skipped: `qualifyingPolls` comes back `null` rather than
+ * counting rows against a drag of zero, which would inflate the count with polls
+ * that only clear the bar because their fees went unpaid. Same discipline as
+ * {@link reportXchg}'s unpriceable bar, and the same reason.
  */
 export async function reportFundingByVenue(
   db: D1Database,
   fromTs: number,
   toTs: number,
-  dragAnnualPct: number,
+  dragAnnualPct: number | null,
   minAnnualPct: number,
 ): Promise<ReportFundingVenue[]> {
   const { results } = await db
     .prepare(
       "SELECT venue, SUM(n) AS observations, COUNT(*) AS polls," +
         " AVG(best) AS avg_best, MAX(best) AS max_best," +
+        // `?3` is NULL for an unpriceable drag, and `best - NULL` is NULL, which
+        // is never `>=` anything — so the CASE falls to its ELSE and the count
+        // comes back 0 for every venue. That 0 is discarded below in favour of
+        // `null`; the branch is here so one query serves both cases.
         " SUM(CASE WHEN best - ?3 >= ?4 THEN 1 ELSE 0 END) AS qualifying_polls" +
         " FROM (SELECT venue, ts, COUNT(*) AS n, MAX(annualized_pct) AS best" +
         "       FROM funding_rates WHERE ts >= ?1 AND ts <= ?2 GROUP BY venue, ts)" +
@@ -1801,7 +1829,7 @@ export async function reportFundingByVenue(
     polls: r.polls ?? 0,
     avgBestAnnualPct: finiteOrNull(r.avg_best),
     maxBestAnnualPct: finiteOrNull(r.max_best),
-    qualifyingPolls: r.qualifying_polls ?? 0,
+    qualifyingPolls: dragAnnualPct === null ? null : (r.qualifying_polls ?? 0),
   }));
 }
 
@@ -1895,17 +1923,25 @@ export interface ReportXchg {
   measured: number;
   /** Rows stamped as checked but with no figure — expired before re-pricing. */
   expiredUnmeasured: number;
-  /** Measured rows whose re-priced net was above zero. */
+  /**
+   * Measured rows whose re-priced net was above zero.
+   *
+   * **This is the break-even count**, not a softer version of one.
+   * `persist_net_pct` is what `evaluateSpread` returned for the same trade on a
+   * later book, and that figure is already net of both legs' taker fees — so
+   * zero is the point at which the round trip paid for itself, and comparing it
+   * against the *gross* two-leg bar would charge the same fees twice.
+   */
   survived: number;
   /**
-   * Measured rows whose re-priced net cleared the fee-aware break-even.
+   * Measured rows whose re-priced net cleared `xchg_min_profit_pct`.
    *
-   * `null` — not `0` — when the caller could not price the bar at all from the
-   * current `fee_rate`. Counting against a bar of zero would turn "we cannot
-   * say" into "every non-negative row cleared", which is the exact inversion the
-   * NULL convention exists to prevent, running in the dangerous direction.
+   * A strictly higher bar than {@link survived}, and a display preference rather
+   * than an economic one: it is the same threshold the dashboard's `qualifies`
+   * badge uses, so the report and the board agree about which rows are worth
+   * looking at.
    */
-  clearedBreakEven: number | null;
+  qualifying: number;
   avgPersistNetPct: number | null;
   maxPersistNetPct: number | null;
   avgSkewMs: number | null;
@@ -1915,20 +1951,30 @@ export interface ReportXchg {
 /**
  * Cross-exchange aggregates in one pass over `idx_opportunities_strategy_ts`.
  *
- * `breakEvenPct` is the caller's *current* two-leg break-even
- * (`(1/(1−fee)² − 1) × 100`), for the reason the funding section recomputes its
- * drag: the bar has to be quoted at the fee in force now, or the report would
- * mark rows against a rate nobody charges. Pass `null` when the stored fee rate
- * cannot price a bar at all — the comparison is then skipped entirely and
- * {@link ReportXchg.clearedBreakEven} comes back `null`, rather than every
- * non-negative row being counted as having cleared zero.
+ * **Both counts are taken against `persist_net_pct`, which is already net of
+ * both legs' fees.** This section is the one that does *not* recompute anything
+ * against current settings, and it is not an oversight: `persist_net_pct` is not
+ * a gross edge waiting to have a drag subtracted from it, it is what
+ * `evaluateSpread` returned after charging the round trip. Subtracting a fee bar
+ * from it — or comparing it against the gross `(1/(1−fee)² − 1) × 100` figure —
+ * charges the same two legs a second time, and would understate survival by
+ * roughly a whole break-even.
+ *
+ * So the two bars are:
+ *
+ * - **zero** ({@link ReportXchg.survived}) — the trade paid for itself. The
+ *   economic question, and the one `answers.anyStrategyClearedBreakEven.xchg`
+ *   is derived from.
+ * - **`minProfitPct`** ({@link ReportXchg.qualifying}) — the same
+ *   `xchg_min_profit_pct` the dashboard flags rows against. A display
+ *   preference, reported beside the first so the two are never confused.
  */
 export async function reportXchg(
   db: D1Database,
   strategy: Strategy,
   fromTs: number,
   toTs: number,
-  breakEvenPct: number | null,
+  minProfitPct: number,
 ): Promise<ReportXchg> {
   const row = await db
     .prepare(
@@ -1937,22 +1983,18 @@ export async function reportXchg(
         " SUM(CASE WHEN persist_checked_ts IS NOT NULL AND persist_net_pct IS NULL" +
         "          THEN 1 ELSE 0 END) AS expired," +
         " SUM(CASE WHEN persist_net_pct > 0 THEN 1 ELSE 0 END) AS survived," +
-        // `?4` is NULL when the bar is unpriceable, and `x >= NULL` is NULL in
-        // SQL — never true — so the CASE falls to its ELSE and `cleared` comes
-        // back 0 for every row. That 0 is discarded below in favour of `null`;
-        // the branch is here so one query serves both cases.
-        " SUM(CASE WHEN persist_net_pct >= ?4 THEN 1 ELSE 0 END) AS cleared," +
+        " SUM(CASE WHEN persist_net_pct >= ?4 THEN 1 ELSE 0 END) AS qualifying," +
         " AVG(persist_net_pct) AS avg_persist, MAX(persist_net_pct) AS max_persist," +
         " AVG(skew_ms) AS avg_skew, MAX(skew_ms) AS max_skew" +
         " FROM opportunities WHERE strategy = ?1 AND ts >= ?2 AND ts <= ?3",
     )
-    .bind(strategy, fromTs, toTs, breakEvenPct)
+    .bind(strategy, fromTs, toTs, minProfitPct)
     .first<{
       rows_in: number;
       measured: number | null;
       expired: number | null;
       survived: number | null;
-      cleared: number | null;
+      qualifying: number | null;
       avg_persist: number | null;
       max_persist: number | null;
       avg_skew: number | null;
@@ -1964,7 +2006,7 @@ export async function reportXchg(
     measured: row?.measured ?? 0,
     expiredUnmeasured: row?.expired ?? 0,
     survived: row?.survived ?? 0,
-    clearedBreakEven: breakEvenPct === null ? null : (row?.cleared ?? 0),
+    qualifying: row?.qualifying ?? 0,
     avgPersistNetPct: finiteOrNull(row?.avg_persist),
     maxPersistNetPct: finiteOrNull(row?.max_persist),
     avgSkewMs: finiteOrNull(row?.avg_skew),
@@ -1983,9 +2025,14 @@ export async function reportXchg(
  * definition rather than a convenient approximation.
  *
  * `count` is the measured-row count the caller already has from
- * {@link reportXchg}; passing it avoids a second `COUNT(*)` over the same window
- * and guarantees the two figures describe the same set of rows. `null` for an
- * empty set — the median of nothing is not zero.
+ * {@link reportXchg}; passing it avoids a second `COUNT(*)` over the same
+ * window. It does **not** guarantee the two queries see the same rows: they are
+ * two statements, and a scan committing a measurement between them changes the
+ * set under this one. The consequence is bounded and benign — the offset is off
+ * by one against a set that grew by one, so the "median" is the value beside the
+ * true one — and the alternative (a transaction, or the distribution in JS) buys
+ * a precision this figure does not have. `null` for an empty set: the median of
+ * nothing is not zero.
  */
 export async function reportXchgMedianPersist(
   db: D1Database,
@@ -2019,8 +2066,12 @@ export interface ReportVenueSpreads {
   /** Mean, over those polls, of the widest differential available that poll. */
   avgGrossAnnualPct: number | null;
   maxGrossAnnualPct: number | null;
-  /** Polls whose widest differential cleared the bar net of the current drag. */
-  qualifyingPolls: number;
+  /**
+   * Polls whose widest differential cleared the bar net of the current drag.
+   * `null` when the drag could not be priced — see
+   * {@link ReportFundingVenue.qualifyingPolls}.
+   */
+  qualifyingPolls: number | null;
 }
 
 /**
@@ -2055,11 +2106,16 @@ export async function reportVenueSpreads(
   fromTs: number,
   toTs: number,
   symbols: readonly string[],
-  dragAnnualPct: number,
+  dragAnnualPct: number | null,
   minAnnualPct: number,
 ): Promise<ReportVenueSpreads> {
   if (symbols.length === 0) {
-    return { polls: 0, avgGrossAnnualPct: null, maxGrossAnnualPct: null, qualifyingPolls: 0 };
+    return {
+      polls: 0,
+      avgGrossAnnualPct: null,
+      maxGrossAnnualPct: null,
+      qualifyingPolls: dragAnnualPct === null ? null : 0,
+    };
   }
 
   // Bound parameters, never interpolation: the symbol list is app-owned today
@@ -2068,6 +2124,7 @@ export async function reportVenueSpreads(
   const row = await db
     .prepare(
       "SELECT COUNT(*) AS polls, AVG(gross) AS avg_gross, MAX(gross) AS max_gross," +
+        // NULL drag -> NULL comparison -> ELSE -> 0, discarded below for `null`.
         " SUM(CASE WHEN gross - ?3 >= ?4 THEN 1 ELSE 0 END) AS qualifying_polls" +
         " FROM (SELECT ts, MAX(spread) AS gross FROM (" +
         "   SELECT ts, symbol, MAX(annualized_pct) - MIN(annualized_pct) AS spread" +
@@ -2088,7 +2145,7 @@ export async function reportVenueSpreads(
     polls: row?.polls ?? 0,
     avgGrossAnnualPct: finiteOrNull(row?.avg_gross),
     maxGrossAnnualPct: finiteOrNull(row?.max_gross),
-    qualifyingPolls: row?.qualifying_polls ?? 0,
+    qualifyingPolls: dragAnnualPct === null ? null : (row?.qualifying_polls ?? 0),
   };
 }
 
@@ -2096,43 +2153,69 @@ export async function reportVenueSpreads(
 export interface ReportBasis {
   observations: number;
   polls: number;
-  /** Mean, over polls, of the best net annual basis available that poll. */
+  /**
+   * Mean, over polls, of the best net annual basis available that poll,
+   * recomputed at the current fee rates. `null` when those rates are unusable.
+   */
   avgBestNetAnnualPct: number | null;
   maxBestNetAnnualPct: number | null;
-  qualifyingPolls: number;
+  /** Polls whose best net cleared the bar. `null` when the fees are unusable. */
+  qualifyingPolls: number | null;
 }
 
 /**
- * Basis aggregates for the window, from the **stored** `net_annual_pct`.
+ * Basis aggregates for the window, on **one fee basis** like every other
+ * section: the stored `net_annual_pct` column is not read.
  *
- * The one section that does not recompute its net figure against current
- * settings, and the exception has a reason: a basis row's fee drag is amortised
- * over that contract's own remaining life, so it is a different number on every
- * row and cannot be re-derived from a single scalar the way a funding board's
- * constant drag can. Recomputing it would mean re-reading `days_to_expiry` per
- * row — the whole-table scan this section exists to avoid.
+ * A basis row's drag is not the funding board's single scalar — it is amortised
+ * over each contract's own remaining life — but that does not make it
+ * unrecomputable, only per row. `days_to_expiry` is stored on the row beside the
+ * gross `annualized_pct`, so the whole drag is
  *
- * The mixed-fee-model hazard the funding section guards against does not apply
- * here yet: `basis_rates` was created in Phase 17 and every row in it has only
- * ever been written under one fee model. It would apply if `fee_rate` or
- * `perp_fee_rate` were retuned mid-window, which is why `meta.settings` reports
- * the rates the rest of the report was priced at.
+ * ```
+ * roundTripFeeFraction x (365 / days_to_expiry) x 100
+ * ```
+ *
+ * which is exactly `feeDragAnnualPct` (`src/engine/funding.ts`) written in SQL,
+ * evaluated inside the existing `GROUP BY` rather than by pulling rows into JS.
+ * The cost is an expression per row in a query that was already visiting every
+ * one of them; there is no extra scan.
+ *
+ * The rationale is the funding section's, unchanged: a stored net was priced at
+ * whatever `fee_rate` and `perp_fee_rate` were in force at poll time, and
+ * averaging across a retune describes a fee schedule that never existed. It has
+ * not happened to `basis_rates` yet — the table is one phase old — but a report
+ * whose correctness depends on nobody having touched the settings is one edit
+ * away from being wrong, and silently.
+ *
+ * `feeFraction` is `roundTripFeeFraction(fee_rate, perp_fee_rate)`, or `null`
+ * when those rates cannot price a round trip at all; `null` propagates to every
+ * net figure rather than pricing the legs at zero.
  */
 export async function reportBasis(
   db: D1Database,
   fromTs: number,
   toTs: number,
+  feeFraction: number | null,
   minAnnualPct: number,
 ): Promise<ReportBasis> {
   const row = await db
     .prepare(
       "SELECT COALESCE(SUM(n), 0) AS observations, COUNT(*) AS polls," +
         " AVG(best) AS avg_best, MAX(best) AS max_best," +
-        " SUM(CASE WHEN best >= ?3 THEN 1 ELSE 0 END) AS qualifying_polls" +
-        " FROM (SELECT ts, COUNT(*) AS n, MAX(net_annual_pct) AS best" +
+        " SUM(CASE WHEN best >= ?4 THEN 1 ELSE 0 END) AS qualifying_polls" +
+        " FROM (SELECT ts, COUNT(*) AS n," +
+        // The CASE guards the divisor: a row with a non-positive
+        // `days_to_expiry` cannot be annualised, so its net is NULL and the
+        // aggregate MAX steps over it rather than the whole poll becoming
+        // unpriceable. `?3` is NULL for an unusable fee schedule, which makes
+        // every net NULL — the section then reports "not measured", the truth.
+        "        MAX(CASE WHEN days_to_expiry > 0 THEN" +
+        "              annualized_pct - ?3 * (365.0 / days_to_expiry) * 100" +
+        "            END) AS best" +
         "       FROM basis_rates WHERE ts >= ?1 AND ts <= ?2 GROUP BY ts)",
     )
-    .bind(fromTs, toTs, minAnnualPct)
+    .bind(fromTs, toTs, feeFraction, minAnnualPct)
     .first<{
       observations: number;
       polls: number;
@@ -2146,7 +2229,7 @@ export async function reportBasis(
     polls: row?.polls ?? 0,
     avgBestNetAnnualPct: finiteOrNull(row?.avg_best),
     maxBestNetAnnualPct: finiteOrNull(row?.max_best),
-    qualifyingPolls: row?.qualifying_polls ?? 0,
+    qualifyingPolls: feeFraction === null ? null : (row?.qualifying_polls ?? 0),
   };
 }
 

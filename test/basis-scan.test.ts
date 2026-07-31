@@ -18,6 +18,7 @@ import { setBasisFetcher, BASIS_VENUE } from "../src/basis";
 import { setRestFetcher, setWsCollector } from "../src/binance";
 import {
   BASIS_POLL_TS_KEY,
+  deleteRawSetting,
   ensureSeeded,
   FUNDING_POLL_TS_KEY,
   getRawSetting,
@@ -26,6 +27,7 @@ import {
   listOpportunities,
   replacePairs,
   resetAll,
+  setRawSetting,
   updateSettings,
 } from "../src/db";
 import { setFundingFetcher } from "../src/funding";
@@ -38,6 +40,8 @@ import { serveFlatBoard } from "./funding-stub";
 
 const DAY_MS = 86_400_000;
 const POLL_MS = 300_000;
+/** `BASIS_POLL_STAGGER_MS`: half an interval, the basis poll's offset. */
+const STAGGER_MS = 150_000;
 
 const PAIRS = [
   { symbol: "BTCUSDT", base: "BTC", quote: "USDT" },
@@ -130,6 +134,20 @@ beforeAll(() => {
   fetchMock.disableNetConnect();
 });
 
+/**
+ * Arm the basis gate so the very next scan polls.
+ *
+ * The basis block does **not** poll on a cold start — it seeds a staggered
+ * marker instead, so its cadence lands half an interval away from the funding
+ * poll's (`BASIS_POLL_STAGGER_MS`). Every test below that is about the *board*
+ * rather than about the gate wants a poll on the first scan, so it says so here
+ * rather than running two scans to get one board. The cold-start behaviour has
+ * its own tests, which clear this marker again.
+ */
+async function armBasisGate(): Promise<void> {
+  await setRawSetting(env.DB, BASIS_POLL_TS_KEY, String(clock - POLL_MS));
+}
+
 beforeEach(async () => {
   clock = 1_700_000_000_000;
   await ensureSeeded(env.DB);
@@ -138,6 +156,7 @@ beforeEach(async () => {
   setRestFetcher(serve(MEXC));
   setFundingFetcher(serveFlatBoard());
   setBasisFetcher(serveEmptyBasisBoard());
+  await armBasisGate();
 });
 
 afterEach(() => {
@@ -339,16 +358,8 @@ describe("runScan - the basis poll gate", () => {
     await expect(listLatestBasisRates(env.DB)).resolves.toHaveLength(3);
   });
 
-  it("polls on the very first scan, with no baseline to wait out", async () => {
-    const result = await runScan(env, "manual", {
-      now,
-      fetchBasis: board(),
-      basisPollIntervalMs: DAY_MS,
-    });
-    expect(result.basisCount).toBe(3);
-  });
-
   it("leaves the marker alone when the poll failed, so the next scan retries", async () => {
+    const armed = await getRawSetting(env.DB, BASIS_POLL_TS_KEY);
     const dead = await runScan(env, "manual", {
       now,
       fetchBasis: async () => {
@@ -356,7 +367,8 @@ describe("runScan - the basis poll gate", () => {
       },
     });
     expect(dead.basisError).toContain("HTTP 451");
-    await expect(getRawSetting(env.DB, BASIS_POLL_TS_KEY)).resolves.toBeNull();
+    // Unmoved: the marker means "a board landed at this time", and none did.
+    await expect(getRawSetting(env.DB, BASIS_POLL_TS_KEY)).resolves.toBe(armed);
 
     clock += 60_000;
     const retry = await runScan(env, "manual", { now, fetchBasis: board() });
@@ -377,6 +389,104 @@ describe("runScan - the basis poll gate", () => {
 
     await expect(getRawSetting(env.DB, BASIS_POLL_TS_KEY)).resolves.toBe(String(clock));
     await expect(getRawSetting(env.DB, FUNDING_POLL_TS_KEY)).resolves.toBeNull();
+  });
+});
+
+describe("runScan - the basis poll stagger", () => {
+  beforeEach(async () => {
+    // Undo the arming the outer `beforeEach` does: these tests are about what
+    // happens with no marker at all.
+    await deleteRawSetting(env.DB, BASIS_POLL_TS_KEY);
+  });
+
+  it("does not poll on a cold start - it seeds the offset marker instead", async () => {
+    // The opposite of the funding gate, on purpose. Polling here would put both
+    // blocks in the same scan, serially inside one 45s lock, for ever.
+    let calls = 0;
+    const counting: BasisFetcher = async (...args) => {
+      calls++;
+      return board()(...args);
+    };
+
+    const first = await runScan(env, "manual", { now, fetchBasis: counting });
+
+    expect(calls).toBe(0);
+    expect(first.basisSkipped).toBe(true);
+    expect(first.basisCount).toBe(0);
+    expect(first.basisError).toBeUndefined();
+    await expect(basisRows()).resolves.toHaveLength(0);
+
+    // ...and the funding poll, whose cold start *does* fire, went ahead.
+    expect(first.fundingSkipped).toBeUndefined();
+    await expect(getRawSetting(env.DB, FUNDING_POLL_TS_KEY)).resolves.toBe(String(clock));
+
+    // The marker is placed half an interval into the past, so the gate opens
+    // half an interval from now rather than a full one.
+    await expect(getRawSetting(env.DB, BASIS_POLL_TS_KEY)).resolves.toBe(
+      String(clock - POLL_MS + STAGGER_MS),
+    );
+  });
+
+  it("fires the first basis poll half an interval after the first funding poll", async () => {
+    await runScan(env, "manual", { now, fetchBasis: board() });
+
+    // One second short of the stagger: still shut.
+    clock += STAGGER_MS - 1_000;
+    const early = await runScan(env, "manual", { now, fetchBasis: board() });
+    expect(early.basisSkipped).toBe(true);
+    expect(early.basisCount).toBe(0);
+
+    clock += 1_000;
+    const due = await runScan(env, "manual", { now, fetchBasis: board() });
+    expect(due.basisSkipped).toBeUndefined();
+    expect(due.basisCount).toBe(3);
+    // The funding poll fired at T+0 and is next due at T+300s; the basis board
+    // just landed at T+150s. The two are now half an interval apart.
+    expect(due.fundingSkipped).toBe(true);
+  });
+
+  it("keeps the two polls alternating rather than co-firing, scan after scan", async () => {
+    // The property the stagger exists for: no scan pays both blocks serially.
+    const startedAt = clock;
+    const fired: Array<{ at: number; funding: boolean; basis: boolean }> = [];
+
+    // A minutely scan for half an hour, which is six funding polls and six
+    // basis polls if they alternate — and six scans paying for both if they do
+    // not.
+    for (let minute = 0; minute <= 30; minute++) {
+      clock = startedAt + minute * 60_000;
+      const r = await runScan(env, "manual", { now, fetchBasis: board() });
+      fired.push({
+        at: minute,
+        funding: r.fundingSkipped !== true,
+        basis: r.basisSkipped !== true,
+      });
+    }
+
+    const both = fired.filter((f) => f.funding && f.basis);
+    expect(both).toEqual([]);
+
+    // Funding on the 5s, basis offset by 2.5 minutes and rounded up to the next
+    // minutely scan: minute 3, 8, 13...
+    expect(fired.filter((f) => f.funding).map((f) => f.at)).toEqual([0, 5, 10, 15, 20, 25, 30]);
+    expect(fired.filter((f) => f.basis).map((f) => f.at)).toEqual([3, 8, 13, 18, 23, 28]);
+  });
+
+  it("re-seeds the stagger after a reset wipes the marker", async () => {
+    await runScan(env, "manual", { now, fetchBasis: board() });
+    clock += POLL_MS;
+    await runScan(env, "manual", { now, fetchBasis: board() });
+    await expect(basisRows()).resolves.toHaveLength(3);
+
+    await resetAll(env.DB, { wipeHistory: true });
+    clock += POLL_MS;
+
+    // A wiped marker is a cold start again, and it stays cold for one scan.
+    const after = await runScan(env, "manual", { now, fetchBasis: board() });
+    expect(after.basisSkipped).toBe(true);
+    await expect(getRawSetting(env.DB, BASIS_POLL_TS_KEY)).resolves.toBe(
+      String(clock - POLL_MS + STAGGER_MS),
+    );
   });
 });
 

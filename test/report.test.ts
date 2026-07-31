@@ -47,6 +47,8 @@ const NOW = 1_785_000_000_000;
 const FUNDING_DRAG = feeDragAnnualPct(0.001, 0.0005, 30)!; // 3.65
 const SPREAD_DRAG = venueSpreadDragAnnualPct(0.0005, 30)!; // 2.43333333
 const BREAK_EVEN = twoLegBreakEvenPct(0.001)!; // 0.2003004%
+/** The shipped `xchg_min_profit_pct`: the *display* bar, not a fee bar. */
+const MIN_PROFIT = 0.05;
 
 const ASSETS = perpAssets(ASSET_UNIVERSE, BASE_ASSET);
 
@@ -166,19 +168,29 @@ describe("twoLegBreakEvenPct", () => {
 describe("xchgVerdict", () => {
   it("says 'not measured' for an empty window rather than condemning the strategy", () => {
     // "No evidence yet" and "evidence of nothing" are different claims.
-    expect(xchgVerdict(0, 0, BREAK_EVEN)).toMatch(/not measured/);
+    expect(xchgVerdict(0, 0, 0, MIN_PROFIT)).toMatch(/not measured/);
   });
 
-  it("implements the README rule when nothing cleared", () => {
-    expect(xchgVerdict(40, 0, BREAK_EVEN)).toBe(
-      `display-only: 0 of 40 measured spreads cleared ${BREAK_EVEN}%`,
+  it("implements the README rule when nothing survived", () => {
+    // The bar is zero, not the gross fee break-even: `persist_net_pct` has
+    // already paid both legs.
+    expect(xchgVerdict(40, 0, 0, MIN_PROFIT)).toBe(
+      "display-only: 0 of 40 measured spreads survived with positive net",
     );
   });
 
-  it("calls for investigation when something did", () => {
-    expect(xchgVerdict(40, 3, BREAK_EVEN)).toBe(
-      `3 of 40 measured spreads cleared ${BREAK_EVEN}% — investigate`,
+  it("carries both the survival count and the display-bar count", () => {
+    expect(xchgVerdict(40, 3, 1, MIN_PROFIT)).toBe(
+      `3 of 40 survived; 1 cleared the ${MIN_PROFIT}% display bar — investigate`,
     );
+  });
+
+  it("is a verdict on survival, not on the display bar", () => {
+    // Nothing cleared 0.05%, but two spreads still paid for themselves — which
+    // is the question the README rule asks. A verdict driven by the threshold
+    // (or by the gross fee bar) would call this display-only on rows that broke
+    // even.
+    expect(xchgVerdict(40, 2, 0, MIN_PROFIT)).toMatch(/^2 of 40 survived; 0 cleared/);
   });
 });
 
@@ -199,6 +211,7 @@ describe("buildReport - an empty database", () => {
     expect(r.xchg.rows).toBe(0);
     expect(r.xchg.measured).toBe(0);
     expect(r.xchg.survivalRate).toBeNull();
+    expect(r.xchg.qualifyingRate).toBeNull();
     expect(r.xchg.medianPersistNetPct).toBeNull();
     expect(r.xchg.verdict).toMatch(/not measured/);
 
@@ -424,12 +437,12 @@ describe("buildReport - the cross-exchange section", () => {
     scanId = await insertScan(env.DB, "manual", NOW - 5 * DAY_MS);
   });
 
-  it("counts survival, break-even clearance and the median, and gives a verdict", async () => {
+  it("counts survival and the display bar apart, with the median and a verdict", async () => {
     const ts = NOW - 4 * DAY_MS;
-    // Five measured rows: three positive, one of them clearing 0.2003%.
+    // Five measured rows: three above zero, of which two also clear 0.05%.
     await seedSpread(scanId, ts, 0.5, { netPct: 0.3, checkedTs: ts + 60_000 }, 4000);
     await seedSpread(scanId, ts, 0.4, { netPct: 0.1, checkedTs: ts + 60_000 }, 3000);
-    await seedSpread(scanId, ts, 0.3, { netPct: 0.05, checkedTs: ts + 60_000 }, 5000);
+    await seedSpread(scanId, ts, 0.3, { netPct: 0.01, checkedTs: ts + 60_000 }, 5000);
     await seedSpread(scanId, ts, 0.2, { netPct: -0.2, checkedTs: ts + 60_000 }, 6000);
     await seedSpread(scanId, ts, 0.1, { netPct: -0.4, checkedTs: ts + 60_000 }, 2000);
     // One stamped-but-unmeasured row: expired before any snapshot could price it.
@@ -442,21 +455,44 @@ describe("buildReport - the cross-exchange section", () => {
     expect(r.xchg.rows).toBe(7);
     expect(r.xchg.measured).toBe(5);
     expect(r.xchg.expiredUnmeasured).toBe(1);
+    // Two distinct measures over the same five rows, and neither is the other:
+    // survival is `> 0` (the fees are already inside `persist_net_pct`) and
+    // qualifying is `>= xchg_min_profit_pct`.
     expect(r.xchg.survived).toBe(3);
-    expect(r.xchg.clearedBreakEven).toBe(1);
-    expect(r.xchg.breakEvenPct).toBeCloseTo(BREAK_EVEN, 7);
+    expect(r.xchg.qualifying).toBe(2);
+    expect(r.xchg.minProfitPct).toBe(MIN_PROFIT);
     expect(r.xchg.survivalRate).toBeCloseTo(0.6, 8);
-    expect(r.xchg.breakEvenRate).toBeCloseTo(0.2, 8);
-    // Odd count: the middle of [-0.4, -0.2, 0.05, 0.1, 0.3].
-    expect(r.xchg.medianPersistNetPct).toBeCloseTo(0.05, 8);
+    expect(r.xchg.qualifyingRate).toBeCloseTo(0.4, 8);
+    // Odd count: the middle of [-0.4, -0.2, 0.01, 0.1, 0.3].
+    expect(r.xchg.medianPersistNetPct).toBeCloseTo(0.01, 8);
     expect(r.xchg.maxPersistNetPct).toBeCloseTo(0.3, 8);
     // Skew is recorded on every row that has one, measured or not.
     expect(r.xchg.avgSkewMs).toBeCloseTo((4000 + 3000 + 5000 + 6000 + 2000 + 1000) / 6, 6);
     expect(r.xchg.maxSkewMs).toBe(6000);
 
-    expect(r.xchg.verdict).toMatch(/^1 of 5 measured spreads cleared/);
+    expect(r.xchg.verdict).toBe(
+      `3 of 5 survived; 2 cleared the ${MIN_PROFIT}% display bar — investigate`,
+    );
     expect(r.answers.spreadSurvivalRate).toBeCloseTo(0.6, 8);
     expect(r.answers.anyStrategyClearedBreakEven.xchg).toBe(true);
+  });
+
+  it("counts a spread that paid for itself but stayed under the gross fee bar", async () => {
+    // The double-charge this section was built wrong for. 0.1% of surviving net
+    // is BELOW the 0.2003% gross two-leg bar and ABOVE zero — and it is a real
+    // profit, because `persist_net_pct` already paid both legs. Judging it
+    // against the gross figure charges the round trip twice and reports a
+    // strategy that broke even as display-only.
+    const ts = NOW - 4 * DAY_MS;
+    await seedSpread(scanId, ts, 0.5, { netPct: 0.1, checkedTs: ts + 60_000 });
+
+    const r = await report();
+
+    expect(0.1).toBeLessThan(BREAK_EVEN);
+    expect(r.xchg.survived).toBe(1);
+    expect(r.xchg.survivalRate).toBe(1);
+    expect(r.answers.anyStrategyClearedBreakEven.xchg).toBe(true);
+    expect(r.xchg.verdict).toMatch(/^1 of 1 survived/);
   });
 
   it("averages the two middle values for an even count", async () => {
@@ -470,33 +506,53 @@ describe("buildReport - the cross-exchange section", () => {
     expect(r.xchg.medianPersistNetPct).toBe(0);
   });
 
-  it("reads display-only when nothing cleared, and the bar moves with fee_rate", async () => {
+  it("reads display-only when nothing survived, whatever the display bar says", async () => {
     const ts = NOW - 4 * DAY_MS;
-    await seedSpread(scanId, ts, 0.5, { netPct: 0.15, checkedTs: ts + 60_000 });
+    // A zero net is not a survivor: it paid for itself and made nothing.
+    await seedSpread(scanId, ts, 0.5, { netPct: 0, checkedTs: ts + 60_000 });
     await seedSpread(scanId, ts, 0.4, { netPct: -0.1, checkedTs: ts + 60_000 });
 
     const before = await report();
-    expect(before.xchg.clearedBreakEven).toBe(0);
+    expect(before.xchg.survived).toBe(0);
     expect(before.xchg.verdict).toBe(
-      `display-only: 0 of 2 measured spreads cleared ${BREAK_EVEN}%`,
+      "display-only: 0 of 2 measured spreads survived with positive net",
     );
     expect(before.answers.anyStrategyClearedBreakEven.xchg).toBe(false);
 
-    // Halve the fee and the bar drops to ~0.1001%, which the 0.15% row clears.
-    // The bar has to be quoted at the fee in force now, or the report would mark
-    // rows against a rate nobody charges.
-    await updateSettings(env.DB, { fee_rate: 0.0005 });
+    // Neither the display threshold nor the fee rate can change that verdict:
+    // it is a statement about the rows, and the rows already paid their fees.
+    await updateSettings(env.DB, { xchg_min_profit_pct: -1, fee_rate: 0.0005 });
     const after = await report();
-    expect(after.xchg.breakEvenPct).toBeCloseTo(0.10007505, 7);
-    expect(after.xchg.clearedBreakEven).toBe(1);
-    expect(after.xchg.verdict).toMatch(/investigate/);
+    expect(after.xchg.qualifying).toBe(2);
+    expect(after.xchg.survived).toBe(0);
+    expect(after.xchg.verdict).toMatch(/^display-only/);
+    expect(after.answers.anyStrategyClearedBreakEven.xchg).toBe(false);
   });
 
-  it("reports 'not measured' rather than a false yes when the bar is unpriceable", async () => {
+  it("moves the qualifying count, and only that, with xchg_min_profit_pct", async () => {
+    const ts = NOW - 4 * DAY_MS;
+    await seedSpread(scanId, ts, 0.5, { netPct: 0.15, checkedTs: ts + 60_000 });
+    await seedSpread(scanId, ts, 0.4, { netPct: 0.02, checkedTs: ts + 60_000 });
+
+    const before = await report();
+    expect(before.xchg.survived).toBe(2);
+    expect(before.xchg.qualifying).toBe(1);
+    expect(before.xchg.qualifyingRate).toBeCloseTo(0.5, 8);
+
+    await updateSettings(env.DB, { xchg_min_profit_pct: 0.01 });
+    const after = await report();
+    expect(after.xchg.minProfitPct).toBe(0.01);
+    expect(after.xchg.qualifying).toBe(2);
+    // Survival is a property of the rows, not of a setting.
+    expect(after.xchg.survived).toBe(2);
+    expect(after.xchg.survivalRate).toBe(1);
+  });
+
+  it("still answers survival when the gross fee bar is unpriceable", async () => {
     // `updateSettings` accepts any finite number; only the route validates the
-    // range. With an unusable `fee_rate` the two-leg break-even cannot be
-    // computed — and a bar of 0 would count every non-negative row as having
-    // cleared it and answer §6(c) "yes" on no evidence at all.
+    // range. An unusable `fee_rate` leaves `meta.settings.xchgBreakEvenPct`
+    // null — and nothing else in this section moves, because no figure in it is
+    // judged against that bar any more.
     const ts = NOW - 4 * DAY_MS;
     await seedSpread(scanId, ts, 0.5, { netPct: 0.001, checkedTs: ts + 60_000 });
     await seedSpread(scanId, ts, 0.4, { netPct: 0, checkedTs: ts + 60_000 });
@@ -506,13 +562,9 @@ describe("buildReport - the cross-exchange section", () => {
 
     expect(r.meta.settings.xchgBreakEvenPct).toBeNull();
     expect(r.xchg.measured).toBe(2);
-    // Not `2`, and not `0` either: the comparison was never made.
-    expect(r.xchg.clearedBreakEven).toBeNull();
-    expect(r.xchg.breakEvenRate).toBeNull();
-    expect(r.xchg.verdict).toMatch(/^not measured: 2 spreads were re-priced/);
-    expect(r.answers.anyStrategyClearedBreakEven.xchg).toBe(false);
-    // Survival needs no bar, so it is still answered.
     expect(r.xchg.survivalRate).toBeCloseTo(0.5, 8);
+    expect(r.xchg.qualifying).toBe(0);
+    expect(r.answers.anyStrategyClearedBreakEven.xchg).toBe(true);
   });
 
   it("ignores rows of another strategy and rows outside the window", async () => {
@@ -634,15 +686,20 @@ describe("buildReport - the basis section", () => {
       env.DB,
       null,
       [
-        basisRow({ instrument: "M3", netAnnualPct: 6.89 }),
-        basisRow({ instrument: "M1", netAnnualPct: 3.65, daysToExpiry: 30 }),
+        // 8.11% gross over 90 days: less a 1.21666667% drag, 6.89444444% net.
+        basisRow({ instrument: "M3", annualizedPct: 8.11111111 }),
+        // 7.3% gross over 30 days pays the same 0.3% round trip in a third of
+        // the time: 3.65% of drag, so 3.65% net. The near-dated contract
+        // out-grosses nothing here and loses on net, which is the whole reason
+        // this section cannot read a board-wide drag.
+        basisRow({ instrument: "M1", annualizedPct: 7.3, daysToExpiry: 30 }),
       ],
       NOW - 4 * DAY_MS,
     );
     await insertBasisRates(
       env.DB,
       null,
-      [basisRow({ instrument: "M3", netAnnualPct: 2.5 })],
+      [basisRow({ instrument: "M3", annualizedPct: 3.71666667 })],
       NOW - DAY_MS,
     );
 
@@ -650,12 +707,59 @@ describe("buildReport - the basis section", () => {
 
     expect(r.basis.polls).toBe(2);
     expect(r.basis.observations).toBe(3);
-    // Best per poll: 6.89 and 2.5.
-    expect(r.basis.avgBestNetAnnualPct).toBeCloseTo(4.695, 6);
-    expect(r.basis.maxBestNetAnnualPct).toBeCloseTo(6.89, 6);
+    // Best per poll: 6.89444444 and 2.5.
+    expect(r.basis.maxBestNetAnnualPct).toBeCloseTo(6.89444444, 6);
+    expect(r.basis.avgBestNetAnnualPct).toBeCloseTo((6.89444444 + 2.5) / 2, 6);
     // Against the 5% bar, one of the two polls.
     expect(r.basis.qualifyingPolls).toBe(1);
     expect(r.answers.anyStrategyClearedBreakEven.basis).toBe(true);
+  });
+
+  it("re-prices each row against the CURRENT fees, not its stored net column", async () => {
+    // The funding section's rule, applied per row because a dated contract
+    // amortises its round trip over its own remaining life. The stored net here
+    // was priced at a fee schedule nobody charges now; averaging a window across
+    // that boundary would describe a fee model that never existed.
+    await insertBasisRates(
+      env.DB,
+      null,
+      [
+        basisRow({
+          annualizedPct: 8.11111111,
+          daysToExpiry: 90,
+          // As if written when both legs cost 0.1%: 0.004 x (365/90) x 100.
+          netAnnualPct: 8.11111111 - 1.62222222,
+        }),
+      ],
+      NOW - DAY_MS,
+    );
+
+    const r = await report();
+    // 8.11111111 − 0.003 x (365/90) x 100 = 6.89444444, today's drag.
+    expect(r.basis.maxBestNetAnnualPct).toBeCloseTo(6.89444444, 6);
+    expect(r.basis.maxBestNetAnnualPct).not.toBeCloseTo(8.11111111 - 1.62222222, 6);
+
+    // ...and it moves with the settings, which a stored column cannot.
+    await updateSettings(env.DB, { fee_rate: 0.002 });
+    const after = await report();
+    // (0.002 x 2 + 0.0005 x 2) x (365/90) x 100 = 2.02777778.
+    expect(after.basis.maxBestNetAnnualPct).toBeCloseTo(8.11111111 - 2.02777778, 6);
+  });
+
+  it("reports nothing rather than free legs when the fees are unusable", async () => {
+    await insertBasisRates(env.DB, null, [basisRow({ annualizedPct: 900 })], NOW - DAY_MS);
+    await updateSettings(env.DB, { fee_rate: 1 });
+
+    const r = await report();
+
+    // The rows are still counted — they exist — but no net figure can be
+    // derived from them, and a 900% gross must not be reported as a net.
+    expect(r.basis.observations).toBe(1);
+    expect(r.basis.polls).toBe(1);
+    expect(r.basis.maxBestNetAnnualPct).toBeNull();
+    expect(r.basis.avgBestNetAnnualPct).toBeNull();
+    expect(r.basis.qualifyingPolls).toBeNull();
+    expect(r.answers.anyStrategyClearedBreakEven.basis).toBe(false);
   });
 
   it("does not call an all-backwardation window a positive result", async () => {
@@ -667,7 +771,8 @@ describe("buildReport - the basis section", () => {
     );
 
     const r = await report();
-    expect(r.basis.maxBestNetAnnualPct).toBeCloseTo(-5.27, 6);
+    // −4.06 gross less the 1.21666667% drag over 90 days.
+    expect(r.basis.maxBestNetAnnualPct).toBeCloseTo(-5.27666667, 6);
     expect(r.answers.anyStrategyClearedBreakEven.basis).toBe(false);
   });
 });
@@ -705,7 +810,50 @@ describe("buildReport - meta", () => {
       fundingDragAnnualPct: FUNDING_DRAG,
       venueSpreadDragAnnualPct: SPREAD_DRAG,
       xchgBreakEvenPct: BREAK_EVEN,
+      minProfitPct: MIN_PROFIT,
     });
+  });
+});
+
+describe("buildReport - an unpriceable fee drag", () => {
+  beforeEach(async () => {
+    const ts = NOW - 2 * DAY_MS;
+    await insertFundingRates(
+      env.DB,
+      null,
+      [
+        fundingRow({ venue: "okx", symbol: "BTC", annualizedPct: 4 }),
+        fundingRow({ venue: "gate", symbol: "BTC", annualizedPct: 18 }),
+      ],
+      ts,
+    );
+    // `updateSettings` accepts any finite number; only the route range-checks.
+    await updateSettings(env.DB, { perp_fee_rate: 1 });
+  });
+
+  it("reports the qualifying counts as null, never as zero-fee counts", async () => {
+    const r = await report();
+
+    // Both drags are unpriceable, so no comparison against the bar was ever
+    // made. Zero would read as "nothing qualified" — a measurement — and would
+    // in fact be the *opposite* risk: passing a drag of 0 makes the legs free
+    // and inflates the count with polls that only clear the bar unfeed.
+    expect(r.meta.settings.fundingDragAnnualPct).toBeNull();
+    expect(r.meta.settings.venueSpreadDragAnnualPct).toBeNull();
+
+    expect(r.funding.qualifyingPolls).toBeNull();
+    expect(r.funding.venues.every((v) => v.qualifyingPolls === null)).toBe(true);
+    expect(r.venueSpreads.qualifyingPolls).toBeNull();
+    expect(r.basis.qualifyingPolls).toBeNull();
+
+    // The gross figures survive — they never depended on a fee.
+    expect(r.funding.venues.find((v) => v.venue === "gate")!.maxBestAnnualPct).toBe(18);
+    expect(r.venueSpreads.maxGrossAnnualPct).toBeCloseTo(14, 6);
+    // ...and every net figure is null rather than silently equal to its gross.
+    expect(r.funding.bestNetAnnualPct).toBeNull();
+    expect(r.venueSpreads.maxNetAnnualPct).toBeNull();
+    expect(r.answers.anyStrategyClearedBreakEven.funding).toBe(false);
+    expect(r.answers.anyStrategyClearedBreakEven.venueSpreads).toBe(false);
   });
 });
 

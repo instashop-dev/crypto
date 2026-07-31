@@ -209,6 +209,30 @@ export const STRATEGIES: readonly Strategy[] = [
 export const FUNDING_POLL_INTERVAL_MS = 300_000;
 
 /**
+ * How far the basis poll is offset from the funding poll: 2.5 minutes, half of
+ * {@link FUNDING_POLL_INTERVAL_MS}.
+ *
+ * The two polls run on the same interval and are both gated on a marker written
+ * with the scan's `startedAt`, so left alone they align on the first scan that
+ * fires both and then stay in lockstep forever. That co-firing scan pays them
+ * **serially inside one scan lock**: the funding block's worst case is ~18s
+ * (cadence fetch plus a venue timeout) and the basis block's is ~9s, and with
+ * the spot snapshot on top that is ~35s of a `SCAN_LOCK_TTL_MS` of 45s. It fits,
+ * but a single slow venue on either side is enough to lose the margin — and a
+ * scan that runs past its lock TTL can be overlapped by the next one.
+ *
+ * So the basis gate seeds its marker on a **cold start** rather than polling
+ * (`src/scan.ts`), placing its first poll half an interval after funding's.
+ * Thereafter the two alternate: worst case per scan becomes the larger of the
+ * two blocks rather than their sum.
+ *
+ * Half the interval rather than a smaller nudge because it is the only offset
+ * that is equally far from the poll before and the poll after, so neither drifts
+ * back into the other under jitter.
+ */
+export const BASIS_POLL_STAGGER_MS = 150_000;
+
+/**
  * How many *best-paying* non-major contracts each venue contributes to a
  * persisted board.
  *

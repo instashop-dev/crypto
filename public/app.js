@@ -255,14 +255,18 @@
   const SPREAD_BREAK_EVEN_FALLBACK_PCT = 0.2003004;
 
   /**
-   * The bar surviving nets are marked against, in percent: the round-trip cost
+   * The bar **gross** edges are marked against, in percent: the round-trip cost
    * of buying and selling once at the taker fee `f`, `(1 / (1 - f)^2 - 1) x 100`.
    *
    * Tracked from `/api/opportunities` rather than hard-coded, because the real
    * break-even moves with `fee_rate` and a display marker that stayed at the
-   * default would quietly mis-flag every row once an operator retuned it. It is
-   * still a marker only: the stored `netPct` figures are already net of the fees
-   * in force when they were priced.
+   * default would quietly mis-flag every row once an operator retuned it.
+   *
+   * **Gross columns only.** The `netPct` and `persistNetPct` figures have
+   * already had both legs' fees taken out of them by `evaluateSpread`, so
+   * marking either against this bar charges the same round trip twice; their bar
+   * is zero. This marker used to sit on the Survived column and did exactly
+   * that.
    */
   let spreadBreakEvenPct = SPREAD_BREAK_EVEN_FALLBACK_PCT;
 
@@ -457,20 +461,25 @@
    * Three distinct states, and collapsing any two of them would be the whole
    * point of the column lost: not yet checked (`—`), checked but never priceable
    * (`expired`), and a real re-priced figure — which is rendered with its sign
-   * and flagged when it still clears the two-leg break-even.
+   * and flagged when it is still **above zero**.
+   *
+   * Zero, not the 0.2003% two-leg fee bar: this figure is `evaluateSpread`'s
+   * output on the later book and has already paid both legs, so the fee bar
+   * would be charged to it a second time. That is what this marker used to do,
+   * and it hid every spread that survived by less than a full round trip.
    */
   function survivalCell(netPct, checkedTs) {
     if (isNum(netPct)) {
-      const survives = netPct >= spreadBreakEvenPct;
+      const survives = netPct > 0;
       return (
         '<td class="right num nowrap ' +
         signClass(netPct) +
         '"><span title="Re-priced on a later snapshot' +
         (isNum(checkedTs) ? " at " + esc(new Date(checkedTs).toISOString()) : "") +
-        '.">' +
+        '. Already net of both legs\' fees.">' +
         fmtPct(netPct) +
         "</span>" +
-        (survives ? ' <span class="tag tag-exec">clears</span>' : "") +
+        (survives ? ' <span class="tag tag-exec">survives</span>' : "") +
         "</td>"
       );
     }
@@ -496,8 +505,8 @@
    * "executed" column when Phase 12 removed the fill paths.
    */
   function renderOpportunities(list, minProfitPct, feeRate) {
-    // Before any row is drawn: the "clears" flag in `survivalCell` is judged
-    // against the fee the server is pricing at right now.
+    // Before any row is drawn: the Gross % column's break-even note is quoted
+    // at the fee the server is pricing at right now.
     spreadBreakEvenPct = breakEvenPct(feeRate);
 
     const body = $("opps-body");
@@ -539,8 +548,14 @@
           '<td class="mono">' +
           esc(o.cycle) +
           "</td>" +
+          // The one column the gross fee bar belongs on: a gross edge below it
+          // cannot survive the round trip, whatever the book looked like.
           '<td class="right num ' +
           signClass(o.grossPct) +
+          '" title="' +
+          (isNum(o.grossPct) && o.grossPct >= spreadBreakEvenPct
+            ? "Above the " + fmtNum(spreadBreakEvenPct, 4) + "% two-leg fee break-even."
+            : "Below the " + fmtNum(spreadBreakEvenPct, 4) + "% two-leg fee break-even.") +
           '">' +
           fmtPct(o.grossPct) +
           "</td>" +
@@ -1065,8 +1080,10 @@
     answer(
       "xchg",
       answers.xchg,
+      // Survived, not "cleared": the bar is a positive net, because the column
+      // has already paid both legs' fees.
       xchg.measured > 0
-        ? xchg.clearedBreakEven + " of " + xchg.measured + " cleared"
+        ? (xchg.survived || 0) + " of " + xchg.measured + " survived"
         : "nothing re-priced yet",
     );
     answer(
@@ -1113,6 +1130,12 @@
         detail:
           (xchg.measured || 0) +
           " measured, " +
+          (xchg.survived || 0) +
+          " survived, " +
+          (xchg.qualifying || 0) +
+          " over " +
+          (isNum(xchg.minProfitPct) ? xchg.minProfitPct + "%" : "the display bar") +
+          ", " +
           (xchg.expiredUnmeasured || 0) +
           " expired · skew avg " +
           (isNum(xchg.avgSkewMs) ? fmtNum(xchg.avgSkewMs, 0) + "ms" : "—") +
@@ -1127,7 +1150,9 @@
         detail:
           (Array.isArray(funding.venues) ? funding.venues.length : 0) +
           " venue(s) · " +
-          (funding.qualifyingPolls || 0) +
+          // `null` is "the drag was unpriceable, so the comparison was never
+          // made" — rendering it as 0 would report a measurement nobody took.
+          (isNum(funding.qualifyingPolls) ? funding.qualifyingPolls : "—") +
           " polls cleared " +
           (isNum(meta.settings && meta.settings.minAnnualPct)
             ? meta.settings.minAnnualPct + "%"
@@ -1141,7 +1166,7 @@
         best: isNum(vspread.maxNetAnnualPct) ? fmtPct(vspread.maxNetAnnualPct, 2) : "—",
         avg: isNum(vspread.avgNetAnnualPct) ? fmtPct(vspread.avgNetAnnualPct, 2) : "—",
         detail:
-          (vspread.qualifyingPolls || 0) +
+          (isNum(vspread.qualifyingPolls) ? vspread.qualifyingPolls : "—") +
           " of " +
           (vspread.polls || 0) +
           " polls qualified · majors only",
@@ -1156,7 +1181,10 @@
           ? fmtPct(basis.avgBestNetAnnualPct, 2)
           : "—",
         detail:
-          (basis.qualifyingPolls || 0) + " of " + (basis.polls || 0) + " polls qualified",
+          (isNum(basis.qualifyingPolls) ? basis.qualifyingPolls : "—") +
+          " of " +
+          (basis.polls || 0) +
+          " polls qualified",
       },
       {
         name: "Paper carry positions",

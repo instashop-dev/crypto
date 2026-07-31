@@ -49,10 +49,16 @@ describe("daysToExpiry", () => {
     expect(daysToExpiry(NOW, NOW)).toBeNull();
   });
 
-  it("refuses a contract inside the one-hour floor", () => {
-    // The divisor guard. A 0.01% basis over ten minutes annualises to ~525%,
-    // which is arithmetically correct and completely meaningless.
+  it("refuses a contract inside the one-day floor", () => {
+    // The divisor guard, and it is a whole day. An hour out, the multiplier is
+    // 8760x: a 0.05% mismark — well inside a thin far-dated book, and exactly
+    // what the `last`-price fallback produces — annualises to +438%/yr and
+    // sorts straight to the top of a board ranked by net.
+    expect(MIN_DAYS_TO_EXPIRY).toBe(1);
     expect(daysToExpiry(NOW + 10 * 60_000, NOW)).toBeNull();
+    expect(daysToExpiry(NOW + 60 * 60_000, NOW)).toBeNull();
+    expect(daysToExpiry(NOW + 23 * 3_600_000, NOW)).toBeNull();
+    // Exactly at the floor is kept: the guard is `< 1 day`, not `<= 1 day`.
     expect(daysToExpiry(NOW + MIN_DAYS_TO_EXPIRY * DAY_MS, NOW)).toBeCloseTo(
       MIN_DAYS_TO_EXPIRY,
       8,
@@ -165,6 +171,29 @@ describe("evaluateBasis", () => {
     // ...until the 0.3% round trip is amortised over those same 3 days.
     expect(near!.feeDragAnnualPct).toBeCloseTo(36.5, 6);
     expect(near!.netAnnualPct).toBeCloseTo(-12.16666667, 6);
+  });
+
+  it("drops a contract inside a day of settlement rather than annualising it", () => {
+    // The exclusion the floor exists for. 60030/60000 is a 0.05% premium — the
+    // width of a rounding error on a thin book — and an hour from settlement it
+    // annualises to +438%/yr, which would rank first on a board sorted by net.
+    // Nobody could trade it either: there is no room to open two legs.
+    const hour = contract({ expiryTs: NOW + 3_600_000, futurePrice: 60_030 });
+    expect(0.05 * (365 / (1 / 24))).toBeCloseTo(438, 0);
+    expect(evaluateBasis(hour, SPOT_FEE, PERP_FEE, NOW)).toBeNull();
+    // ...and the annualiser refuses that horizon on its own, not only via the
+    // `daysToExpiry` gate above it.
+    expect(annualizedBasisPct(0.05, 1 / 24)).toBeNull();
+
+    // A day out is kept, and reads like the near-dated contract it is.
+    const day = evaluateBasis(
+      contract({ expiryTs: NOW + DAY_MS, futurePrice: 60_030 }),
+      SPOT_FEE,
+      PERP_FEE,
+      NOW,
+    );
+    expect(day!.daysToExpiry).toBe(1);
+    expect(day!.annualizedPct).toBeCloseTo(18.25, 6);
   });
 
   it("drops an expired contract, an unpriceable leg and an unusable fee", () => {

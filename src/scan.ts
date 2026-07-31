@@ -30,6 +30,7 @@ import { getDualSnapshot, discoverPairs, type DualSnapshot } from "./binance";
 import {
   ASSET_UNIVERSE,
   BASE_ASSET,
+  BASIS_POLL_STAGGER_MS,
   FUNDING_BOARD_BOTTOM_N,
   FUNDING_BOARD_TOP_N,
   FUNDING_INTERVAL_CACHE_TTL_MS,
@@ -246,8 +247,11 @@ export interface ScanResult {
    * any of those would send whoever reads it to the wrong upstream.
    */
   basisError?: string;
-  /** Set when the basis poll gate declined: the board is younger than the
-   *  interval. */
+  /**
+   * Set when the basis poll gate declined: either the board is younger than the
+   * interval, or this was the cold start that seeds the stagger marker instead
+   * of polling (see {@link BASIS_POLL_STAGGER_MS}).
+   */
   basisSkipped?: boolean;
 }
 
@@ -1277,20 +1281,38 @@ export async function runScan(
   // `scans` row no column for it, deliberately.
   try {
     const pollMs = deps.basisPollIntervalMs ?? FUNDING_POLL_INTERVAL_MS;
-    // Its own marker, read exactly as the funding gate reads its own, and for
-    // the same reasons: a missing or unparseable value forces the poll (a cold
-    // database must fill the board immediately rather than wait out an interval
-    // it has no baseline for), and the marker is written only *after* the poll
-    // returns, so a poll that threw is retried by the next scan instead of
-    // holding the gate shut for a full interval.
+    // Its own marker, read exactly as the funding gate reads its own, and
+    // written only *after* the poll returns, so a poll that threw is retried by
+    // the next scan instead of holding the gate shut for a full interval.
     //
     // Separate from `funding_last_poll_ts` because the two polls fail
     // independently: sharing one marker would mean a failed funding poll
     // silently re-polling the basis board a minute later, or the reverse.
+    //
+    // **The cold start is the one place this gate is not the funding gate.**
+    // There, a missing marker forces the poll, because a cold database has an
+    // empty board and nothing to show. Here it *seeds* the marker instead, at
+    // `startedAt − FUNDING_POLL_INTERVAL_MS + BASIS_POLL_STAGGER_MS`, so the
+    // first basis poll lands half an interval after the first funding one and
+    // the two alternate from then on. Polling here would put both blocks in
+    // every scan that fires either, serially inside one 45s scan lock, for the
+    // life of the deployment — see {@link BASIS_POLL_STAGGER_MS} for the timing.
+    // The cost is one skipped board: the basis series starts 2.5 minutes late,
+    // once, and a strategy whose whole point is that its return is locked in at
+    // entry has nothing to learn in that window.
     const marker = await getRawSetting(db, BASIS_POLL_TS_KEY);
     const parsed = marker === null ? Number.NaN : Number(marker);
     const lastPollTs = Number.isFinite(parsed) ? parsed : null;
-    if (lastPollTs !== null && startedAt - lastPollTs < pollMs) {
+    if (lastPollTs === null) {
+      // Written directly rather than through the poll's own write below, which
+      // must keep meaning "a board landed at this time".
+      await setRawSetting(
+        db,
+        BASIS_POLL_TS_KEY,
+        String(startedAt - FUNDING_POLL_INTERVAL_MS + BASIS_POLL_STAGGER_MS),
+      );
+      basisSkipped = true;
+    } else if (startedAt - lastPollTs < pollMs) {
       basisSkipped = true;
     } else {
       const poll = await pollBasisRates(env, scanId, deps);
